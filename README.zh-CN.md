@@ -2,8 +2,9 @@
 
 [English](README.md) | 简体中文
 
-面向 OneKVM 扩展的低内存 D-Bus 进程宿主。插件管理器使用它启动扩展进程并
-分发生命周期操作，从而避免增加另一个占用较大的运行时服务。
+面向 OneKVM 扩展的低内存 D-Bus 生命周期宿主（libsystemd sd-bus）。它实现
+`org.onekvm.ExtensionHost1`，并按扩展拉起 `--plugin-helper`。安装/卸载仍由
+`onekvm-extension-manager` 负责。
 
 ## 编译和测试
 

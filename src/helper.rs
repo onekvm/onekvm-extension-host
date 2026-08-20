@@ -1,7 +1,3 @@
-use dbus::blocking::Connection;
-use dbus::channel::MatchingReceiver;
-use dbus::message::MatchRule;
-use dbus_crossroads::{Crossroads, MethodErr};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,8 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const OBJECT_PATH: &str = "/org/onekvm/ExtensionHelper1";
-const INTERFACE: &str = "org.onekvm.ExtensionHelper1";
 const MAX_OUTPUT: usize = 1 << 20;
 const HELPER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_STACK_SIZE: usize = 128 * 1024;
@@ -36,6 +30,7 @@ struct ManagedProcess {
 
 struct HelperState {
     id: String,
+    address_file: PathBuf,
     controller: CommandSpec,
     controller_timeout: Duration,
     cgroups: CgroupManager,
@@ -69,8 +64,8 @@ struct Captured {
     oversized: bool,
 }
 
-fn method_error(context: &str, error: impl std::fmt::Display) -> MethodErr {
-    MethodErr::failed(&format!("{context}: {error}"))
+fn method_error(context: &str, error: impl std::fmt::Display) -> String {
+    format!("{context}: {error}")
 }
 
 fn command_from_spec(spec: &CommandSpec) -> Result<Command, String> {
@@ -761,6 +756,7 @@ pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let cgroups = CgroupManager::discover()?;
     let state = Arc::new(HelperState {
         id,
+        address_file,
         controller: CommandSpec {
             command: arguments[3..].to_vec(),
             environment: Vec::new(),
@@ -770,92 +766,287 @@ pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         last_work: Mutex::new(Instant::now()),
         instances: Mutex::new(HashMap::new()),
     });
-    let connection = Connection::new_system()?;
-    let interface_state = Arc::clone(&state);
-    let mut crossroads = Crossroads::new();
-    let interface = crossroads.register(INTERFACE, move |builder| {
-        let ping_state = Arc::clone(&interface_state);
-        builder.method("Ping", (), ("id",), move |_, _, ()| Ok((ping_state.id.clone(),)));
-
-        let controller_state = Arc::clone(&interface_state);
-        builder.method("RunController", ("payload",), ("output",), move |_, _, (payload,): (Vec<u8>,)| {
-            let result = run_capture(&controller_state.controller, &payload, controller_state.controller_timeout);
-            controller_state.touch();
-            let output = result.map_err(|error| method_error("run controller", error))?;
-            Ok((output,))
-        });
-
-        let ensure_state = Arc::clone(&interface_state);
-        builder.method("Ensure", ("name", "command", "environment", "restart"), (), move |_, _, (name, command, environment, restart): (String, Vec<String>, Vec<String>, String)| {
-            ensure_state.ensure(name, CommandSpec { command, environment }, restart)
-                .map_err(|error| method_error("ensure process", error))?;
-            Ok(())
-        });
-
-        let remove_state = Arc::clone(&interface_state);
-        builder.method("Remove", ("name",), (), move |_, _, (name,): (String,)| {
-            remove_state.remove(&name).map_err(|error| method_error("remove process", error))?;
-            Ok(())
-        });
-
-        let remove_all_state = Arc::clone(&interface_state);
-        builder.method("RemoveAll", (), (), move |_, _, ()| {
-            remove_all_state.remove_all().map_err(|error| method_error("remove all processes", error))?;
-            Ok(())
-        });
-
-        let restart_state = Arc::clone(&interface_state);
-        builder.method("Restart", ("name",), (), move |_, _, (name,): (String,)| {
-            restart_state.restart(&name).map_err(|error| method_error("restart process", error))?;
-            Ok(())
-        });
-
-        let exec_state = Arc::clone(&interface_state);
-        builder.method("Exec", ("command", "environment", "timeout_seconds"), (), move |_, _, (command, environment, timeout_seconds): (Vec<String>, Vec<String>, u32)| {
-            let timeout = Duration::from_secs(u64::from(timeout_seconds));
-            if timeout.is_zero() || timeout > Duration::from_secs(300) {
-                return Err(MethodErr::failed("action timeout must be between 1 and 300 seconds"));
-            }
-            // Keep the state captured so the D-Bus object cannot outlive the
-            // helper's controller/instance ownership.
-            let result = run_exec(&CommandSpec { command, environment }, timeout);
-            exec_state.touch();
-            result.map_err(|error| method_error("execute action", error))?;
-            Ok(())
-        });
-
-        let instances_state = Arc::clone(&interface_state);
-        builder.method("Instances", (), ("names",), move |_, _, ()| {
-            Ok((instances_state.instances().map_err(|error| method_error("list processes", error))?,))
-        });
-    });
-    crossroads.insert(OBJECT_PATH, &[interface], ());
-    write_address(&address_file, connection.unique_name().as_ref())?;
-    connection.start_receive(
-        MatchRule::new_method_call(),
-        Box::new(move |message, connection| {
-            if crossroads.handle_message(message, connection).is_err() {
-                eprintln!("onekvm-extension-helper: handle D-Bus message failed");
-            }
-            true
-        }),
-    );
-
-    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            connection.process(Duration::from_secs(1))?;
-            if state.has_managed_processes().map_err(io::Error::other)? {
-                continue;
-            }
-            if state.idle_for().map_err(io::Error::other)? >= HELPER_IDLE_TIMEOUT {
-                break;
-            }
-        }
-        Ok(())
-    })();
+    let raw = Arc::into_raw(state);
+    let status = unsafe { crate::ffi::onekvm_helper_serve(raw as *mut std::os::raw::c_void) };
+    let state = unsafe { Arc::from_raw(raw) };
     let _ = state.remove_all();
-    let _ = fs::remove_file(&address_file);
-    result
+    let _ = fs::remove_file(&state.address_file);
+    if status < 0 {
+        return Err(format!("sd-bus helper failed ({status})").into());
+    }
+    Ok(())
+}
+
+fn c_string(value: &str) -> *mut std::os::raw::c_char {
+    std::ffi::CString::new(value)
+        .unwrap_or_else(|_| std::ffi::CString::new("invalid").unwrap())
+        .into_raw()
+}
+
+fn set_err(slot: *mut *mut std::os::raw::c_char, message: String) {
+    unsafe { *slot = c_string(&message) };
+}
+
+unsafe fn string_vec(ptr: *mut *mut std::os::raw::c_char, count: usize) -> Vec<String> {
+    if ptr.is_null() || count == 0 {
+        return Vec::new();
+    }
+    std::slice::from_raw_parts(ptr, count)
+        .iter()
+        .map(|item| {
+            if item.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(*item)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .collect()
+}
+
+unsafe fn helper_ref<'a>(ptr: *mut std::os::raw::c_void) -> Option<&'a HelperState> {
+    ptr.cast::<HelperState>().as_ref()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_set_address(
+    helper: *mut std::os::raw::c_void,
+    name: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        return -1;
+    };
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
+    match write_address(&state.address_file, &name) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_ping(
+    helper: *mut std::os::raw::c_void,
+    id: *mut *mut std::os::raw::c_char,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    *id = c_string(&state.id);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_run_controller(
+    helper: *mut std::os::raw::c_void,
+    payload: *const std::os::raw::c_void,
+    size: usize,
+    output: *mut *mut std::os::raw::c_void,
+    out_size: *mut usize,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    let bytes = std::slice::from_raw_parts(payload as *const u8, size);
+    match run_capture(&state.controller, bytes, state.controller_timeout) {
+        Ok(data) => {
+            state.touch();
+            let size = data.len();
+            let ptr = libc::malloc(size.max(1)) as *mut u8;
+            if ptr.is_null() {
+                set_err(err, "allocate controller output".into());
+                return -1;
+            }
+            if size != 0 {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, size);
+            }
+            *out_size = size;
+            *output = ptr as *mut std::os::raw::c_void;
+            0
+        }
+        Err(error) => {
+            set_err(err, method_error("run controller", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_ensure(
+    helper: *mut std::os::raw::c_void,
+    name: *const std::os::raw::c_char,
+    command: *mut *mut std::os::raw::c_char,
+    ncommand: usize,
+    environment: *mut *mut std::os::raw::c_char,
+    nenv: usize,
+    restart: *const std::os::raw::c_char,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
+    let restart = std::ffi::CStr::from_ptr(restart).to_string_lossy().into_owned();
+    match state.ensure(
+        name,
+        CommandSpec {
+            command: string_vec(command, ncommand),
+            environment: string_vec(environment, nenv),
+        },
+        restart,
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_err(err, method_error("ensure process", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_remove(
+    helper: *mut std::os::raw::c_void,
+    name: *const std::os::raw::c_char,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
+    match state.remove(&name) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_err(err, method_error("remove process", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_remove_all(
+    helper: *mut std::os::raw::c_void,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    match state.remove_all() {
+        Ok(()) => 0,
+        Err(error) => {
+            set_err(err, method_error("remove all processes", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_restart(
+    helper: *mut std::os::raw::c_void,
+    name: *const std::os::raw::c_char,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
+    match state.restart(&name) {
+        Ok(()) => 0,
+        Err(error) => {
+            set_err(err, method_error("restart process", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_exec(
+    helper: *mut std::os::raw::c_void,
+    command: *mut *mut std::os::raw::c_char,
+    ncommand: usize,
+    environment: *mut *mut std::os::raw::c_char,
+    nenv: usize,
+    timeout: u32,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    let timeout = Duration::from_secs(u64::from(timeout));
+    if timeout.is_zero() || timeout > Duration::from_secs(300) {
+        set_err(err, "action timeout must be between 1 and 300 seconds".into());
+        return -1;
+    }
+    match run_exec(
+        &CommandSpec {
+            command: string_vec(command, ncommand),
+            environment: string_vec(environment, nenv),
+        },
+        timeout,
+    ) {
+        Ok(()) => {
+            state.touch();
+            0
+        }
+        Err(error) => {
+            set_err(err, method_error("execute action", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_instances(
+    helper: *mut std::os::raw::c_void,
+    names: *mut *mut *mut std::os::raw::c_char,
+    count: *mut usize,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    match state.instances() {
+        Ok(list) => {
+            let n = list.len();
+            let ptr = libc::malloc(std::mem::size_of::<*mut std::os::raw::c_char>().saturating_mul(n.max(1)))
+                as *mut *mut std::os::raw::c_char;
+            if ptr.is_null() {
+                set_err(err, "allocate instance list".into());
+                return -1;
+            }
+            for (index, name) in list.iter().enumerate() {
+                let item = std::ffi::CString::new(name.as_str()).unwrap_or_default();
+                *ptr.add(index) = libc::strdup(item.as_ptr());
+            }
+            *count = n;
+            *names = ptr;
+            0
+        }
+        Err(error) => {
+            set_err(err, method_error("list processes", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_should_exit(helper: *mut std::os::raw::c_void) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        return 1;
+    };
+    match (state.has_managed_processes(), state.idle_for()) {
+        (Ok(false), Ok(idle)) if idle >= HELPER_IDLE_TIMEOUT => 1,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -897,6 +1088,7 @@ mod tests {
         fs::create_dir_all(&instance_root).unwrap();
         let state = HelperState {
             id: "test".into(),
+            address_file: instance_root.join("helper.bus"),
             controller: CommandSpec {
                 command: vec!["/bin/true".into()],
                 environment: Vec::new(),
