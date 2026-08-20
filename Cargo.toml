@@ -10,7 +10,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [build-dependencies]
-cc = "1"
+cc = "=1.1.10"
 pkg-config = "0.3"
 
 [profile.release]
