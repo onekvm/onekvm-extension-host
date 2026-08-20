@@ -66,35 +66,33 @@ pub fn apply(
     method: &str,
     request: Option<Value>,
 ) -> Result<Value, String> {
-    sys::with_lock(|| {
-        if !paths::valid_id(id) {
-            return Err(format!("invalid extension id {id:?}"));
-        }
-        let state = read_state(id)?;
-        if revision != 0 && revision != state.revision {
+    if !paths::valid_id(id) {
+        return Err(format!("invalid extension id {id:?}"));
+    }
+    let state = read_state(id)?;
+    if revision != 0 && revision != state.revision {
+        return Err(format!(
+            "stale extension revision {revision}; current revision is {}",
+            state.revision
+        ));
+    }
+    let extension = load_installed(id, &state.active_version)?;
+    if extension.manifest.controller.is_none() {
+        return apply_legacy(&extension, &state, event);
+    }
+    if !method.is_empty() {
+        let spec = extension
+            .manifest
+            .methods
+            .get(method)
+            .ok_or_else(|| format!("extension {id} does not export method {method:?}"))?;
+        if !state.enabled && !spec.available_when_disabled {
             return Err(format!(
-                "stale extension revision {revision}; current revision is {}",
-                state.revision
+                "method {method:?} is unavailable while extension {id} is disabled"
             ));
         }
-        let extension = load_installed(id, &state.active_version)?;
-        if extension.manifest.controller.is_none() {
-            return apply_legacy(&extension, &state, event);
-        }
-        if !method.is_empty() {
-            let spec = extension
-                .manifest
-                .methods
-                .get(method)
-                .ok_or_else(|| format!("extension {id} does not export method {method:?}"))?;
-            if !state.enabled && !spec.available_when_disabled {
-                return Err(format!(
-                    "method {method:?} is unavailable while extension {id} is disabled"
-                ));
-            }
-        }
-        apply_controller(host, &extension, &state, event, reason, changed_keys, method, request)
-    })
+    }
+    apply_controller(host, &extension, &state, event, reason, changed_keys, method, request)
 }
 
 fn apply_legacy(extension: &Installed, state: &PluginState, event: &str) -> Result<Value, String> {
@@ -173,40 +171,38 @@ fn apply_controller(
 }
 
 pub fn reconcile_all(host: &Host, generation: &str) -> Result<(), String> {
-    sys::with_lock(|| {
-        write_generation(generation)?;
-        *host
-            .generation
-            .lock()
-            .map_err(|_| "host state lock is poisoned".to_string())? = generation.to_owned();
-        initialize_default_enabled_states()?;
-        let entries = match fs::read_dir(paths::CONFIG_ROOT) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err.to_string()),
-        };
-        let mut failures = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) || !name.ends_with(".json") {
-                continue;
-            }
-            let id = name.trim_end_matches(".json");
-            if !paths::valid_id(id) {
-                continue;
-            }
-            if let Err(err) = reconcile_one(host, id) {
-                failures.push(format!("{id}: {err}"));
-            }
+    write_generation(generation)?;
+    *host
+        .generation
+        .lock()
+        .map_err(|_| "host state lock is poisoned".to_string())? = generation.to_owned();
+    sys::with_lock(initialize_default_enabled_states)?;
+    let entries = match fs::read_dir(paths::CONFIG_ROOT) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) || !name.ends_with(".json") {
+            continue;
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("reconcile failures: {}", failures.join("; ")))
+        let id = name.trim_end_matches(".json");
+        if !paths::valid_id(id) {
+            continue;
         }
-    })
+        if let Err(err) = reconcile_one(host, id) {
+            failures.push(format!("{id}: {err}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("reconcile failures: {}", failures.join("; ")))
+    }
 }
 
 fn reconcile_one(host: &Host, id: &str) -> Result<(), String> {
