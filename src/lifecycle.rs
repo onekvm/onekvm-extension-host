@@ -198,6 +198,7 @@ pub fn enable_unlocked(id: &str) -> Result<(), String> {
     if !was_enabled {
         memory::validate(id, &extension.manifest)?;
     }
+    crate::sandbox::load_kernel_modules(&extension)?;
     state.enabled = true;
     if !was_enabled {
         state.revision += 1;
@@ -227,6 +228,8 @@ pub fn start(id: &str) -> Result<(), String> {
         if state.active_version.is_empty() {
             return Err(format!("extension {id} has no active version"));
         }
+        let extension = load_installed(id, &state.active_version)?;
+        crate::sandbox::load_kernel_modules(&extension)?;
         crate::dbus_client::reconcile(id, state.revision)
     })
 }
@@ -387,14 +390,24 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
         }
         write_state(id, &state)?;
         if !changed_keys.is_empty() {
-            let settings = serde_json::to_string(&Value::Object(
-                state.settings.clone().into_iter().collect(),
-            ))
-            .map_err(|e| e.to_string())?;
-            crate::dbus_client::apply_config(id, state.revision, &settings, &changed_keys)?;
+            if extension.manifest.controller.is_some() {
+                let settings = serde_json::to_string(&Value::Object(
+                    state.settings.clone().into_iter().collect(),
+                ))
+                .map_err(|e| e.to_string())?;
+                crate::dbus_client::apply_config(id, state.revision, &settings, &changed_keys)?;
+            } else if extension.manifest.settings_reload == "watch" {
+                let settings = settings::settings_for_state(&extension, &state)?;
+                settings::write_runtime_settings(id, &settings)?;
+            } else if state.enabled {
+                crate::dbus_client::disable(id, state.revision)?;
+                crate::sandbox::load_kernel_modules(&extension)?;
+                crate::dbus_client::reconcile(id, state.revision)?;
+            }
         }
         if enabled_changed {
             if state.enabled {
+                crate::sandbox::load_kernel_modules(&extension)?;
                 crate::dbus_client::enable(id, state.revision)?;
             } else {
                 crate::dbus_client::disable(id, state.revision)?;
@@ -447,8 +460,17 @@ pub fn restore() -> Result<(), String> {
                         continue;
                     }
                 }
-                if let Err(err) = crate::dbus_client::reconcile(id, state.revision) {
-                    failures.push(format!("{id}: {err}"));
+                match load_installed(id, &state.active_version) {
+                    Ok(extension) => {
+                        if let Err(err) = crate::sandbox::load_kernel_modules(&extension) {
+                            failures.push(format!("{id}: {err}"));
+                            continue;
+                        }
+                        if let Err(err) = crate::dbus_client::reconcile(id, state.revision) {
+                            failures.push(format!("{id}: {err}"));
+                        }
+                    }
+                    Err(err) => failures.push(format!("{id}: {err}")),
                 }
             }
             Ok(_) => {}
