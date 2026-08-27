@@ -1,10 +1,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/capability.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <systemd/sd-bus.h>
+#include <systemd/sd-daemon.h>
 #include <time.h>
 
 #define HOST_NAME "org.onekvm.ExtensionHost1"
@@ -14,13 +17,13 @@
 #define HELPER_PATH "/org/onekvm/ExtensionHelper1"
 #define HELPER_IFACE "org.onekvm.ExtensionHelper1"
 #define CORE_NAME "org.onekvm.Core1"
-#define IDLE_USEC (30 * 1000000ull)
 
 int onekvm_host_apply_config(void *host, const char *id, uint64_t revision,
                              const char *settings, char **keys, size_t nkeys,
                              char **err);
 int onekvm_host_simple(void *host, const char *method, const char *id,
                        uint64_t revision, char **err);
+int onekvm_host_prewarm(void *host, char **err);
 int onekvm_host_reconcile_all(void *host, const char *generation, char **err);
 int onekvm_host_invoke(void *host, const char *id, const char *method,
                        const char *request, char **response, char **err);
@@ -107,6 +110,500 @@ static void free_string_array(char **values, size_t count) {
     free(values);
 }
 
+static int append_string_array(sd_bus_message *message, char **values, size_t count);
+
+static int append_property_strv(sd_bus_message *message, const char *name,
+                                const char *value) {
+    char *copy = strdup(value ? value : "");
+    if (!copy)
+        return -ENOMEM;
+    int result = sd_bus_message_open_container(message, 'r', "sv");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", name);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'v', "as");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "s");
+    if (result < 0)
+        goto out;
+    char *state = NULL;
+    for (char *word = strtok_r(copy, " \t", &state); word;
+         word = strtok_r(NULL, " \t", &state)) {
+        result = sd_bus_message_append(message, "s", word);
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+out:
+    free(copy);
+    return result;
+}
+
+static int parse_boolean(const char *value, int *out) {
+    if (!value || !out)
+        return -EINVAL;
+    if (strcmp(value, "yes") == 0 || strcmp(value, "true") == 0 ||
+        strcmp(value, "1") == 0) {
+        *out = 1;
+        return 0;
+    }
+    if (strcmp(value, "no") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "0") == 0) {
+        *out = 0;
+        return 0;
+    }
+    return -EINVAL;
+}
+
+static int parse_unsigned(const char *value, int base, uint64_t *out) {
+    if (!value || !value[0] || !out || value[0] == '-')
+        return -EINVAL;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, base);
+    if (errno || !end || end == value || *end)
+        return -EINVAL;
+    *out = (uint64_t)parsed;
+    return 0;
+}
+
+static int parse_size(const char *value, uint64_t *out) {
+    if (!value || !value[0] || !out || value[0] == '-')
+        return -EINVAL;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno || !end || end == value)
+        return -EINVAL;
+    uint64_t multiplier = 1;
+    if (end[0] && !end[1]) {
+        switch (end[0]) {
+        case 'K': case 'k': multiplier = 1024ull; break;
+        case 'M': case 'm': multiplier = 1024ull * 1024ull; break;
+        case 'G': case 'g': multiplier = 1024ull * 1024ull * 1024ull; break;
+        default: return -EINVAL;
+        }
+    } else if (end[0])
+        return -EINVAL;
+    if ((uint64_t)parsed > UINT64_MAX / multiplier)
+        return -ERANGE;
+    *out = (uint64_t)parsed * multiplier;
+    return 0;
+}
+
+static int parse_usec(const char *value, uint64_t *out) {
+    if (!value || !value[0] || !out || value[0] == '-')
+        return -EINVAL;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno || !end || end == value)
+        return -EINVAL;
+    uint64_t multiplier;
+    if (strcmp(end, "s") == 0)
+        multiplier = 1000000ull;
+    else if (strcmp(end, "ms") == 0)
+        multiplier = 1000ull;
+    else if (strcmp(end, "us") == 0)
+        multiplier = 1;
+    else
+        return -EINVAL;
+    if ((uint64_t)parsed > UINT64_MAX / multiplier)
+        return -ERANGE;
+    *out = (uint64_t)parsed * multiplier;
+    return 0;
+}
+
+static int append_filter_property(sd_bus_message *message, const char *name,
+                                  const char *value) {
+    int allow = 1;
+    if (value && value[0] == '~') {
+        allow = 0;
+        value++;
+    }
+    char *copy = strdup(value ? value : "");
+    if (!copy)
+        return -ENOMEM;
+    int result = sd_bus_message_open_container(message, 'r', "sv");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", name);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'v', "(bas)");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'r', "bas");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "b", allow);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "s");
+    if (result < 0)
+        goto out;
+    char *state = NULL;
+    for (char *word = strtok_r(copy, " \t", &state); word;
+         word = strtok_r(NULL, " \t", &state)) {
+        result = sd_bus_message_append(message, "s", word);
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+out:
+    free(copy);
+    return result;
+}
+
+static int append_pair_array_property(sd_bus_message *message, const char *name,
+                                      const char *first, const char *second) {
+    return sd_bus_message_append(message, "(sv)", name, "a(ss)", 1,
+                                 first ? first : "", second ? second : "");
+}
+
+static int append_capabilities(sd_bus_message *message, const char *name,
+                               const char *value) {
+    char *copy = strdup(value ? value : "");
+    if (!copy)
+        return -ENOMEM;
+    uint64_t mask = 0;
+    char *state = NULL;
+    int result = 0;
+    for (char *word = strtok_r(copy, " \t", &state); word;
+         word = strtok_r(NULL, " \t", &state)) {
+        unsigned capability;
+        if (strcmp(word, "CAP_NET_ADMIN") == 0)
+            capability = CAP_NET_ADMIN;
+        else if (strcmp(word, "CAP_NET_RAW") == 0)
+            capability = CAP_NET_RAW;
+        else {
+            result = -EINVAL;
+            goto out;
+        }
+        mask |= 1ull << capability;
+    }
+    result = sd_bus_message_append(message, "(sv)", name, "t", mask);
+out:
+    free(copy);
+    return result;
+}
+
+static int append_transient_property(sd_bus_message *message,
+                                     const char *assignment) {
+    const char *separator = assignment ? strchr(assignment, '=') : NULL;
+    if (!separator || separator == assignment)
+        return -EINVAL;
+    char *name = strndup(assignment, (size_t)(separator - assignment));
+    if (!name)
+        return -ENOMEM;
+    const char *value = separator + 1;
+    int result;
+
+    if (strcmp(name, "Type") == 0 || strcmp(name, "User") == 0 ||
+        strcmp(name, "Group") == 0 || strcmp(name, "ProtectSystem") == 0 ||
+        strcmp(name, "ProtectHome") == 0 || strcmp(name, "DevicePolicy") == 0 ||
+        strcmp(name, "Restart") == 0 || strcmp(name, "KillMode") == 0 ||
+        strcmp(name, "CollectMode") == 0) {
+        result = sd_bus_message_append(message, "(sv)", name, "s", value);
+    } else if (strcmp(name, "NoNewPrivileges") == 0 ||
+               strcmp(name, "PrivateTmp") == 0 ||
+               strcmp(name, "ProtectKernelTunables") == 0 ||
+               strcmp(name, "ProtectKernelModules") == 0 ||
+               strcmp(name, "ProtectKernelLogs") == 0 ||
+               strcmp(name, "ProtectControlGroups") == 0 ||
+               strcmp(name, "ProtectHostname") == 0 ||
+               strcmp(name, "RestrictSUIDSGID") == 0 ||
+               strcmp(name, "LockPersonality") == 0 ||
+               strcmp(name, "RestrictRealtime") == 0 ||
+               strcmp(name, "PrivateNetwork") == 0 ||
+               strcmp(name, "PrivateDevices") == 0 ||
+               strcmp(name, "ProtectClock") == 0 ||
+               strcmp(name, "Delegate") == 0) {
+        int boolean;
+        result = parse_boolean(value, &boolean);
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)", name, "b", boolean);
+    } else if (strcmp(name, "ReadOnlyPaths") == 0 ||
+               strcmp(name, "ReadWritePaths") == 0 ||
+               strcmp(name, "SystemCallArchitectures") == 0 ||
+               strcmp(name, "BindsTo") == 0 || strcmp(name, "PartOf") == 0 ||
+               strcmp(name, "After") == 0) {
+        result = append_property_strv(message, name, value);
+    } else if (strcmp(name, "RestrictAddressFamilies") == 0) {
+        result = append_filter_property(message, name, value);
+    } else if (strcmp(name, "CapabilityBoundingSet") == 0 ||
+               strcmp(name, "AmbientCapabilities") == 0) {
+        result = append_capabilities(message, name, value);
+    } else if (strcmp(name, "UMask") == 0) {
+        uint64_t mode;
+        result = parse_unsigned(value, 8, &mode);
+        if (result >= 0 && mode > UINT_MAX)
+            result = -ERANGE;
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)", name, "u", (uint32_t)mode);
+    } else if (strcmp(name, "MemoryMax") == 0) {
+        uint64_t limit;
+        result = parse_size(value, &limit);
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)", name, "t", limit);
+    } else if (strcmp(name, "TasksMax") == 0) {
+        uint64_t limit;
+        result = parse_unsigned(value, 10, &limit);
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)", name, "t", limit);
+    } else if (strcmp(name, "CPUQuota") == 0) {
+        size_t length = strlen(value);
+        uint64_t percent;
+        if (length < 2 || value[length - 1] != '%')
+            result = -EINVAL;
+        else {
+            char *number = strndup(value, length - 1);
+            if (!number)
+                result = -ENOMEM;
+            else {
+                result = parse_unsigned(number, 10, &percent);
+                free(number);
+                if (result >= 0 && (percent == 0 || percent > UINT64_MAX / 10000ull))
+                    result = -ERANGE;
+                if (result >= 0)
+                    result = sd_bus_message_append(message, "(sv)",
+                                                   "CPUQuotaPerSecUSec", "t",
+                                                   percent * 10000ull);
+            }
+        }
+    } else if (strcmp(name, "LimitNOFILE") == 0) {
+        uint64_t limit;
+        result = parse_unsigned(value, 10, &limit);
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)(sv)",
+                                           "LimitNOFILE", "t", limit,
+                                           "LimitNOFILESoft", "t", limit);
+    } else if (strcmp(name, "RestartSec") == 0 ||
+               strcmp(name, "TimeoutStopSec") == 0) {
+        uint64_t usec;
+        result = parse_usec(value, &usec);
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)",
+                                           strcmp(name, "RestartSec") == 0
+                                               ? "RestartUSec" : "TimeoutStopUSec",
+                                           "t", usec);
+    } else if (strcmp(name, "LoadCredential") == 0) {
+        const char *colon = strchr(value, ':');
+        if (!colon || colon == value || !colon[1])
+            result = -EINVAL;
+        else {
+            char *credential = strndup(value, (size_t)(colon - value));
+            if (!credential)
+                result = -ENOMEM;
+            else {
+                result = append_pair_array_property(message, name, credential, colon + 1);
+                free(credential);
+            }
+        }
+    } else if (strcmp(name, "DeviceAllow") == 0) {
+        const char *space = strchr(value, ' ');
+        if (!space || space == value)
+            result = append_pair_array_property(message, name, value, "");
+        else {
+            char *device = strndup(value, (size_t)(space - value));
+            if (!device)
+                result = -ENOMEM;
+            else {
+                while (*space == ' ' || *space == '\t')
+                    space++;
+                result = append_pair_array_property(message, name, device, space);
+                free(device);
+            }
+        }
+    } else
+        result = -EINVAL;
+
+    free(name);
+    return result;
+}
+
+static int wait_for_unit_start(sd_bus *bus, const char *unit) {
+    const uint64_t deadline = now_usec() + 35000000ull;
+    for (;;) {
+        sd_bus_message *reply = NULL;
+        sd_bus_error error = SD_BUS_ERROR_NULL;
+        char *state = NULL;
+        const char *path = NULL;
+        int result = sd_bus_call_method(bus, "org.freedesktop.systemd1",
+                                        "/org/freedesktop/systemd1",
+                                        "org.freedesktop.systemd1.Manager", "GetUnit",
+                                        &error, &reply, "s", unit);
+        if (result >= 0)
+            result = sd_bus_message_read(reply, "o", &path);
+        if (result >= 0)
+            result = sd_bus_get_property_string(bus, "org.freedesktop.systemd1", path,
+                                                "org.freedesktop.systemd1.Unit",
+                                                "ActiveState", &error, &state);
+        if (result >= 0 &&
+            (strcmp(state, "active") == 0 || strcmp(state, "reloading") == 0))
+            result = 0;
+        else if (result >= 0 && strcmp(state, "failed") == 0)
+            result = -EIO;
+        else if (now_usec() >= deadline)
+            result = -ETIMEDOUT;
+        else
+            result = -EAGAIN;
+        free(state);
+        sd_bus_error_free(&error);
+        sd_bus_message_unref(reply);
+        if (result != -EAGAIN)
+            return result;
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 25000000 };
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+            ;
+    }
+}
+
+int onekvm_start_transient_service(const char *unit, const char *slice,
+                                   const char *working_directory,
+                                   char **properties, size_t nproperties,
+                                   char **environment, size_t nenv,
+                                   char **command, size_t ncommand) {
+    if (!unit || !unit[0] || !command || ncommand == 0 || !command[0] || !command[0][0])
+        return -EINVAL;
+    sd_bus *bus = NULL;
+    sd_bus_message *message = NULL, *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_new_method_call(bus, &message, "org.freedesktop.systemd1",
+                                            "/org/freedesktop/systemd1",
+                                            "org.freedesktop.systemd1.Manager",
+                                            "StartTransientUnit");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "ss", unit, "replace");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "(sv)");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "(sv)", "Description", "s", unit);
+    if (result < 0)
+        goto out;
+    if (slice && slice[0]) {
+        result = sd_bus_message_append(message, "(sv)", "Slice", "s", slice);
+        if (result < 0)
+            goto out;
+    }
+    for (size_t i = 0; i < nproperties; i++) {
+        result = append_transient_property(message, properties[i]);
+        if (result < 0)
+            goto out;
+    }
+    if (working_directory && working_directory[0]) {
+        result = sd_bus_message_append(message, "(sv)", "WorkingDirectory", "s",
+                                       working_directory);
+        if (result < 0)
+            goto out;
+    }
+    if (environment && nenv > 0) {
+        result = sd_bus_message_open_container(message, 'r', "sv");
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_append(message, "s", "Environment");
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_open_container(message, 'v', "as");
+        if (result < 0)
+            goto out;
+        result = append_string_array(message, environment, nenv);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_message_open_container(message, 'r', "sv");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", "ExecStart");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'v', "a(sasb)");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "(sasb)");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'r', "sasb");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", command[0]);
+    if (result < 0)
+        goto out;
+    result = append_string_array(message, command, ncommand);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "b", 0);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "a(sa(sv))", 0);
+    if (result < 0)
+        goto out;
+    result = sd_bus_call(bus, message, 0, &error, &reply);
+    if (result >= 0)
+        result = wait_for_unit_start(bus, unit);
+    else if (result == -EEXIST) {
+        /* A just-stopped transient unit can remain loaded until systemd's
+         * garbage collector runs. StartTransientUnit still restarts that
+         * existing unit before reporting EEXIST; accept it once Type=exec has
+         * reached active instead of turning a successful warm restart into a
+         * reconcile failure. */
+        int started = wait_for_unit_start(bus, unit);
+        if (started >= 0)
+            result = 0;
+    }
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    sd_bus_message_unref(message);
+    sd_bus_unref(bus);
+    return result < 0 ? result : 0;
+}
+
 static int append_string_array(sd_bus_message *message, char **values, size_t count) {
     int result = sd_bus_message_open_container(message, 'a', "s");
     if (result < 0)
@@ -163,6 +660,18 @@ static int host_reconcile_all(sd_bus_message *message, void *userdata, sd_bus_er
     if (result != 0)
         return fail(error, err);
     free(err);
+    result = sd_notify(0, "READY=1\nSTATUS=Extensions reconciled");
+    if (result < 0)
+        return fail(error, strdup("notify systemd after extension reconcile failed"));
+    return sd_bus_reply_method_return(message, "");
+}
+
+static int host_prewarm(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+    char *err = NULL;
+    int result = onekvm_host_prewarm(userdata, &err);
+    if (result != 0)
+        return fail(error, err);
+    free(err);
     return sd_bus_reply_method_return(message, "");
 }
 
@@ -199,6 +708,7 @@ static const sd_bus_vtable host_vtable[] = {
     SD_BUS_METHOD("Enable", "st", "", host_simple, 0),
     SD_BUS_METHOD("Disable", "st", "", host_simple, 0),
     SD_BUS_METHOD("Reconcile", "st", "", host_simple, 0),
+    SD_BUS_METHOD("Prewarm", "", "", host_prewarm, 0),
     SD_BUS_METHOD("ReconcileAll", "s", "", host_reconcile_all, 0),
     SD_BUS_METHOD("Invoke", "sss", "s", host_invoke, 0),
     SD_BUS_VTABLE_END,
@@ -223,23 +733,16 @@ int onekvm_host_serve(void *host) {
     result = sd_bus_request_name(bus, HOST_NAME, 0);
     if (result < 0)
         goto out;
-    uint64_t deadline = now_usec() + IDLE_USEC;
     for (;;) {
         result = sd_bus_process(bus, NULL);
         if (result < 0)
             goto out;
-        if (result > 0) {
-            deadline = now_usec() + IDLE_USEC;
+        if (result > 0)
             continue;
-        }
-        uint64_t now = now_usec();
-        if (now >= deadline)
-            break;
-        result = sd_bus_wait(bus, deadline - now);
+        result = sd_bus_wait(bus, UINT64_MAX);
         if (result < 0)
             goto out;
     }
-    result = 0;
 out:
     sd_bus_unref(bus);
     return result;
@@ -528,7 +1031,7 @@ int onekvm_helper_client_ensure(const char *unique, const char *name, char **com
 out:
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
-    return result;
+    return result < 0 ? result : 0;
 }
 
 int onekvm_helper_client_simple(const char *unique, const char *method, const char *name) {
@@ -568,7 +1071,7 @@ int onekvm_helper_client_exec(const char *unique, char **command, size_t ncomman
 out:
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
-    return result;
+    return result < 0 ? result : 0;
 }
 
 int onekvm_helper_serve(void *helper) {
@@ -604,6 +1107,137 @@ int onekvm_helper_serve(void *helper) {
     }
     result = 0;
 out:
+    sd_bus_unref(bus);
+    return result;
+}
+
+static int cli_set_error(char **err, const char *text) {
+    if (!err)
+        return -EIO;
+    *err = strdup(text && text[0] ? text : "extension host call failed");
+    return *err ? -EIO : -ENOMEM;
+}
+
+int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision, char **err) {
+    sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        return cli_set_error(err, strerror(-result));
+    result = sd_bus_message_new_method_call(bus, &message, HOST_NAME, HOST_PATH, HOST_IFACE, method);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "st", id, revision);
+    if (result < 0)
+        goto out;
+    result = sd_bus_call(bus, message, 35000000, &error, NULL);
+    if (result < 0)
+        result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(message);
+    sd_bus_unref(bus);
+    return result < 0 ? result : 0;
+}
+
+int onekvm_cli_host_invoke(const char *id, const char *method, const char *request, char **response,
+                           char **err) {
+    sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL;
+    sd_bus_message *reply = NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        return cli_set_error(err, strerror(-result));
+    result = sd_bus_message_new_method_call(bus, &message, HOST_NAME, HOST_PATH, HOST_IFACE, "Invoke");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "sss", id, method, request ? request : "null");
+    if (result < 0)
+        goto out;
+    result = sd_bus_call(bus, message, 35000000, &error, &reply);
+    if (result < 0) {
+        result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+        goto out;
+    }
+    const char *value = NULL;
+    result = sd_bus_message_read(reply, "s", &value);
+    if (result < 0)
+        goto out;
+    *response = strdup(value ? value : "null");
+    result = *response ? 0 : -ENOMEM;
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    sd_bus_message_unref(message);
+    sd_bus_unref(bus);
+    return result;
+}
+
+int onekvm_cli_host_apply_config(const char *id, uint64_t revision, const char *settings, char **keys,
+                                 size_t nkeys, char **err) {
+    sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        return cli_set_error(err, strerror(-result));
+    result = sd_bus_message_new_method_call(bus, &message, HOST_NAME, HOST_PATH, HOST_IFACE,
+                                            "ApplyConfig");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "sts", id, revision, settings ? settings : "{}");
+    if (result < 0)
+        goto out;
+    result = append_string_array(message, keys, nkeys);
+    if (result < 0)
+        goto out;
+    result = sd_bus_call(bus, message, 35000000, &error, NULL);
+    if (result < 0)
+        result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(message);
+    sd_bus_unref(bus);
+    return result < 0 ? result : 0;
+}
+
+int onekvm_cli_dbus_call_s(const char *dest, const char *path, const char *iface, const char *method,
+                           const char *arg, int has_arg, char **response, int want_response,
+                           char **err) {
+    sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL;
+    sd_bus_message *reply = NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        return cli_set_error(err, strerror(-result));
+    result = sd_bus_message_new_method_call(bus, &message, dest, path, iface, method);
+    if (result < 0)
+        goto out;
+    if (has_arg) {
+        result = sd_bus_message_append(message, "s", arg ? arg : "");
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_call(bus, message, 5000000, &error, want_response ? &reply : NULL);
+    if (result < 0) {
+        result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+        goto out;
+    }
+    if (want_response && response) {
+        const char *value = NULL;
+        result = sd_bus_message_read(reply, "s", &value);
+        if (result < 0)
+            goto out;
+        *response = strdup(value ? value : "");
+        result = *response ? 0 : -ENOMEM;
+    }
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    sd_bus_message_unref(message);
     sd_bus_unref(bus);
     return result;
 }

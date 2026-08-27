@@ -120,3 +120,53 @@ pub fn quiet(command: &str, args: &[&str]) -> bool {
         .map(|status| status.success())
         .unwrap_or(false)
 }
+
+pub fn output(command: &str, args: &[String]) -> Result<Vec<u8>, String> {
+    let result = std::process::Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{command}: {e}"))?;
+    if result.status.success() {
+        Ok(result.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        Err(format!(
+            "{}: {}",
+            Path::new(command)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(command),
+            stderr.trim()
+        ))
+    }
+}
+
+pub fn opkg(args: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
+    owned.extend(args.iter().map(|value| (*value).to_owned()));
+    run(paths::OPKG, &owned)
+}
+
+pub fn opkg_output(args: &[&str]) -> Result<Vec<u8>, String> {
+    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
+    owned.extend(args.iter().map(|value| (*value).to_owned()));
+    output(paths::OPKG, &owned)
+}
+
+pub fn opkg_in(dir: &Path, args: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
+    owned.extend(args.iter().map(|value| (*value).to_owned()));
+    let status = std::process::Command::new(paths::OPKG)
+        .args(&owned)
+        .current_dir(dir)
+        .status()
+        .map_err(|e| format!("opkg: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("opkg failed with {}", status.code().unwrap_or(-1)))
+    }
+}

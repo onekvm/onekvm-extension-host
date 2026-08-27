@@ -108,6 +108,21 @@ pub unsafe extern "C" fn onekvm_host_reconcile_all(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn onekvm_host_prewarm(
+    host: *mut c_void,
+    err: *mut *mut c_char,
+) -> c_int {
+    let result = host_ref(host).and_then(|_| host::prewarm());
+    match result {
+        Ok(()) => 0,
+        Err(message) => {
+            err_ptr(err, message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn onekvm_host_invoke(
     host: *mut c_void,
     id: *const c_char,

@@ -2,9 +2,12 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A low-memory D-Bus process host for OneKVM extensions. The plugin manager uses
-it to launch extension processes and dispatch lifecycle operations without
-adding a second large runtime service.
+A low-memory D-Bus process host for OneKVM extensions. The same binary is the
+extension manager CLI: no arguments start `org.onekvm.ExtensionHost1`, while
+`catalog` / `install` / `enable` and the rest of the former
+`onekvm-extension-manager` commands run in-process. Core calls
+`/usr/bin/onekvm-extension-host`. A compatibility symlink
+`onekvm-extension-manager` remains for rolling upgrades.
 
 ## Build and test
 

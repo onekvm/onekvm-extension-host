@@ -167,6 +167,96 @@ pub fn repair_settings_output_permissions() -> Result<(), String> {
     Ok(())
 }
 
+pub fn apply_update(
+    extension: &Installed,
+    current: &Value,
+    update: &serde_json::Map<String, Value>,
+) -> Result<Value, String> {
+    let mut result = match current {
+        Value::Object(map) => map.clone(),
+        _ => return Err("settings must be an object".into()),
+    };
+    for (key, value) in update {
+        let property = extension
+            .manifest
+            .settings_schema
+            .properties
+            .get(key)
+            .ok_or_else(|| format!("unknown setting {key:?}"))?;
+        if property.read_only {
+            return Err(format!("setting {key:?} is read-only"));
+        }
+        result.insert(key.clone(), value.clone());
+    }
+    let settings = Value::Object(result);
+    validate_settings(&extension.manifest.settings_schema, &settings)?;
+    Ok(settings)
+}
+
+pub fn redact(manifest: &crate::manifest::Manifest, settings: &Value) -> (Value, Vec<String>) {
+    let mut result = settings.clone();
+    let mut configured = Vec::new();
+    if let Value::Object(map) = &mut result {
+        for pointer in &manifest.secret_fields {
+            let name = pointer.trim_start_matches('/');
+            if let Some(Value::String(secret)) = map.get(name) {
+                if !secret.is_empty() {
+                    configured.push(pointer.clone());
+                }
+            }
+            map.remove(name);
+        }
+    }
+    configured.sort();
+    (result, configured)
+}
+
+pub fn merge_output(extension: &Installed, settings: &mut Value) -> Result<(), String> {
+    let path = Path::new(paths::APP_DATA_ROOT)
+        .join(&extension.manifest.id)
+        .join(paths::SETTINGS_OUTPUT);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(err) => return Err(format!("read extension settings output: {err}")),
+    };
+    if data.len() > 64 << 10 {
+        return Err("extension settings output exceeds 64 KiB".into());
+    }
+    let output: serde_json::Map<String, Value> = serde_json::from_slice(&data)
+        .map_err(|e| format!("decode extension settings output: {e}"))?;
+    let Value::Object(map) = settings else {
+        return Err("settings must be an object".into());
+    };
+    for (name, value) in output {
+        let property = extension
+            .manifest
+            .settings_schema
+            .properties
+            .get(&name)
+            .ok_or_else(|| format!("extension settings output contains unknown setting {name:?}"))?;
+        if !property.read_only {
+            return Err(format!(
+                "extension settings output contains writable setting {name:?}"
+            ));
+        }
+        validate_value(property, &value)
+            .map_err(|err| format!("extension settings output {name}: {err}"))?;
+        map.insert(name, value);
+    }
+    validate_settings(&extension.manifest.settings_schema, settings)
+        .map_err(|err| format!("validate extension settings output: {err}"))
+}
+
+pub fn service_enabled(settings: &Value) -> bool {
+    match settings.get("service_enabled") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        _ => true,
+    }
+}
+
 pub fn repair_settings_output_permission(id: &str) -> Result<(), String> {
     let path = Path::new(paths::APP_DATA_ROOT).join(id).join(paths::SETTINGS_OUTPUT);
     let info = match fs::symlink_metadata(&path) {

@@ -41,7 +41,7 @@ extern "C" {
 fn unique_name(id: &str) -> Result<CString, String> {
     let data = std::fs::read_to_string(paths::helper_address(id))
         .map_err(|e| format!("read extension helper address: {e}"))?;
-    let name = data.trim();
+    let name = data.lines().next().unwrap_or_default();
     if name.len() > 128 || !name.starts_with(':') {
         return Err("extension helper address is invalid".into());
     }
@@ -93,8 +93,9 @@ pub fn call(id: &str, method: &str, args: &[Value]) -> Result<Vec<Value>, String
                 .ok_or_else(|| "helper name is required".to_string())?;
             let name = c_string(name)?;
             let method = c_string(method)?;
-            let status =
-                unsafe { onekvm_helper_client_simple(unique.as_ptr(), method.as_ptr(), name.as_ptr()) };
+            let status = unsafe {
+                onekvm_helper_client_simple(unique.as_ptr(), method.as_ptr(), name.as_ptr())
+            };
             if status != 0 {
                 return Err(fail(status, method.to_str().unwrap_or("helper")));
             }
@@ -117,10 +118,7 @@ pub fn call(id: &str, method: &str, args: &[Value]) -> Result<Vec<Value>, String
                 .ok_or_else(|| "ensure name is required".to_string())?;
             let command = string_list(args.get(1))?;
             let environment = string_list(args.get(2))?;
-            let restart = args
-                .get(3)
-                .and_then(Value::as_str)
-                .unwrap_or("on-failure");
+            let restart = args.get(3).and_then(Value::as_str).unwrap_or("on-failure");
             let name = c_string(name)?;
             let restart = c_string(restart)?;
             let mut command = CStrings::from_values(&command)?;

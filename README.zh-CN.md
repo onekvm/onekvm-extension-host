@@ -2,9 +2,11 @@
 
 [English](README.md) | 简体中文
 
-面向 OneKVM 扩展的低内存 D-Bus 生命周期宿主（libsystemd sd-bus）。它实现
-`org.onekvm.ExtensionHost1`，并按扩展拉起 `--plugin-helper`。安装/卸载仍由
-`onekvm-extension-manager` 负责。
+面向 OneKVM 扩展的低内存 D-Bus 生命周期宿主（libsystemd sd-bus）。同一二进制
+也是扩展管理 CLI：无参数时认领 `org.onekvm.ExtensionHost1`；`catalog` /
+`install` / `enable` 等原 `onekvm-extension-manager` 子命令在进程内执行。
+Core 直接调用 `/usr/bin/onekvm-extension-host`。滚动升级期间仍提供
+`onekvm-extension-manager` 符号链接。
 
 ## 编译和测试
 

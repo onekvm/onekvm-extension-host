@@ -11,7 +11,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT: usize = 1 << 20;
-const HELPER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_STACK_SIZE: usize = 128 * 1024;
 
 #[derive(Clone)]
@@ -30,11 +29,11 @@ struct ManagedProcess {
 
 struct HelperState {
     id: String,
+    reuse_key: String,
     address_file: PathBuf,
     controller: CommandSpec,
     controller_timeout: Duration,
     cgroups: CgroupManager,
-    last_work: Mutex<Instant>,
     instances: Mutex<HashMap<String, ManagedProcess>>,
 }
 
@@ -564,22 +563,7 @@ fn stop_managed(process: ManagedProcess) {
 }
 
 impl HelperState {
-    fn touch(&self) {
-        if let Ok(mut last_work) = self.last_work.lock() {
-            *last_work = Instant::now();
-        }
-    }
-
-    fn idle_for(&self) -> Result<Duration, String> {
-        Ok(self
-            .last_work
-            .lock()
-            .map_err(|_| "activity lock is poisoned")?
-            .elapsed())
-    }
-
     fn ensure(&self, name: String, spec: CommandSpec, restart: String) -> Result<(), String> {
-        self.touch();
         if name.is_empty()
             || !name
                 .bytes()
@@ -647,7 +631,6 @@ impl HelperState {
     }
 
     fn remove(&self, name: &str) -> Result<(), String> {
-        self.touch();
         let process = self
             .instances
             .lock()
@@ -660,7 +643,6 @@ impl HelperState {
     }
 
     fn remove_all(&self) -> Result<(), String> {
-        self.touch();
         let processes: Vec<_> = self
             .instances
             .lock()
@@ -675,7 +657,6 @@ impl HelperState {
     }
 
     fn restart(&self, name: &str) -> Result<(), String> {
-        self.touch();
         let process = self
             .instances
             .lock()
@@ -700,35 +681,9 @@ impl HelperState {
         names.sort();
         Ok(names)
     }
-
-    fn has_managed_processes(&self) -> Result<bool, String> {
-        let finished: Vec<String> = self
-            .instances
-            .lock()
-            .map_err(|_| "instance lock is poisoned")?
-            .iter()
-            .filter(|(_, process)| process.thread.is_finished())
-            .map(|(name, _)| name.clone())
-            .collect();
-        for name in finished {
-            let process = self
-                .instances
-                .lock()
-                .map_err(|_| "instance lock is poisoned")?
-                .remove(&name);
-            if let Some(process) = process {
-                stop_managed(process);
-            }
-        }
-        Ok(!self
-            .instances
-            .lock()
-            .map_err(|_| "instance lock is poisoned")?
-            .is_empty())
-    }
 }
 
-fn write_address(path: &Path, address: &str) -> io::Result<()> {
+fn write_address(path: &Path, address: &str, reuse_key: &str) -> io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let _ = fs::remove_file(&temporary);
     let mut output = OpenOptions::new()
@@ -736,6 +691,7 @@ fn write_address(path: &Path, address: &str) -> io::Result<()> {
         .create_new(true)
         .open(&temporary)?;
     writeln!(output, "{address}")?;
+    writeln!(output, "{reuse_key}")?;
     output.sync_all()?;
     fs::rename(&temporary, path)
 }
@@ -743,7 +699,7 @@ fn write_address(path: &Path, address: &str) -> io::Result<()> {
 pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if arguments.len() < 5 {
         return Err(
-            "helper requires <id> <timeout-seconds> <address-file> <controller> [arguments...]"
+            "helper requires <id> <timeout-seconds> <address-file> <reuse-key> <controller> [arguments...]"
                 .into(),
         );
     }
@@ -756,14 +712,14 @@ pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let cgroups = CgroupManager::discover()?;
     let state = Arc::new(HelperState {
         id,
+        reuse_key: arguments[3].clone(),
         address_file,
         controller: CommandSpec {
-            command: arguments[3..].to_vec(),
+            command: arguments[4..].to_vec(),
             environment: Vec::new(),
         },
         controller_timeout: Duration::from_secs(timeout_seconds),
         cgroups,
-        last_work: Mutex::new(Instant::now()),
         instances: Mutex::new(HashMap::new()),
     });
     let raw = Arc::into_raw(state);
@@ -818,7 +774,7 @@ pub unsafe extern "C" fn onekvm_helper_set_address(
         return -1;
     };
     let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
-    match write_address(&state.address_file, &name) {
+    match write_address(&state.address_file, &name, &state.reuse_key) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -854,7 +810,6 @@ pub unsafe extern "C" fn onekvm_helper_run_controller(
     let bytes = std::slice::from_raw_parts(payload as *const u8, size);
     match run_capture(&state.controller, bytes, state.controller_timeout) {
         Ok(data) => {
-            state.touch();
             let size = data.len();
             let ptr = libc::malloc(size.max(1)) as *mut u8;
             if ptr.is_null() {
@@ -890,8 +845,12 @@ pub unsafe extern "C" fn onekvm_helper_ensure(
         set_err(err, "helper is missing".into());
         return -1;
     };
-    let name = std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned();
-    let restart = std::ffi::CStr::from_ptr(restart).to_string_lossy().into_owned();
+    let name = std::ffi::CStr::from_ptr(name)
+        .to_string_lossy()
+        .into_owned();
+    let restart = std::ffi::CStr::from_ptr(restart)
+        .to_string_lossy()
+        .into_owned();
     match state.ensure(
         name,
         CommandSpec {
@@ -976,13 +935,16 @@ pub unsafe extern "C" fn onekvm_helper_exec(
     timeout: u32,
     err: *mut *mut std::os::raw::c_char,
 ) -> std::os::raw::c_int {
-    let Some(state) = helper_ref(helper) else {
+    let Some(_state) = helper_ref(helper) else {
         set_err(err, "helper is missing".into());
         return -1;
     };
     let timeout = Duration::from_secs(u64::from(timeout));
     if timeout.is_zero() || timeout > Duration::from_secs(300) {
-        set_err(err, "action timeout must be between 1 and 300 seconds".into());
+        set_err(
+            err,
+            "action timeout must be between 1 and 300 seconds".into(),
+        );
         return -1;
     }
     match run_exec(
@@ -992,10 +954,7 @@ pub unsafe extern "C" fn onekvm_helper_exec(
         },
         timeout,
     ) {
-        Ok(()) => {
-            state.touch();
-            0
-        }
+        Ok(()) => 0,
         Err(error) => {
             set_err(err, method_error("execute action", error));
             -1
@@ -1017,8 +976,9 @@ pub unsafe extern "C" fn onekvm_helper_instances(
     match state.instances() {
         Ok(list) => {
             let n = list.len();
-            let ptr = libc::malloc(std::mem::size_of::<*mut std::os::raw::c_char>().saturating_mul(n.max(1)))
-                as *mut *mut std::os::raw::c_char;
+            let ptr = libc::malloc(
+                std::mem::size_of::<*mut std::os::raw::c_char>().saturating_mul(n.max(1)),
+            ) as *mut *mut std::os::raw::c_char;
             if ptr.is_null() {
                 set_err(err, "allocate instance list".into());
                 return -1;
@@ -1039,14 +999,16 @@ pub unsafe extern "C" fn onekvm_helper_instances(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn onekvm_helper_should_exit(helper: *mut std::os::raw::c_void) -> std::os::raw::c_int {
-    let Some(state) = helper_ref(helper) else {
+pub unsafe extern "C" fn onekvm_helper_should_exit(
+    helper: *mut std::os::raw::c_void,
+) -> std::os::raw::c_int {
+    let Some(_state) = helper_ref(helper) else {
         return 1;
     };
-    match (state.has_managed_processes(), state.idle_for()) {
-        (Ok(false), Ok(idle)) if idle >= HELPER_IDLE_TIMEOUT => 1,
-        _ => 0,
-    }
+    // The systemd unit is the lifetime owner. Keeping an enabled extension's
+    // helper alive preserves its mount/device/network namespaces for later
+    // controller invocations, even when it currently supervises no process.
+    0
 }
 
 #[cfg(test)]
@@ -1088,6 +1050,7 @@ mod tests {
         fs::create_dir_all(&instance_root).unwrap();
         let state = HelperState {
             id: "test".into(),
+            reuse_key: "test-key".into(),
             address_file: instance_root.join("helper.bus"),
             controller: CommandSpec {
                 command: vec!["/bin/true".into()],
@@ -1097,7 +1060,6 @@ mod tests {
             cgroups: CgroupManager {
                 instances: instance_root.clone(),
             },
-            last_work: Mutex::new(Instant::now()),
             instances: Mutex::new(HashMap::new()),
         };
         state

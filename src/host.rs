@@ -24,6 +24,17 @@ pub struct Host {
     pub generation: std::sync::Mutex<String>,
 }
 
+struct ReconcileCandidate {
+    id: String,
+    state: PluginState,
+}
+
+struct LegacyStart {
+    id: String,
+    extension: Installed,
+    state: PluginState,
+}
+
 impl Host {
     pub fn new() -> Self {
         Self {
@@ -92,13 +103,24 @@ pub fn apply(
             ));
         }
     }
-    apply_controller(host, &extension, &state, event, reason, changed_keys, method, request)
+    apply_controller(
+        host,
+        &extension,
+        &state,
+        event,
+        reason,
+        changed_keys,
+        method,
+        request,
+    )
 }
 
 fn apply_legacy(extension: &Installed, state: &PluginState, event: &str) -> Result<Value, String> {
     match event {
         "disable" => stop_legacy(&extension.manifest.id),
-        "enable" | "reconcile" | "config_changed" if state.enabled => start_legacy(extension, state),
+        "enable" | "reconcile" | "config_changed" if state.enabled => {
+            start_legacy(extension, state)
+        }
         "enable" | "reconcile" | "config_changed" => stop_legacy(&extension.manifest.id),
         _ => Err(format!(
             "extension {} has no controller",
@@ -177,11 +199,49 @@ pub fn reconcile_all(host: &Host, generation: &str) -> Result<(), String> {
         .lock()
         .map_err(|_| "host state lock is poisoned".to_string())? = generation.to_owned();
     sys::with_lock(initialize_default_enabled_states)?;
+    let (mut candidates, mut failures) = read_candidates()?;
+    prioritize_enabled(&mut candidates);
+    let (legacy, serial) = split_legacy_starts(candidates, &mut failures);
+    start_legacy_parallel(&legacy, &mut failures);
+    for candidate in serial {
+        if let Err(err) = reconcile_one(host, &candidate.id, &candidate.state) {
+            failures.push(format!("{}: {err}", candidate.id));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("reconcile failures: {}", failures.join("; ")))
+    }
+}
+
+// Start enabled legacy services as soon as Core has created the extension
+// control and media sockets. ReconcileAll remains the authoritative readiness
+// barrier and will retry any failed or incomplete prewarm operation.
+pub fn prewarm() -> Result<(), String> {
+    eprintln!("extension prewarm: discovering enabled legacy services");
+    sys::with_lock(initialize_default_enabled_states)?;
+    let (mut candidates, mut failures) = read_candidates()?;
+    prioritize_enabled(&mut candidates);
+    let (legacy, _) = split_legacy_starts(candidates, &mut failures);
+    start_legacy_parallel(&legacy, &mut failures);
+    if failures.is_empty() {
+        eprintln!("extension prewarm: enabled legacy services are active");
+        Ok(())
+    } else {
+        Err(format!("prewarm failures: {}", failures.join("; ")))
+    }
+}
+
+fn read_candidates() -> Result<(Vec<ReconcileCandidate>, Vec<String>), String> {
     let entries = match fs::read_dir(paths::CONFIG_ROOT) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()))
+        }
         Err(err) => return Err(err.to_string()),
     };
+    let mut candidates = Vec::new();
     let mut failures = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -194,19 +254,70 @@ pub fn reconcile_all(host: &Host, generation: &str) -> Result<(), String> {
         if !paths::valid_id(id) {
             continue;
         }
-        if let Err(err) = reconcile_one(host, id) {
-            failures.push(format!("{id}: {err}"));
+        match read_state(id) {
+            Ok(state) => candidates.push(ReconcileCandidate {
+                id: id.to_owned(),
+                state,
+            }),
+            Err(err) => failures.push(format!("{id}: {err}")),
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("reconcile failures: {}", failures.join("; ")))
+    Ok((candidates, failures))
+}
+
+fn split_legacy_starts(
+    candidates: Vec<ReconcileCandidate>,
+    failures: &mut Vec<String>,
+) -> (Vec<LegacyStart>, Vec<ReconcileCandidate>) {
+    let mut legacy = Vec::new();
+    let mut serial = Vec::new();
+    for candidate in candidates {
+        if !candidate.state.enabled || candidate.state.active_version.is_empty() {
+            serial.push(candidate);
+            continue;
+        }
+        match load_installed(&candidate.id, &candidate.state.active_version) {
+            Ok(extension) if extension.manifest.controller.is_none() => {
+                legacy.push(LegacyStart {
+                    id: candidate.id,
+                    extension,
+                    state: candidate.state,
+                });
+            }
+            Ok(_) => serial.push(candidate),
+            Err(err) => failures.push(format!("{}: {err}", candidate.id)),
+        }
+    }
+    (legacy, serial)
+}
+
+fn start_legacy_parallel(starts: &[LegacyStart], failures: &mut Vec<String>) {
+    const MAX_PARALLEL_STARTS: usize = 2;
+    for batch in starts.chunks(MAX_PARALLEL_STARTS) {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(batch.len());
+            for start in batch {
+                handles.push((
+                    start.id.as_str(),
+                    scope.spawn(move || start_legacy(&start.extension, &start.state)),
+                ));
+            }
+            for (id, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => failures.push(format!("{id}: {err}")),
+                    Err(_) => failures.push(format!("{id}: start worker panicked")),
+                }
+            }
+        });
     }
 }
 
-fn reconcile_one(host: &Host, id: &str) -> Result<(), String> {
-    let state = read_state(id)?;
+fn prioritize_enabled(candidates: &mut [ReconcileCandidate]) {
+    candidates.sort_by_key(|candidate| !candidate.state.enabled);
+}
+
+fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), String> {
     if state.active_version.is_empty() {
         return Ok(());
     }
@@ -217,7 +328,7 @@ fn reconcile_one(host: &Host, id: &str) -> Result<(), String> {
         } else {
             stop_legacy(id)
         }
-    } else {
+    } else if state.enabled {
         apply_controller(
             host,
             &extension,
@@ -229,6 +340,25 @@ fn reconcile_one(host: &Host, id: &str) -> Result<(), String> {
             None,
         )
         .map(|_| ())
+    } else {
+        cleanup_disabled_controller(id)
+    }
+}
+
+// Controller actions can only supervise processes inside the per-extension
+// helper.  Once that helper and any old transient units are stopped, a
+// disabled extension has no runtime state left to reconcile.  Avoid spawning a
+// fully sandboxed helper merely to return remove_all during every cold boot.
+fn cleanup_disabled_controller(id: &str) -> Result<(), String> {
+    stop_helper(id)?;
+    stop_legacy_unit(id)?;
+    stop_legacy_controller_units(id)?;
+    remove_credential(id);
+    let runtime = Path::new(paths::RUNTIME_ROOT).join(id);
+    match fs::remove_dir_all(runtime) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove disabled extension runtime: {err}")),
     }
 }
 
@@ -257,7 +387,8 @@ pub fn validate_device_variant(manifest: &Manifest) -> Result<(), String> {
 
 fn current_machine() -> Result<String, String> {
     let data = fs::read(paths::MACHINE_PROFILE).map_err(|_| "read machine identity".to_string())?;
-    let value: Value = serde_json::from_slice(&data).map_err(|_| "machine identity is unavailable".to_string())?;
+    let value: Value =
+        serde_json::from_slice(&data).map_err(|_| "machine identity is unavailable".to_string())?;
     let machine = value
         .get("machine")
         .and_then(Value::as_str)
@@ -271,7 +402,8 @@ fn current_machine() -> Result<String, String> {
 
 fn validate_current_variant(id: &str, variants: &[String]) -> Result<(), String> {
     let data = fs::read(paths::MACHINE_HARDWARE).map_err(|_| "read device variant".to_string())?;
-    let value: Value = serde_json::from_slice(&data).map_err(|_| "device variant is unavailable".to_string())?;
+    let value: Value =
+        serde_json::from_slice(&data).map_err(|_| "device variant is unavailable".to_string())?;
     let variant = value
         .get("variant")
         .and_then(Value::as_str)
@@ -279,11 +411,14 @@ fn validate_current_variant(id: &str, variants: &[String]) -> Result<(), String>
     if variants.iter().any(|candidate| candidate == variant) {
         Ok(())
     } else {
-        Err(format!("extension {id} does not support device variant {variant}"))
+        Err(format!(
+            "extension {id} does not support device variant {variant}"
+        ))
     }
 }
 
 fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String> {
+    eprintln!("extension {}: preparing legacy service", extension.manifest.id);
     validate_device_variant(&extension.manifest)?;
     crate::host::validate_conflicts(&extension.manifest.id, &extension.manifest)?;
     load_kernel_modules(extension)?;
@@ -304,8 +439,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         format!("--slice={}", paths::EXTENSIONS_SLICE),
         "--property=Restart=on-failure".into(),
         "--property=RestartSec=1s".into(),
-        "--property=BindsTo=onekvm.service".into(),
-        "--property=After=onekvm.service".into(),
+        "--property=PartOf=onekvm.service".into(),
     ];
     arguments.extend(sandbox_arguments(extension));
     arguments.extend([
@@ -338,6 +472,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
             .to_string_lossy()
             .into_owned(),
     ]);
+    eprintln!("extension {}: submitting transient service", extension.manifest.id);
     if let Err(err) = systemd_run(&arguments) {
         remove_credential(&extension.manifest.id);
         let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(&extension.manifest.id));
@@ -352,6 +487,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
             extension.manifest.id
         ));
     }
+    eprintln!("extension {}: legacy service is active", extension.manifest.id);
     Ok(())
 }
 
@@ -397,7 +533,8 @@ pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
 
 fn ensure_helper(extension: &Installed) -> Result<bool, String> {
     let id = &extension.manifest.id;
-    if helper_ready(id) {
+    let reuse_key = format!("sandbox-v1:{}", extension.manifest.version);
+    if helper_ready(id, &reuse_key) {
         return Ok(false);
     }
     stop_helper(id)?;
@@ -448,6 +585,7 @@ fn ensure_helper(extension: &Installed) -> Result<bool, String> {
         id.clone(),
         controller.timeout_seconds.to_string(),
         address.to_string_lossy().into_owned(),
+        reuse_key.clone(),
         extension
             .root
             .join(&controller.entrypoint)
@@ -458,7 +596,7 @@ fn ensure_helper(extension: &Installed) -> Result<bool, String> {
     systemd_run(&arguments).map_err(|err| format!("start extension helper: {err}"))?;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if helper_ready(id) {
+        if helper_ready(id, &reuse_key) {
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -467,14 +605,17 @@ fn ensure_helper(extension: &Installed) -> Result<bool, String> {
     Err(format!("extension helper {id} did not become ready"))
 }
 
-fn helper_ready(id: &str) -> bool {
-    call_helper(id, "Ping", &[]).ok().and_then(|value| {
-        value
-            .get(0)
-            .and_then(Value::as_str)
-            .map(|text| text == id)
-    })
-    .unwrap_or(false)
+fn helper_ready(id: &str, reuse_key: &str) -> bool {
+    let Ok(address) = fs::read_to_string(paths::helper_address(id)) else {
+        return false;
+    };
+    if address.lines().nth(1) != Some(reuse_key) {
+        return false;
+    }
+    call_helper(id, "Ping", &[])
+        .ok()
+        .and_then(|value| value.get(0).and_then(Value::as_str).map(|text| text == id))
+        .unwrap_or(false)
 }
 
 fn stop_helper(id: &str) -> Result<(), String> {
@@ -539,7 +680,11 @@ fn remove_legacy_slice(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_controller(extension: &Installed, payload: &Value, event: &str) -> Result<ControllerPlan, String> {
+fn run_controller(
+    extension: &Installed,
+    payload: &Value,
+    event: &str,
+) -> Result<ControllerPlan, String> {
     let encoded = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let output = call_helper_bytes(&extension.manifest.id, "RunController", &encoded)?;
     if output.len() > 1 << 20 {
@@ -568,7 +713,9 @@ fn execute_action(extension: &Installed, action: &ControllerAction) -> Result<()
     }
     match action.kind.as_str() {
         "ensure" => ensure_instance(extension, action),
-        "remove" => call_helper(&extension.manifest.id, "Remove", &[json!(action.name)]).map(|_| ()),
+        "remove" => {
+            call_helper(&extension.manifest.id, "Remove", &[json!(action.name)]).map(|_| ())
+        }
         "remove_all" => call_helper(&extension.manifest.id, "RemoveAll", &[]).map(|_| ()),
         "exec" => exec_action(extension, action),
         other => Err(format!("unsupported action type {other:?}")),
@@ -649,7 +796,10 @@ fn validate_command(extension: &Installed, command: &[String]) -> Result<(), Str
         )
     })?;
     if !meta.is_file() {
-        return Err(format!("action executable {} is not executable", command[0]));
+        return Err(format!(
+            "action executable {} is not executable",
+            command[0]
+        ));
     }
     Ok(())
 }
@@ -675,4 +825,37 @@ pub fn core_lost(host: &Host) {
 
 pub fn repair_permissions() -> Result<(), String> {
     repair_settings_output_permissions()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(id: &str, enabled: bool) -> ReconcileCandidate {
+        ReconcileCandidate {
+            id: id.into(),
+            state: PluginState {
+                enabled,
+                ..PluginState::default()
+            },
+        }
+    }
+
+    #[test]
+    fn reconcile_prioritizes_enabled_extensions() {
+        let mut candidates = vec![
+            candidate("disabled-a", false),
+            candidate("enabled-a", true),
+            candidate("disabled-b", false),
+            candidate("enabled-b", true),
+        ];
+        prioritize_enabled(&mut candidates);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled-a", "enabled-b", "disabled-a", "disabled-b"]
+        );
+    }
 }
