@@ -8,7 +8,7 @@ use crate::paths;
 use crate::sys;
 
 const USAGE: &str = "\
-usage: onekvm-extension-host <command> [arguments]
+usage: onekvm-extension <command> [arguments]
 
 commands:
   list
@@ -162,8 +162,8 @@ fn usage(argv0: &str) -> String {
     let name = std::path::Path::new(argv0)
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("onekvm-extension-host");
-    USAGE.replace("onekvm-extension-host", name)
+        .unwrap_or("onekvm-extension");
+    USAGE.replace("onekvm-extension", name)
 }
 
 fn require_len(args: &[String], len: usize, message: &str) -> Result<(), String> {
@@ -200,5 +200,13 @@ mod tests {
     fn unknown_command_mentions_usage() {
         let err = run("onekvm-extension-host", &["nope".into()]).unwrap_err();
         assert!(err.to_string().contains("unknown command"));
+    }
+
+    #[test]
+    fn cli_name_without_args_prints_usage() {
+        let err = run("onekvm-extension", &[]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("usage: onekvm-extension"), "{text}");
+        assert!(!text.contains("onekvm-extension-host"));
     }
 }
