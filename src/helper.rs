@@ -392,12 +392,18 @@ fn run_capture(spec: &CommandSpec, input: &[u8], timeout: Duration) -> Result<Ve
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("start controller: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "controller stdin is unavailable".to_owned())?
-        .write_all(input)
-        .map_err(|error| format!("write controller input: {error}"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "controller stdin is unavailable".to_owned())?;
+        stdin
+            .write_all(input)
+            .map_err(|error| format!("write controller input: {error}"))?;
+        stdin
+            .flush()
+            .map_err(|error| format!("flush controller input: {error}"))?;
+    }
     let stdout = child
         .stdout
         .take()
