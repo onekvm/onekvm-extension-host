@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::feed::available_extensions;
 use crate::manifest::{
     load_installed, installed_versions, ActivationConflict, ExtensionPage, ExtensionRoute,
+    ExtensionToolbar,
     Manifest, ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
 };
 use crate::memory;
@@ -58,6 +59,10 @@ pub struct CatalogSummary {
     pub icon: Option<PageIcon>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_page: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_toolbar: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolbar: Option<ExtensionToolbar>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_settings: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -110,6 +115,8 @@ pub struct CatalogEntry {
     pub icon: Option<PageIcon>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<ExtensionPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolbar: Option<ExtensionToolbar>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
     pub settings_schema: SettingsSchema,
@@ -260,6 +267,8 @@ pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSu
         error: String::new(),
         icon,
         has_page: extension.page.is_some(),
+        has_toolbar: extension.toolbar.is_some(),
+        toolbar: extension.toolbar.clone(),
         has_settings: !extension.settings_schema.properties.is_empty(),
         services: catalog_services(extension, &extension.id, installed, false),
         memory_budget_bytes: budget,
@@ -302,6 +311,7 @@ fn entry_from_manifest(extension: &Manifest, installed: bool, versions: Vec<Stri
         services: catalog_services(extension, &extension.id, installed, false),
         icon: extension.icon.clone(),
         page: extension.page.clone(),
+        toolbar: extension.toolbar.clone(),
         routes: extension.routes.clone(),
         settings_schema: schema,
         settings: serde_json::json!({}),
@@ -381,6 +391,8 @@ fn empty_summary() -> CatalogSummary {
         error: String::new(),
         icon: None,
         has_page: false,
+        has_toolbar: false,
+        toolbar: None,
         has_settings: false,
         services: Vec::new(),
         memory_budget_bytes: 0,

@@ -319,6 +319,9 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             }
         }
     }
+    if let Some(toolbar) = &manifest.toolbar {
+        require_regular(&present, &root, &toolbar.entrypoint)?;
+    }
     if let Some(icon) = &manifest.icon {
         if icon.source == "custom" {
             require_regular(&present, &root, &icon.path)?;

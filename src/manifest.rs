@@ -55,6 +55,8 @@ pub struct Manifest {
     pub icon: Option<PageIcon>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<ExtensionPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbar: Option<ExtensionToolbar>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
     #[serde(default)]
@@ -120,6 +122,11 @@ pub struct ExtensionPage {
     pub entrypoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<PageIcon>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct ExtensionToolbar {
+    pub entrypoint: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -402,6 +409,14 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
         }
     }
     validate_directories(&value.directories)?;
+    if let Some(toolbar) = &value.toolbar {
+        if !paths::safe_relative(&toolbar.entrypoint)
+            || !toolbar.entrypoint.starts_with("web/")
+            || !toolbar.entrypoint.ends_with(".js")
+        {
+            return Err(format!("unsafe toolbar entrypoint {:?}", toolbar.entrypoint));
+        }
+    }
     Ok(())
 }
 

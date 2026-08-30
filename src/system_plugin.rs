@@ -65,6 +65,8 @@ impl SystemPlugin {
             error: String::new(),
             icon,
             has_page: self.page.is_some(),
+            has_toolbar: false,
+            toolbar: None,
             has_settings: !self.settings_schema.properties.is_empty(),
             services: vec![CatalogService {
                 id: "main".into(),
@@ -111,6 +113,7 @@ impl SystemPlugin {
             services: summary.services,
             icon: self.icon.clone(),
             page: self.page.clone(),
+            toolbar: None,
             routes: Vec::new(),
             settings_schema: schema,
             settings,
