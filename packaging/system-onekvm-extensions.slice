@@ -1,0 +1,8 @@
+[Unit]
+Description=OneKVM extension processes
+PartOf=onekvm.service
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes

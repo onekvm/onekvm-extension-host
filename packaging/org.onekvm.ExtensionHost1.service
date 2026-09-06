@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.onekvm.ExtensionHost1
+Exec=/usr/bin/onekvm-extension-host
+User=root
+SystemdService=onekvm-extension-host.service

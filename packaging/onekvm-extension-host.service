@@ -1,0 +1,36 @@
+[Unit]
+Description=OneKVM extension lifecycle host
+BindsTo=onekvm.service
+After=dbus.socket
+Requires=dbus.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+# The host claims its D-Bus name immediately, then reports READY only after
+# Core's initial ReconcileAll has finished applying all enabled extensions.
+ExecStart=/usr/bin/onekvm-extension-host
+Restart=on-failure
+RestartSec=1s
+Slice=system-onekvm.slice
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+# The host builds per-extension DeviceAllow lists from the real /dev tree.
+# DevicePolicy keeps the host itself from opening those devices.
+PrivateDevices=no
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+ReadWritePaths=/etc/onekvm /data /run/onekvm /run/systemd/system
