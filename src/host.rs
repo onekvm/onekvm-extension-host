@@ -88,9 +88,6 @@ pub fn apply(
         ));
     }
     let extension = load_installed(id, &state.active_version)?;
-    if extension.manifest.controller.is_none() {
-        return apply_legacy(&extension, &state, event);
-    }
     if !method.is_empty() {
         let spec = extension
             .manifest
@@ -102,6 +99,20 @@ pub fn apply(
                 "method {method:?} is unavailable while extension {id} is disabled"
             ));
         }
+        if !spec.command.is_empty() {
+            return apply_command_method(&extension, &state, spec, request);
+        }
+    }
+    if extension.manifest.controller.is_none() {
+        if manages_legacy_service(&extension.manifest) {
+            return apply_legacy(&extension, &state, event);
+        }
+        if extension.manifest.methods.has_commands() {
+            stop_helper(id)?;
+            stop_legacy(id)?;
+            return Ok(Value::Null);
+        }
+        return apply_legacy(&extension, &state, event);
     }
     apply_controller(
         host,
@@ -113,6 +124,111 @@ pub fn apply(
         method,
         request,
     )
+}
+
+fn apply_command_method(
+    extension: &Installed,
+    state: &PluginState,
+    spec: &crate::manifest::MethodSpec,
+    request: Option<Value>,
+) -> Result<Value, String> {
+    let id = &extension.manifest.id;
+    prepare_runtime_dirs(id)?;
+    let settings = settings_for_state(extension, state)?;
+    write_runtime_settings(id, &settings)?;
+    let command = build_method_command(spec, request.as_ref())?;
+    let timeout = if spec.timeout_seconds == 0 {
+        10
+    } else {
+        spec.timeout_seconds
+    };
+    ensure_helper(extension, Some((&command, timeout)))?;
+    let input = serde_json::to_vec(&request.unwrap_or(Value::Null)).map_err(|e| e.to_string())?;
+    let mut executable = command;
+    executable[0] = extension
+        .root
+        .join(&executable[0])
+        .to_string_lossy()
+        .into_owned();
+    let result = crate::helper_client::exec_capture(id, &executable, &[], &input, timeout as u32)
+        .and_then(|output| {
+            serde_json::from_slice(&output).map_err(|e| format!("decode method response: {e}"))
+        });
+    let repaired = repair_settings_output_permission(id);
+    match (result, repaired) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
+fn build_method_command(
+    spec: &crate::manifest::MethodSpec,
+    request: Option<&Value>,
+) -> Result<Vec<String>, String> {
+    let object = match request {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) if spec.args.is_empty() => None,
+        Some(Value::Object(object)) => Some(object),
+        _ => return Err(format!("method {:?} request must be an object", spec.name)),
+    };
+    if let Some(object) = object {
+        for name in object.keys() {
+            if !spec.args.iter().any(|argument| argument.name == *name) {
+                return Err(format!(
+                    "method {:?} does not declare argument {name:?}",
+                    spec.name
+                ));
+            }
+        }
+    }
+    let mut command = spec.command.clone();
+    let mut omitted_optional = false;
+    for argument in &spec.args {
+        let value = object.and_then(|values| values.get(&argument.name));
+        let Some(value) = value else {
+            if argument.required {
+                return Err(format!(
+                    "method {:?} requires argument {:?}",
+                    spec.name, argument.name
+                ));
+            }
+            omitted_optional = true;
+            continue;
+        };
+        if argument.secret {
+            if value.as_str().is_none() {
+                return Err(format!(
+                    "method {:?} argument {:?} must be {}",
+                    spec.name, argument.name, argument.type_name
+                ));
+            }
+            continue;
+        }
+        if omitted_optional {
+            return Err(format!(
+                "method {:?} argument {:?} cannot follow an omitted optional argument",
+                spec.name, argument.name
+            ));
+        }
+        let encoded = match argument.type_name.as_str() {
+            "string" => value.as_str().map(str::to_owned),
+            "integer" if value.as_i64().is_some() || value.as_u64().is_some() => {
+                Some(value.to_string())
+            }
+            "number" if value.is_number() => Some(value.to_string()),
+            "boolean" => value.as_bool().map(|value| value.to_string()),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            format!(
+                "method {:?} argument {:?} must be {}",
+                spec.name, argument.name, argument.type_name
+            )
+        })?;
+        command.push(encoded);
+    }
+    Ok(command)
 }
 
 fn apply_legacy(extension: &Installed, state: &PluginState, event: &str) -> Result<Value, String> {
@@ -144,7 +260,7 @@ fn apply_controller(
     prepare_runtime_dirs(id)?;
     let settings = settings_for_state(extension, state)?;
     write_runtime_settings(id, &settings)?;
-    let helper_started = ensure_helper(extension)?;
+    let helper_started = ensure_helper(extension, None)?;
     let generation = host
         .generation
         .lock()
@@ -277,7 +393,7 @@ fn split_legacy_starts(
             continue;
         }
         match load_installed(&candidate.id, &candidate.state.active_version) {
-            Ok(extension) if extension.manifest.controller.is_none() => {
+            Ok(extension) if manages_legacy_service(&extension.manifest) => {
                 legacy.push(LegacyStart {
                     id: candidate.id,
                     extension,
@@ -322,13 +438,13 @@ fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), Strin
         return Ok(());
     }
     let extension = load_installed(id, &state.active_version)?;
-    if extension.manifest.controller.is_none() {
+    if manages_legacy_service(&extension.manifest) {
         if state.enabled {
             start_legacy(&extension, &state)
         } else {
             stop_legacy(id)
         }
-    } else if state.enabled {
+    } else if extension.manifest.controller.is_some() && state.enabled {
         apply_controller(
             host,
             &extension,
@@ -417,13 +533,29 @@ fn validate_current_variant(id: &str, variants: &[String]) -> Result<(), String>
     }
 }
 
+fn manages_legacy_service(manifest: &Manifest) -> bool {
+    manifest.controller.is_none() && !manifest.entrypoint.is_empty()
+}
+
 fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String> {
-    eprintln!("extension {}: preparing legacy service", extension.manifest.id);
+    eprintln!(
+        "extension {}: preparing legacy service",
+        extension.manifest.id
+    );
     validate_device_variant(&extension.manifest)?;
     crate::host::validate_conflicts(&extension.manifest.id, &extension.manifest)?;
     load_kernel_modules(extension)?;
-    if is_active(&paths::unit_name(&extension.manifest.id)) {
-        return Ok(());
+    let unit = paths::unit_name(&extension.manifest.id);
+    if is_active(&unit) {
+        if legacy_unit_has_core_lifetime(&unit) {
+            return Ok(());
+        }
+        eprintln!(
+            "extension {}: replacing legacy PartOf unit with ordered BindsTo unit",
+            extension.manifest.id
+        );
+        crate::sandbox::systemctl(&["stop", &unit])?;
+        let _ = crate::sandbox::systemctl(&["reset-failed", &unit]);
     }
     prepare_runtime_dirs(&extension.manifest.id)?;
     let settings = settings_for_state(extension, state)?;
@@ -439,8 +571,8 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         format!("--slice={}", paths::EXTENSIONS_SLICE),
         "--property=Restart=on-failure".into(),
         "--property=RestartSec=1s".into(),
-        "--property=PartOf=onekvm.service".into(),
     ];
+    arguments.extend(legacy_core_lifetime_properties());
     arguments.extend(sandbox_arguments(extension));
     arguments.extend([
         format!("--property=LoadCredential=onekvm-token:{credential}"),
@@ -472,7 +604,10 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
             .to_string_lossy()
             .into_owned(),
     ]);
-    eprintln!("extension {}: submitting transient service", extension.manifest.id);
+    eprintln!(
+        "extension {}: submitting transient service",
+        extension.manifest.id
+    );
     if let Err(err) = systemd_run(&arguments) {
         remove_credential(&extension.manifest.id);
         let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(&extension.manifest.id));
@@ -487,8 +622,47 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
             extension.manifest.id
         ));
     }
-    eprintln!("extension {}: legacy service is active", extension.manifest.id);
+    eprintln!(
+        "extension {}: legacy service is active",
+        extension.manifest.id
+    );
     Ok(())
+}
+
+fn legacy_unit_has_core_lifetime(unit: &str) -> bool {
+    let property = |name: &str| {
+        sys::output(
+            paths::SYSTEMCTL,
+            &[
+                "show".to_owned(),
+                format!("--property={name}"),
+                "--value".to_owned(),
+                unit.to_owned(),
+            ],
+        )
+        .ok()
+        .and_then(|value| String::from_utf8(value).ok())
+        .unwrap_or_default()
+    };
+    property("BindsTo")
+        .split_whitespace()
+        .any(|value| value == "onekvm.service")
+        && property("After")
+            .split_whitespace()
+            .any(|value| value == "onekvm.service")
+}
+
+fn legacy_core_lifetime_properties() -> [String; 2] {
+    /* BindsTo stops the extension when Core disappears, while After prevents
+     * systemd from automatically restarting it during the middle of a Core
+     * restart. The host then creates the new service after Core is active and
+     * LoadCredential snapshots the matching freshly generated token. PartOf
+     * propagates the Core restart job and can race credential preparation,
+     * leaving the service with the old token and Core with the new one. */
+    [
+        "--property=BindsTo=onekvm.service".into(),
+        "--property=After=onekvm.service".into(),
+    ]
 }
 
 fn stop_legacy(id: &str) -> Result<(), String> {
@@ -531,23 +705,43 @@ pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_helper(extension: &Installed) -> Result<bool, String> {
+fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Result<bool, String> {
     let id = &extension.manifest.id;
-    let reuse_key = format!("sandbox-v1:{}", extension.manifest.version);
+    let command_only = direct.is_some() && extension.manifest.controller.is_none();
+    let mode = if command_only {
+        "command"
+    } else {
+        "controller"
+    };
+    let reuse_key = format!("sandbox-v2:{}:{mode}", extension.manifest.version);
     if helper_ready(id, &reuse_key) {
         return Ok(false);
     }
     stop_helper(id)?;
-    stop_legacy_unit(id)?;
-    stop_legacy_controller_units(id)?;
+    if !manages_legacy_service(&extension.manifest) {
+        stop_legacy_unit(id)?;
+        stop_legacy_controller_units(id)?;
+    }
     let credential = prepare_credential(&extension.manifest)?;
     let address = paths::helper_address(id);
     let _ = fs::remove_file(&address);
-    let controller = extension
-        .manifest
-        .controller
-        .as_ref()
-        .ok_or_else(|| format!("extension {id} has no controller"))?;
+    let (controller_command, controller_timeout, idle_timeout) =
+        if let Some(controller) = &extension.manifest.controller {
+            let mut command = vec![controller.entrypoint.clone()];
+            command.extend(controller.arguments.iter().cloned());
+            (command, controller.timeout_seconds, 0)
+        } else if let Some((command, timeout)) = direct {
+            (command.to_vec(), timeout, 60)
+        } else {
+            let controller = extension
+                .manifest
+                .controller
+                .as_ref()
+                .ok_or_else(|| format!("extension {id} has no controller"))?;
+            let mut command = vec![controller.entrypoint.clone()];
+            command.extend(controller.arguments.iter().cloned());
+            (command, controller.timeout_seconds, 0)
+        };
     let mut arguments = vec![
         "--quiet".into(),
         "--collect".into(),
@@ -583,16 +777,17 @@ fn ensure_helper(extension: &Installed) -> Result<bool, String> {
         paths::HOST_BINARY.into(),
         "--plugin-helper".into(),
         id.clone(),
-        controller.timeout_seconds.to_string(),
+        controller_timeout.to_string(),
         address.to_string_lossy().into_owned(),
         reuse_key.clone(),
+        idle_timeout.to_string(),
         extension
             .root
-            .join(&controller.entrypoint)
+            .join(&controller_command[0])
             .to_string_lossy()
             .into_owned(),
     ]);
-    arguments.extend(controller.arguments.iter().cloned());
+    arguments.extend(controller_command.into_iter().skip(1));
     systemd_run(&arguments).map_err(|err| format!("start extension helper: {err}"))?;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -842,6 +1037,34 @@ mod tests {
     }
 
     #[test]
+    fn command_methods_can_keep_a_legacy_entrypoint() {
+        let mut manifest = Manifest::default();
+        assert!(!manages_legacy_service(&manifest));
+        manifest.entrypoint = "bin/daemon".into();
+        assert!(manages_legacy_service(&manifest));
+        manifest.controller = Some(crate::manifest::ControllerSpec {
+            runtime: "executable".into(),
+            entrypoint: "bin/daemon".into(),
+            arguments: vec!["--controller".into()],
+            timeout_seconds: 5,
+        });
+        assert!(!manages_legacy_service(&manifest));
+    }
+
+    #[test]
+    fn legacy_service_lifetime_is_ordered_after_core() {
+        let properties = legacy_core_lifetime_properties();
+        assert_eq!(
+            properties,
+            [
+                "--property=BindsTo=onekvm.service",
+                "--property=After=onekvm.service",
+            ]
+        );
+        assert!(!properties.iter().any(|value| value.contains("PartOf=")));
+    }
+
+    #[test]
     fn reconcile_prioritizes_enabled_extensions() {
         let mut candidates = vec![
             candidate("disabled-a", false),
@@ -856,6 +1079,88 @@ mod tests {
                 .map(|candidate| candidate.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["enabled-a", "enabled-b", "disabled-a", "disabled-b"]
+        );
+    }
+
+    #[test]
+    fn method_arguments_are_validated_and_appended_in_order() {
+        let spec = crate::manifest::MethodSpec {
+            name: "save".into(),
+            command: vec!["bin/editor".into(), "save".into()],
+            args: vec![
+                crate::manifest::MethodArgument {
+                    name: "id".into(),
+                    type_name: "string".into(),
+                    required: true,
+                    secret: false,
+                },
+                crate::manifest::MethodArgument {
+                    name: "force".into(),
+                    type_name: "boolean".into(),
+                    required: true,
+                    secret: false,
+                },
+            ],
+            ..crate::manifest::MethodSpec::default()
+        };
+        let request = json!({"force": true, "id": "display"});
+        assert_eq!(
+            build_method_command(&spec, Some(&request)).unwrap(),
+            ["bin/editor", "save", "display", "true"]
+        );
+        assert!(build_method_command(&spec, Some(&json!({"id": "display"}))).is_err());
+    }
+
+    #[test]
+    fn secret_method_arguments_are_validated_but_not_put_in_argv() {
+        let spec = crate::manifest::MethodSpec {
+            name: "login".into(),
+            command: vec!["bin/client".into(), "login".into()],
+            args: vec![
+                crate::manifest::MethodArgument {
+                    name: "username".into(),
+                    type_name: "string".into(),
+                    required: true,
+                    secret: false,
+                },
+                crate::manifest::MethodArgument {
+                    name: "password".into(),
+                    type_name: "string".into(),
+                    required: true,
+                    secret: true,
+                },
+            ],
+            ..crate::manifest::MethodSpec::default()
+        };
+        let request = json!({"username": "admin", "password": "not-in-argv"});
+        assert_eq!(
+            build_method_command(&spec, Some(&request)).unwrap(),
+            ["bin/client", "login", "admin"]
+        );
+        assert!(
+            build_method_command(&spec, Some(&json!({"username": "admin", "password": true})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stdin_only_methods_accept_undeclared_object_keys() {
+        let spec = crate::manifest::MethodSpec {
+            name: "confirm".into(),
+            command: vec!["bin/onekvm-boot-confirm".into()],
+            ..crate::manifest::MethodSpec::default()
+        };
+        let request = json!({
+            "version": 1,
+            "action": "login",
+            "username": "admin",
+            "challenge_id": "pending",
+            "cancel_path": "/run/onekvm/mfa/pending.cancel",
+            "response": {"kind": "plugin"}
+        });
+        assert_eq!(
+            build_method_command(&spec, Some(&request)).unwrap(),
+            ["bin/onekvm-boot-confirm"]
         );
     }
 }

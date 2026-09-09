@@ -125,7 +125,11 @@ fn validate_value(property: &SettingProperty, value: &Value) -> Result<(), Strin
         }
         other => return Err(format!("has unsupported type {other:?}")),
     }
-    if !property.enum_values.is_empty() && !property.enum_values.iter().any(|candidate| candidate == value)
+    if !property.enum_values.is_empty()
+        && !property
+            .enum_values
+            .iter()
+            .any(|candidate| candidate == value)
     {
         return Err("must be one of the declared enum values".into());
     }
@@ -235,7 +239,9 @@ pub fn merge_output(extension: &Installed, settings: &mut Value) -> Result<(), S
             .settings_schema
             .properties
             .get(&name)
-            .ok_or_else(|| format!("extension settings output contains unknown setting {name:?}"))?;
+            .ok_or_else(|| {
+                format!("extension settings output contains unknown setting {name:?}")
+            })?;
         if !property.read_only {
             return Err(format!(
                 "extension settings output contains writable setting {name:?}"
@@ -258,14 +264,18 @@ pub fn service_enabled(settings: &Value) -> bool {
 }
 
 pub fn repair_settings_output_permission(id: &str) -> Result<(), String> {
-    let path = Path::new(paths::APP_DATA_ROOT).join(id).join(paths::SETTINGS_OUTPUT);
+    let path = Path::new(paths::APP_DATA_ROOT)
+        .join(id)
+        .join(paths::SETTINGS_OUTPUT);
     let info = match fs::symlink_metadata(&path) {
         Ok(info) => info,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.to_string()),
     };
     if !info.is_file() {
-        return Err(format!("extension settings output for {id} is not a regular file"));
+        return Err(format!(
+            "extension settings output for {id} is not a regular file"
+        ));
     }
     let (_, gid) = sys::runtime_ids()?;
     use std::os::unix::ffi::OsStrExt;
@@ -274,7 +284,6 @@ pub fn repair_settings_output_permission(id: &str) -> Result<(), String> {
     if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } != 0 {
         return Err(format!("set extension settings output group for {id}"));
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).map_err(|e| {
-        format!("set extension settings output mode for {id}: {e}")
-    })
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+        .map_err(|e| format!("set extension settings output mode for {id}: {e}"))
 }

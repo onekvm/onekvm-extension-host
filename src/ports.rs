@@ -7,13 +7,19 @@ use serde_json::Value;
 use crate::paths;
 use crate::state::read_state;
 
-pub fn validate_extension_port(id: &str, settings: &Value, allow_current: bool) -> Result<(), String> {
+pub fn validate_extension_port(
+    id: &str,
+    settings: &Value,
+    allow_current: bool,
+) -> Result<(), String> {
     let Some(port) = setting_port(settings) else {
         return Ok(());
     };
     let web_port = configured_web_port()?;
     if port == web_port {
-        return Err(format!("port {port} is configured for the OneKVM Web service"));
+        return Err(format!(
+            "port {port} is configured for the OneKVM Web service"
+        ));
     }
     if let Some(owner) = configured_owner(id, port)? {
         return Err(format!("port {port} is configured for extension {owner}"));
@@ -69,7 +75,8 @@ fn configured_owner(exclude_id: &str, port: i64) -> Result<Option<String>, Strin
             continue;
         }
         let state = read_state(id)?;
-        if setting_port(&Value::Object(state.settings.clone().into_iter().collect())) == Some(port) {
+        if setting_port(&Value::Object(state.settings.clone().into_iter().collect())) == Some(port)
+        {
             return Ok(Some(id.to_owned()));
         }
     }

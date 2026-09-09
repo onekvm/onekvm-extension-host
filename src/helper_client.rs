@@ -36,6 +36,18 @@ extern "C" {
         nenv: usize,
         timeout: u32,
     ) -> c_int;
+    fn onekvm_helper_client_exec_capture(
+        unique: *const c_char,
+        command: *mut *mut c_char,
+        ncommand: usize,
+        environment: *mut *mut c_char,
+        nenv: usize,
+        payload: *const c_void,
+        size: usize,
+        timeout: u32,
+        output: *mut *mut c_void,
+        out_size: *mut usize,
+    ) -> c_int;
 }
 
 fn unique_name(id: &str) -> Result<CString, String> {
@@ -179,6 +191,41 @@ pub fn run_controller(id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     };
     if status != 0 {
         return Err(fail(status, "RunController"));
+    }
+    let slice = unsafe { std::slice::from_raw_parts(output as *const u8, size) };
+    let data = slice.to_vec();
+    unsafe { libc::free(output) };
+    Ok(data)
+}
+
+pub fn exec_capture(
+    id: &str,
+    command: &[String],
+    environment: &[String],
+    payload: &[u8],
+    timeout: u32,
+) -> Result<Vec<u8>, String> {
+    let unique = unique_name(id)?;
+    let mut command = CStrings::from_values(command)?;
+    let mut environment = CStrings::from_values(environment)?;
+    let mut output = std::ptr::null_mut();
+    let mut size = 0usize;
+    let status = unsafe {
+        onekvm_helper_client_exec_capture(
+            unique.as_ptr(),
+            command.pointers.as_mut_ptr(),
+            command.owned.len(),
+            environment.pointers.as_mut_ptr(),
+            environment.owned.len(),
+            payload.as_ptr().cast(),
+            payload.len(),
+            timeout,
+            &mut output,
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return Err(fail(status, "ExecCapture"));
     }
     let slice = unsafe { std::slice::from_raw_parts(output as *const u8, size) };
     let data = slice.to_vec();

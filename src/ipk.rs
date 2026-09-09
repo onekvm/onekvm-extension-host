@@ -17,6 +17,7 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "libcrypto3",
     "libgcc1",
     "libjson-c5",
+    "libsqlite3-0",
     "libssl3",
     "libstdc++6",
     "libsystemd0",
@@ -24,6 +25,7 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "onekvm-core",
     "onekvm-plugin-manager",
     "onekvm-extension-host",
+    "onekvm-samba-runtime",
 ];
 
 #[derive(Debug, Clone)]
@@ -59,7 +61,8 @@ pub fn inspect_ipk(
         .get("control.tar.gz")
         .ok_or_else(|| "IPK has no control.tar.gz".to_string())?;
     let fields = inspect_control(control)?;
-    let dependencies = parse_package_dependencies(fields.get("Depends").map(String::as_str).unwrap_or(""))?;
+    let dependencies =
+        parse_package_dependencies(fields.get("Depends").map(String::as_str).unwrap_or(""))?;
     let info_name = fields["Package"].clone();
     if !expected_package.is_empty() && info_name != expected_package {
         return Err(format!(
@@ -67,7 +70,9 @@ pub fn inspect_ipk(
         ));
     }
     if !crate::paths::valid_package_name(&info_name) {
-        return Err(format!("package {info_name:?} is outside the extension namespace"));
+        return Err(format!(
+            "package {info_name:?} is outside the extension namespace"
+        ));
     }
     if !accepted.contains(&fields["Architecture"]) {
         return Err(format!(
@@ -151,14 +156,16 @@ pub fn parse_package_dependencies(value: &str) -> Result<Vec<PackageDependency>,
 
 fn parse_dependency(value: &str) -> Result<(String, String, String), String> {
     if let Some((name, rest)) = value.split_once(" (") {
-        let rest = rest.strip_suffix(')').ok_or_else(|| {
-            format!("extension package has invalid dependency {value:?}")
-        })?;
+        let rest = rest
+            .strip_suffix(')')
+            .ok_or_else(|| format!("extension package has invalid dependency {value:?}"))?;
         let mut parts = rest.splitn(2, ' ');
         let compare = parts.next().unwrap_or_default();
         let version = parts.next().unwrap_or_default();
         if !matches!(compare, "=" | ">=" | "<=" | ">" | "<") || version.is_empty() {
-            return Err(format!("extension package has invalid dependency {value:?}"));
+            return Err(format!(
+                "extension package has invalid dependency {value:?}"
+            ));
         }
         validate_dep_name(name)?;
         return Ok((name.to_owned(), compare.to_owned(), version.to_owned()));
@@ -170,7 +177,8 @@ fn parse_dependency(value: &str) -> Result<(String, String, String), String> {
 fn validate_dep_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     if matches!(chars.next(), Some('a'..='z' | '0'..='9'))
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-'))
+        && chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '-'))
     {
         return Ok(());
     }
@@ -205,12 +213,7 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             return Err("extension has too many archive entries".into());
         }
         let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = clean_archive_path(
-            &entry
-                .path()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy(),
-        )?;
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
         let kind = entry.header().entry_type();
         if !matches!(
             kind,
@@ -226,7 +229,10 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             .unwrap_or_default();
         let mode = entry.header().mode().unwrap_or(0);
         entries.push((name.clone(), linkname, mode, kind));
-        if Path::new(&name).file_name().and_then(|value| value.to_str()) == Some("manifest.json")
+        if Path::new(&name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            == Some("manifest.json")
             && matches!(kind, EntryType::Regular)
         {
             if entry.size() > 64 * 1024 {
@@ -248,14 +254,20 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             regular_json.insert(name, Some(data));
         }
     }
-    let manifest = decode_manifest(&manifest_data.ok_or_else(|| "manifest.json is missing".to_string())?)?;
+    let manifest =
+        decode_manifest(&manifest_data.ok_or_else(|| "manifest.json is missing".to_string())?)?;
     if manifest.id != expected_id {
-        return Err(format!("manifest id {:?} does not match package", manifest.id));
+        return Err(format!(
+            "manifest id {:?} does not match package",
+            manifest.id
+        ));
     }
     let root = format!("data/onekvm/apps/{}/{}", manifest.id, manifest.version);
     let mut present = BTreeMap::new();
     for (name, linkname, mode, kind) in &entries {
-        if name != &root && !name.starts_with(&(root.clone() + "/")) && !root.starts_with(&(name.clone() + "/"))
+        if name != &root
+            && !name.starts_with(&(root.clone() + "/"))
+            && !root.starts_with(&(name.clone() + "/"))
         {
             return Err(format!("payload path /{name} escapes /{root}"));
         }
@@ -280,7 +292,18 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
         }
         present.insert(name.clone(), (*mode, *kind));
     }
-    let mut executables = vec![manifest.entrypoint.clone()];
+    let mut executables = Vec::new();
+    if !manifest.entrypoint.is_empty() {
+        executables.push(manifest.entrypoint.clone());
+    }
+    if let Some(controller) = &manifest.controller {
+        executables.push(controller.entrypoint.clone());
+    }
+    for method in manifest.methods.values() {
+        if let Some(command) = method.command.first() {
+            executables.push(command.clone());
+        }
+    }
     if let Some(command) = manifest.healthcheck.command.first() {
         executables.push(command.clone());
     }
@@ -372,12 +395,7 @@ fn extract_preview_icon(compressed: &[u8], manifest: &Manifest) -> Result<String
     let mut archive = Archive::new(decoder);
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = clean_archive_path(
-            &entry
-                .path()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy(),
-        )?;
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
         if name != target {
             continue;
         }
@@ -413,7 +431,8 @@ pub fn clean_archive_path(name: &str) -> Result<String, String> {
 pub fn read_ar(filename: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut file = std::fs::File::open(filename).map_err(|e| e.to_string())?;
     let mut magic = [0u8; 8];
-    file.read_exact(&mut magic).map_err(|_| "invalid ar archive".to_string())?;
+    file.read_exact(&mut magic)
+        .map_err(|_| "invalid ar archive".to_string())?;
     if &magic != b"!<arch>\n" {
         return Err("invalid ar archive".into());
     }
@@ -544,6 +563,12 @@ mod tests {
         let deps = parse_package_dependencies("curl").unwrap();
         assert!(validate_package_dependencies(&deps, None).is_err());
         let deps = parse_package_dependencies("onekvm-core, musl").unwrap();
+        validate_package_dependencies(&deps, None).unwrap();
+    }
+
+    #[test]
+    fn accepts_sqlite_runtime_dependency() {
+        let deps = parse_package_dependencies("libsqlite3-0 (>= 3.51.3)").unwrap();
         validate_package_dependencies(&deps, None).unwrap();
     }
 }

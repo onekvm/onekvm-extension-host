@@ -23,7 +23,9 @@ mod system_plugin;
 
 fn main() {
     let mut arguments = std::env::args();
-    let argv0 = arguments.next().unwrap_or_else(|| "onekvm-extension-host".into());
+    let argv0 = arguments
+        .next()
+        .unwrap_or_else(|| "onekvm-extension-host".into());
     let rest: Vec<String> = arguments.collect();
     let result = if rest.first().map(String::as_str) == Some("--plugin-helper") {
         helper::run(rest.into_iter().skip(1).collect())

@@ -30,7 +30,10 @@ fn keys_from(ptr: *mut *mut c_char, count: usize) -> Result<Vec<String>, String>
         return Ok(Vec::new());
     }
     let slice = unsafe { slice::from_raw_parts(ptr, count) };
-    slice.iter().map(|item| cstr(*item).map(str::to_owned)).collect()
+    slice
+        .iter()
+        .map(|item| cstr(*item).map(str::to_owned))
+        .collect()
 }
 
 fn host_ref<'a>(ptr: *mut c_void) -> Result<&'a Host, String> {
@@ -51,8 +54,17 @@ pub unsafe extern "C" fn onekvm_host_apply_config(
         let host = host_ref(host)?;
         let _settings = cstr(settings)?;
         let changed = keys_from(keys, nkeys)?;
-        host::apply(host, cstr(id)?, revision, "config_changed", "configure", &changed, "", None)
-            .map(|_| ())
+        host::apply(
+            host,
+            cstr(id)?,
+            revision,
+            "config_changed",
+            "configure",
+            &changed,
+            "",
+            None,
+        )
+        .map(|_| ())
     })();
     match result {
         Ok(()) => 0,
@@ -108,10 +120,7 @@ pub unsafe extern "C" fn onekvm_host_reconcile_all(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn onekvm_host_prewarm(
-    host: *mut c_void,
-    err: *mut *mut c_char,
-) -> c_int {
+pub unsafe extern "C" fn onekvm_host_prewarm(host: *mut c_void, err: *mut *mut c_char) -> c_int {
     let result = host_ref(host).and_then(|_| host::prewarm());
     match result {
         Ok(()) => 0,
@@ -137,7 +146,10 @@ pub unsafe extern "C" fn onekvm_host_invoke(
         let request = if raw.is_empty() {
             Some(Value::Null)
         } else {
-            Some(serde_json::from_str(raw).map_err(|_| "public method request is not valid JSON".to_string())?)
+            Some(
+                serde_json::from_str(raw)
+                    .map_err(|_| "public method request is not valid JSON".to_string())?,
+            )
         };
         let value = host::apply(
             host,

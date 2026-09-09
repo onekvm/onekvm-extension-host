@@ -139,9 +139,7 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
                 return Err(format!("invalid extension method {:?}", args[2]).into());
             }
             let mut request = Vec::new();
-            io::stdin()
-                .take((1 << 20) + 1)
-                .read_to_end(&mut request)?;
+            io::stdin().take((1 << 20) + 1).read_to_end(&mut request)?;
             if request.len() > 1 << 20 {
                 return Err("public method request exceeds 1 MiB".into());
             }

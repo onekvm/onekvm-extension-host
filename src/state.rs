@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -89,23 +89,60 @@ pub fn initialize_default_enabled_states() -> Result<(), String> {
 pub fn prepare_runtime_dirs(id: &str) -> Result<(), String> {
     let (uid, gid) = sys::runtime_ids()?;
     fs::create_dir_all(paths::RUNTIME_ROOT).map_err(|e| e.to_string())?;
-    fs::set_permissions(paths::RUNTIME_ROOT, fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
+    set_mode_if_needed(Path::new(paths::RUNTIME_ROOT), 0o755)?;
     let euid = unsafe { libc::geteuid() } as u32;
     let directories = [
         (Path::new(paths::APP_DATA_ROOT).join(id), uid),
         (Path::new(paths::RUNTIME_ROOT).join(id), euid),
-        (
-            Path::new(paths::RUNTIME_ROOT).join(id).join("sockets"),
-            uid,
-        ),
+        (Path::new(paths::RUNTIME_ROOT).join(id).join("sockets"), uid),
     ];
     for (path, owner) in directories {
         fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).map_err(|e| e.to_string())?;
-        if unsafe { libc::chown(c_path(&path)?.as_ptr(), owner, gid) } != 0 {
-            return Err(format!("chown {}", path.display()));
+        ensure_directory_permissions(&path, owner, gid, euid, 0o750)?;
+    }
+    Ok(())
+}
+
+fn set_mode_if_needed(path: &Path, mode: u32) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.mode() & 0o7777 == mode {
+        return Ok(());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
+}
+
+fn ensure_directory_permissions(
+    path: &Path,
+    owner: u32,
+    group: u32,
+    euid: u32,
+    mode: u32,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    let current_owner = metadata.uid();
+    let current_group = metadata.gid();
+    let mode_matches = metadata.mode() & 0o7777 == mode;
+    if current_owner == owner && current_group == group && mode_matches {
+        return Ok(());
+    }
+
+    let path_c = c_path(path)?;
+    let took_ownership = !mode_matches && current_owner != euid;
+    if took_ownership && unsafe { libc::chown(path_c.as_ptr(), euid, u32::MAX) } != 0 {
+        return Err(format!("take ownership of {}", path.display()));
+    }
+    if !mode_matches {
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+            if took_ownership {
+                unsafe { libc::chown(path_c.as_ptr(), current_owner, current_group) };
+            }
+            return Err(err.to_string());
         }
+    }
+    if (current_owner != owner || current_group != group || took_ownership)
+        && unsafe { libc::chown(path_c.as_ptr(), owner, group) } != 0
+    {
+        return Err(format!("chown {}", path.display()));
     }
     Ok(())
 }
@@ -157,11 +194,67 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_directory(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "onekvm-extension-host-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn matching_directory_permissions_are_a_noop() {
+        let path = temporary_directory("permission-noop");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        ensure_directory_permissions(
+            &path,
+            before.uid(),
+            before.gid(),
+            unsafe { libc::geteuid() } as u32,
+            0o750,
+        )
+        .unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, 0o750);
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn owned_directory_mode_is_repaired() {
+        let path = temporary_directory("permission-repair");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        ensure_directory_permissions(
+            &path,
+            metadata.uid(),
+            metadata.gid(),
+            unsafe { libc::geteuid() } as u32,
+            0o750,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o750);
+        fs::remove_dir(path).unwrap();
+    }
+}
+
 pub fn write_generation(generation: &str) -> Result<(), String> {
     if let Some(parent) = Path::new(paths::GENERATION_PATH).parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    sys::atomic_write(Path::new(paths::GENERATION_PATH), format!("{generation}\n").as_bytes(), 0o600)
+    sys::atomic_write(
+        Path::new(paths::GENERATION_PATH),
+        format!("{generation}\n").as_bytes(),
+        0o600,
+    )
 }
 
 pub fn read_generation() -> String {

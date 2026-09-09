@@ -11,7 +11,7 @@ use crate::host;
 use crate::ipk::{inspect_ipk, PackageInfo};
 use crate::ipks::{inspect_ipks, is_ipks};
 use crate::lifecycle;
-use crate::manifest::{load_installed, installed_versions};
+use crate::manifest::{installed_versions, load_installed};
 use crate::memory;
 use crate::paths;
 use crate::state::{read_state, write_state};
@@ -70,7 +70,8 @@ pub fn validate_local_upload_path(filename: &str) -> Result<(), String> {
     {
         return Err("local extension path is outside the upload staging directory".into());
     }
-    let info = fs::symlink_metadata(&clean).map_err(|e| format!("read staged extension package: {e}"))?;
+    let info =
+        fs::symlink_metadata(&clean).map_err(|e| format!("read staged extension package: {e}"))?;
     if !info.file_type().is_file() {
         return Err("staged extension package is not a regular file".into());
     }
@@ -192,11 +193,7 @@ pub fn install_package(package_name: &str) -> Result<(), String> {
                 .map_err(|e| e.to_string())?
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        == Some("ipk")
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("ipk")
                 })
                 .map(|entry| entry.path())
                 .collect();
@@ -276,9 +273,8 @@ fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf]) -> Resu
         return Err("installed extension failed validation".into());
     }
     if !info.manifest.kernel_modules.is_empty() {
-        sys::run(paths::DEPMOD, &["-a".into()]).map_err(|err| {
-            format!("rebuild kernel module metadata: {err}")
-        })?;
+        sys::run(paths::DEPMOD, &["-a".into()])
+            .map_err(|err| format!("rebuild kernel module metadata: {err}"))?;
     }
     if state.active_version != info.manifest.version {
         state.active_version = info.manifest.version.clone();
@@ -366,10 +362,7 @@ fn package_installed_version(name: &str) -> (String, bool) {
         .get("Status")
         .is_some_and(|status| status.ends_with(" installed"))
     {
-        (
-            fields.get("Version").cloned().unwrap_or_default(),
-            true,
-        )
+        (fields.get("Version").cloned().unwrap_or_default(), true)
     } else {
         (String::new(), false)
     }
@@ -405,7 +398,11 @@ fn unique_temp_dir(root: &str, prefix: &str) -> Result<PathBuf, String> {
 fn unique_temp_file(root: &str, prefix: &str) -> Result<PathBuf, String> {
     for n in 0..1000 {
         let path = Path::new(root).join(format!("{prefix}{}-{n}.upload", std::process::id()));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.to_string()),
@@ -421,6 +418,8 @@ mod tests {
     #[test]
     fn rejects_paths_outside_staging() {
         assert!(validate_local_upload_path("/tmp/evil.ipk").is_err());
-        assert!(validate_local_upload_path("/var/tmp/onekvm/extension-uploads/../x.upload").is_err());
+        assert!(
+            validate_local_upload_path("/var/tmp/onekvm/extension-uploads/../x.upload").is_err()
+        );
     }
 }

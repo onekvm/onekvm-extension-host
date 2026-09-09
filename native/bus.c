@@ -42,6 +42,11 @@ int onekvm_helper_restart(void *helper, const char *name, char **err);
 int onekvm_helper_exec(void *helper, char **command, size_t ncommand,
                        char **environment, size_t nenv, uint32_t timeout,
                        char **err);
+int onekvm_helper_exec_capture(void *helper, char **command, size_t ncommand,
+                               char **environment, size_t nenv,
+                               const void *payload, size_t size,
+                               uint32_t timeout, void **output,
+                               size_t *out_size, char **err);
 int onekvm_helper_instances(void *helper, char ***names, size_t *count,
                             char **err);
 int onekvm_helper_should_exit(void *helper);
@@ -884,6 +889,49 @@ static int helper_exec(sd_bus_message *message, void *userdata, sd_bus_error *er
     return sd_bus_reply_method_return(message, "");
 }
 
+static int helper_exec_capture(sd_bus_message *message, void *userdata,
+                               sd_bus_error *error) {
+    char **command = NULL, **environment = NULL;
+    size_t ncommand = 0, nenv = 0, size = 0, out_size = 0;
+    const void *payload = NULL;
+    void *output = NULL;
+    sd_bus_message *reply = NULL;
+    uint32_t timeout = 0;
+    char *err = NULL;
+    int result = read_string_array(message, &command, &ncommand);
+    if (result < 0)
+        return result;
+    result = read_string_array(message, &environment, &nenv);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_read_array(message, 'y', &payload, &size);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_read(message, "u", &timeout);
+    if (result < 0)
+        goto out;
+    result = onekvm_helper_exec_capture(userdata, command, ncommand,
+                                        environment, nenv, payload, size,
+                                        timeout, &output, &out_size, &err);
+    if (result != 0) {
+        result = fail(error, err);
+        err = NULL;
+        goto out;
+    }
+    result = sd_bus_message_new_method_return(message, &reply);
+    if (result >= 0)
+        result = sd_bus_message_append_array(reply, 'y', output, out_size);
+    if (result >= 0)
+        result = sd_bus_send(NULL, reply, NULL);
+    sd_bus_message_unref(reply);
+out:
+    free(err);
+    free(output);
+    free_string_array(command, ncommand);
+    free_string_array(environment, nenv);
+    return result;
+}
+
 static int helper_instances(sd_bus_message *message, void *userdata, sd_bus_error *error) {
     char **names = NULL;
     size_t count = 0;
@@ -918,6 +966,7 @@ static const sd_bus_vtable helper_vtable[] = {
     SD_BUS_METHOD("RemoveAll", "", "", helper_remove_all, 0),
     SD_BUS_METHOD("Restart", "s", "", helper_restart, 0),
     SD_BUS_METHOD("Exec", "asasu", "", helper_exec, 0),
+    SD_BUS_METHOD("ExecCapture", "asasayu", "ay", helper_exec_capture, 0),
     SD_BUS_METHOD("Instances", "", "as", helper_instances, 0),
     SD_BUS_VTABLE_END,
 };
@@ -1069,6 +1118,56 @@ int onekvm_helper_client_exec(const char *unique, char **command, size_t ncomman
         goto out;
     result = sd_bus_call(bus, message, (timeout + 2) * 1000000ull, NULL, NULL);
 out:
+    sd_bus_message_unref(message);
+    sd_bus_unref(bus);
+    return result < 0 ? result : 0;
+}
+
+int onekvm_helper_client_exec_capture(const char *unique, char **command,
+                                      size_t ncommand, char **environment,
+                                      size_t nenv, const void *payload,
+                                      size_t size, uint32_t timeout,
+                                      void **output, size_t *out_size) {
+    sd_bus *bus = NULL;
+    sd_bus_message *message = NULL, *reply = NULL;
+    int result = sd_bus_default_system(&bus);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_new_method_call(bus, &message, unique, HELPER_PATH,
+                                            HELPER_IFACE, "ExecCapture");
+    if (result < 0)
+        goto out;
+    result = append_string_array(message, command, ncommand);
+    if (result < 0)
+        goto out;
+    result = append_string_array(message, environment, nenv);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append_array(message, 'y', payload, size);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "u", timeout);
+    if (result < 0)
+        goto out;
+    result = sd_bus_call(bus, message, (timeout + 2) * 1000000ull, NULL, &reply);
+    if (result < 0)
+        goto out;
+    const void *data = NULL;
+    size_t nbytes = 0;
+    result = sd_bus_message_read_array(reply, 'y', &data, &nbytes);
+    if (result >= 0) {
+        void *copy = malloc(nbytes ? nbytes : 1);
+        if (!copy)
+            result = -ENOMEM;
+        else {
+            memcpy(copy, data, nbytes);
+            *output = copy;
+            *out_size = nbytes;
+            result = 0;
+        }
+    }
+out:
+    sd_bus_message_unref(reply);
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
     return result < 0 ? result : 0;

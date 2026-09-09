@@ -7,10 +7,11 @@ use serde_json::Value;
 
 use crate::catalog::extension_running;
 use crate::host;
-use crate::manifest::{load_installed, installed_versions};
+use crate::manifest::{installed_versions, load_installed};
 use crate::memory;
 use crate::paths;
 use crate::ports;
+use crate::sandbox;
 use crate::settings;
 use crate::state::{read_state, write_state, PluginState};
 use crate::sys;
@@ -76,7 +77,9 @@ fn read_legacy_state(id: &str) -> Result<PluginState, String> {
     serde_json::from_slice(&data).map_err(|e| format!("invalid legacy state for {id}: {e}"))
 }
 
-fn read_legacy_settings(id: &str) -> Result<Option<std::collections::BTreeMap<String, Value>>, String> {
+fn read_legacy_settings(
+    id: &str,
+) -> Result<Option<std::collections::BTreeMap<String, Value>>, String> {
     let data = match fs::read(Path::new(paths::LEGACY_CONFIG).join(id).join("config.json")) {
         Ok(data) => data,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -262,22 +265,28 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
     if !matches!(action, "start" | "stop" | "restart" | "enable" | "disable") {
         return Err(format!("unsupported service action {action:?}"));
     }
-    let (controller, enabled) = sys::with_lock(|| {
+    let (registered_service, controller, enabled) = sys::with_lock(|| {
         let state = read_state(id)?;
         if state.active_version.is_empty() {
             return Err(format!("extension {id} is not active"));
         }
         let extension = load_installed(id, &state.active_version)?;
-        if !extension
+        let registered_service = extension
             .manifest
             .services
             .iter()
-            .any(|item| item.id == service)
-        {
-            return Err(format!("extension {id} does not register service {service}"));
-        }
-        Ok((extension.manifest.controller.is_some(), state.enabled))
+            .find(|item| item.id == service)
+            .cloned()
+            .ok_or_else(|| format!("extension {id} does not register service {service}"))?;
+        Ok((
+            registered_service,
+            extension.manifest.controller.is_some(),
+            state.enabled,
+        ))
     })?;
+    if !registered_service.unit.is_empty() {
+        return sandbox::systemctl(&[action, &registered_service.unit]);
+    }
     match action {
         "enable" => enable(id),
         "disable" => disable(id),
@@ -380,6 +389,11 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
             }
         }
         if !state_initialized && !enabled_changed && changed_keys.is_empty() {
+            if extension.manifest.controller.is_none()
+                && extension.manifest.settings_reload == "watch"
+            {
+                settings::write_runtime_settings(id, &current)?;
+            }
             return Ok(());
         }
         if let Some(enabled) = request.enabled {

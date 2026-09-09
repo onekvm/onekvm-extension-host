@@ -51,7 +51,9 @@ pub fn runtime_ids() -> Result<(u32, u32), String> {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
-    let dir = path.parent().ok_or_else(|| "invalid write path".to_string())?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "invalid write path".to_string())?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut temporary = tempfile_in(dir)?;
     let tmp_path = temporary.path().clone();
@@ -142,21 +144,24 @@ pub fn output(command: &str, args: &[String]) -> Result<Vec<u8>, String> {
 }
 
 pub fn opkg(args: &[&str]) -> Result<(), String> {
-    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    fs::create_dir_all(paths::OPKG_TMP)
+        .map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
     let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
     owned.extend(args.iter().map(|value| (*value).to_owned()));
     run(paths::OPKG, &owned)
 }
 
 pub fn opkg_output(args: &[&str]) -> Result<Vec<u8>, String> {
-    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    fs::create_dir_all(paths::OPKG_TMP)
+        .map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
     let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
     owned.extend(args.iter().map(|value| (*value).to_owned()));
     output(paths::OPKG, &owned)
 }
 
 pub fn opkg_in(dir: &Path, args: &[&str]) -> Result<(), String> {
-    fs::create_dir_all(paths::OPKG_TMP).map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
+    fs::create_dir_all(paths::OPKG_TMP)
+        .map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
     let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
     owned.extend(args.iter().map(|value| (*value).to_owned()));
     let status = std::process::Command::new(paths::OPKG)

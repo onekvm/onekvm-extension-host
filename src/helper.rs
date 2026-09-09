@@ -33,6 +33,8 @@ struct HelperState {
     address_file: PathBuf,
     controller: CommandSpec,
     controller_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    last_activity: Mutex<Instant>,
     cgroups: CgroupManager,
     instances: Mutex<HashMap<String, ManagedProcess>>,
 }
@@ -569,6 +571,24 @@ fn stop_managed(process: ManagedProcess) {
 }
 
 impl HelperState {
+    fn touch(&self) {
+        if self.idle_timeout.is_some() {
+            if let Ok(mut last_activity) = self.last_activity.lock() {
+                *last_activity = Instant::now();
+            }
+        }
+    }
+
+    fn idle_expired(&self) -> bool {
+        let Some(timeout) = self.idle_timeout else {
+            return false;
+        };
+        self.last_activity
+            .lock()
+            .map(|last_activity| last_activity.elapsed() >= timeout)
+            .unwrap_or(false)
+    }
+
     fn ensure(&self, name: String, spec: CommandSpec, restart: String) -> Result<(), String> {
         if name.is_empty()
             || !name
@@ -703,9 +723,9 @@ fn write_address(path: &Path, address: &str, reuse_key: &str) -> io::Result<()> 
 }
 
 pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    if arguments.len() < 5 {
+    if arguments.len() < 6 {
         return Err(
-            "helper requires <id> <timeout-seconds> <address-file> <reuse-key> <controller> [arguments...]"
+            "helper requires <id> <timeout-seconds> <address-file> <reuse-key> <idle-seconds> <controller> [arguments...]"
                 .into(),
         );
     }
@@ -714,6 +734,10 @@ pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if timeout_seconds == 0 || timeout_seconds > 300 {
         return Err("helper timeout must be between 1 and 300 seconds".into());
     }
+    let idle_seconds: u64 = arguments[4].parse()?;
+    if idle_seconds > 3600 {
+        return Err("helper idle timeout must not exceed 3600 seconds".into());
+    }
     let address_file = PathBuf::from(&arguments[2]);
     let cgroups = CgroupManager::discover()?;
     let state = Arc::new(HelperState {
@@ -721,10 +745,12 @@ pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         reuse_key: arguments[3].clone(),
         address_file,
         controller: CommandSpec {
-            command: arguments[4..].to_vec(),
+            command: arguments[5..].to_vec(),
             environment: Vec::new(),
         },
         controller_timeout: Duration::from_secs(timeout_seconds),
+        idle_timeout: (idle_seconds != 0).then(|| Duration::from_secs(idle_seconds)),
+        last_activity: Mutex::new(Instant::now()),
         cgroups,
         instances: Mutex::new(HashMap::new()),
     });
@@ -796,6 +822,7 @@ pub unsafe extern "C" fn onekvm_helper_ping(
         set_err(err, "helper is missing".into());
         return -1;
     };
+    state.touch();
     *id = c_string(&state.id);
     0
 }
@@ -969,6 +996,62 @@ pub unsafe extern "C" fn onekvm_helper_exec(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_exec_capture(
+    helper: *mut std::os::raw::c_void,
+    command: *mut *mut std::os::raw::c_char,
+    ncommand: usize,
+    environment: *mut *mut std::os::raw::c_char,
+    nenv: usize,
+    payload: *const std::os::raw::c_void,
+    size: usize,
+    timeout: u32,
+    output: *mut *mut std::os::raw::c_void,
+    out_size: *mut usize,
+    err: *mut *mut std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(state) = helper_ref(helper) else {
+        set_err(err, "helper is missing".into());
+        return -1;
+    };
+    state.touch();
+    let timeout = Duration::from_secs(u64::from(timeout));
+    if timeout.is_zero() || timeout > Duration::from_secs(300) {
+        set_err(
+            err,
+            "action timeout must be between 1 and 300 seconds".into(),
+        );
+        return -1;
+    }
+    let bytes = std::slice::from_raw_parts(payload as *const u8, size);
+    let spec = CommandSpec {
+        command: string_vec(command, ncommand),
+        environment: string_vec(environment, nenv),
+    };
+    match run_capture(&spec, bytes, timeout) {
+        Ok(data) => {
+            let size = data.len();
+            let ptr = libc::malloc(size.max(1)) as *mut u8;
+            if ptr.is_null() {
+                set_err(err, "allocate action output".into());
+                return -1;
+            }
+            if size != 0 {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, size);
+            }
+            *out_size = size;
+            *output = ptr.cast::<std::os::raw::c_void>();
+            state.touch();
+            0
+        }
+        Err(error) => {
+            state.touch();
+            set_err(err, method_error("execute action", error));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn onekvm_helper_instances(
     helper: *mut std::os::raw::c_void,
     names: *mut *mut *mut std::os::raw::c_char,
@@ -1008,13 +1091,13 @@ pub unsafe extern "C" fn onekvm_helper_instances(
 pub unsafe extern "C" fn onekvm_helper_should_exit(
     helper: *mut std::os::raw::c_void,
 ) -> std::os::raw::c_int {
-    let Some(_state) = helper_ref(helper) else {
+    let Some(state) = helper_ref(helper) else {
         return 1;
     };
     // The systemd unit is the lifetime owner. Keeping an enabled extension's
     // helper alive preserves its mount/device/network namespaces for later
     // controller invocations, even when it currently supervises no process.
-    0
+    i32::from(state.idle_expired())
 }
 
 #[cfg(test)]
@@ -1063,6 +1146,8 @@ mod tests {
                 environment: Vec::new(),
             },
             controller_timeout: Duration::from_secs(1),
+            idle_timeout: None,
+            last_activity: Mutex::new(Instant::now()),
             cgroups: CgroupManager {
                 instances: instance_root.clone(),
             },

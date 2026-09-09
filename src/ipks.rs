@@ -54,8 +54,8 @@ pub fn inspect_ipks(
     accepted: &BTreeSet<String>,
 ) -> Result<InspectedIpks, String> {
     let (manifest_data, extracted) = extract_ipks(filename, extraction_root)?;
-    let manifest: IpksManifest = serde_json::from_slice(&manifest_data)
-        .map_err(|e| format!("decode IPKS manifest: {e}"))?;
+    let manifest: IpksManifest =
+        serde_json::from_slice(&manifest_data).map_err(|e| format!("decode IPKS manifest: {e}"))?;
     if manifest.format != IPKS_FORMAT || manifest.version != 1 {
         return Err("unsupported IPKS format or version".into());
     }
@@ -73,11 +73,18 @@ pub fn inspect_ipks(
         if !valid_ipks_filename(&item.file) {
             return Err(format!("IPKS has invalid package filename {:?}", item.file));
         }
-        if item.sha256.len() != 64 || !item.sha256.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        if item.sha256.len() != 64
+            || !item
+                .sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         {
             return Err(format!("IPKS package {} has invalid SHA-256", item.file));
         }
-        if declared.insert(item.file.clone(), item.sha256.clone()).is_some() {
+        if declared
+            .insert(item.file.clone(), item.sha256.clone())
+            .is_some()
+        {
             return Err(format!("IPKS repeats package {}", item.file));
         }
     }
@@ -88,7 +95,9 @@ pub fn inspect_ipks(
             .ok_or_else(|| format!("IPKS contains undeclared package {filename}"))?;
         let actual = file_sha256(package_path)?;
         if &actual != expected {
-            return Err(format!("IPKS package {filename} failed SHA-256 verification"));
+            return Err(format!(
+                "IPKS package {filename} failed SHA-256 verification"
+            ));
         }
         let bundled = inspect_bundled(package_path, accepted)?;
         if packages.contains_key(&bundled.info.name) {
@@ -181,7 +190,8 @@ fn inspect_bundled(path: &Path, accepted: &BTreeSet<String>) -> Result<BundledIp
         .get("control.tar.gz")
         .ok_or_else(|| "IPK has no control.tar.gz".to_string())?;
     let fields = inspect_control(control)?;
-    let dependencies = parse_package_dependencies(fields.get("Depends").map(String::as_str).unwrap_or(""))?;
+    let dependencies =
+        parse_package_dependencies(fields.get("Depends").map(String::as_str).unwrap_or(""))?;
     if !accepted.contains(&fields["Architecture"]) {
         return Err(format!(
             "package architecture {:?} is not accepted by opkg",
@@ -216,13 +226,10 @@ fn inspect_dependency_data(compressed: &[u8], root: &str) -> Result<(), String> 
             return Err("dependency has too many archive entries".into());
         }
         let entry = entry.map_err(|e| e.to_string())?;
-        let name = clean_archive_path(
-            &entry
-                .path()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy(),
-        )?;
-        if name != root && !name.starts_with(&(root.to_owned() + "/")) && !root.starts_with(&(name.clone() + "/"))
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
+        if name != root
+            && !name.starts_with(&(root.to_owned() + "/"))
+            && !root.starts_with(&(name.clone() + "/"))
         {
             return Err(format!("payload path /{name} escapes /{root}"));
         }
@@ -298,12 +305,7 @@ fn inspect_kernel_dependency_data(package_name: &str, compressed: &[u8]) -> Resu
             return Err("kernel dependency has too many archive entries".into());
         }
         let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = clean_archive_path(
-            &entry
-                .path()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy(),
-        )?;
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
         if !present.insert(name.clone()) {
             return Err(format!("duplicate archive path /{name}"));
         }
@@ -312,14 +314,17 @@ fn inspect_kernel_dependency_data(package_name: &str, compressed: &[u8]) -> Resu
             return Err(format!("unsupported archive entry type for /{name}"));
         }
         let parts: Vec<&str> = name.split('/').collect();
-        let is_module_tree = parts.len() >= 4 && parts[0] == "usr" && parts[1] == "lib" && parts[2] == "modules";
+        let is_module_tree =
+            parts.len() >= 4 && parts[0] == "usr" && parts[1] == "lib" && parts[2] == "modules";
         let is_module_ancestor = name == "usr" || name == "usr/lib" || name == "usr/lib/modules";
         let is_config_ancestor = name == "etc" || name == "etc/modules-load.d";
         if matches!(kind, EntryType::Directory) {
             if is_module_ancestor || is_config_ancestor || is_module_tree {
                 continue;
             }
-            return Err(format!("kernel dependency directory /{name} is not allowed"));
+            return Err(format!(
+                "kernel dependency directory /{name} is not allowed"
+            ));
         }
         if is_module_tree {
             let release = parts[3];
@@ -330,14 +335,18 @@ fn inspect_kernel_dependency_data(package_name: &str, compressed: &[u8]) -> Resu
             let relative = parts[4..].join("/");
             if package_name == KERNEL_BASE {
                 if relative.contains('/') || !metadata.contains(&relative.as_str()) {
-                    return Err(format!("kernel metadata package contains unexpected file /{name}"));
+                    return Err(format!(
+                        "kernel metadata package contains unexpected file /{name}"
+                    ));
                 }
                 modules_dep |= relative == "modules.dep";
                 build_id |= relative == "onekvm-build-id";
                 continue;
             }
             if relative.is_empty() || !relative.ends_with(".ko") {
-                return Err(format!("kernel module package contains unexpected file /{name}"));
+                return Err(format!(
+                    "kernel module package contains unexpected file /{name}"
+                ));
             }
             ko_files += 1;
             continue;
@@ -350,7 +359,9 @@ fn inspect_kernel_dependency_data(package_name: &str, compressed: &[u8]) -> Resu
                 return Err("kernel module load configuration is too large".into());
             }
             let mut content = String::new();
-            entry.read_to_string(&mut content).map_err(|e| e.to_string())?;
+            entry
+                .read_to_string(&mut content)
+                .map_err(|e| e.to_string())?;
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -418,7 +429,10 @@ fn validate_bundled_versions(packages: &BTreeMap<String, BundledIpk>) -> Result<
     Ok(())
 }
 
-fn validate_ipks_closure(root: &PackageInfo, packages: &BTreeMap<String, BundledIpk>) -> Result<(), String> {
+fn validate_ipks_closure(
+    root: &PackageInfo,
+    packages: &BTreeMap<String, BundledIpk>,
+) -> Result<(), String> {
     let mut reachable = BTreeSet::from([root.name.clone()]);
     let mut queue = vec![root.clone()];
     while let Some(current) = queue.pop() {
@@ -439,24 +453,26 @@ fn validate_ipks_closure(root: &PackageInfo, packages: &BTreeMap<String, Bundled
     Ok(())
 }
 
-fn extract_ipks(filename: &str, extraction_root: &Path) -> Result<(Vec<u8>, BTreeMap<String, PathBuf>), String> {
+fn extract_ipks(
+    filename: &str,
+    extraction_root: &Path,
+) -> Result<(Vec<u8>, BTreeMap<String, PathBuf>), String> {
     let file = fs::File::open(filename).map_err(|e| e.to_string())?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
     let mut manifest = None;
     let mut packages = BTreeMap::new();
     let mut expanded = 0u64;
-    for (count, entry) in archive.entries().map_err(|e| format!("open IPKS archive: {e}"))?.enumerate() {
+    for (count, entry) in archive
+        .entries()
+        .map_err(|e| format!("open IPKS archive: {e}"))?
+        .enumerate()
+    {
         if count > MAX_PACKAGES + 4 {
             return Err("IPKS has too many archive entries".into());
         }
         let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = clean_archive_path(
-            &entry
-                .path()
-                .map_err(|e| e.to_string())?
-                .to_string_lossy(),
-        )?;
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
         match entry.header().entry_type() {
             EntryType::Directory => {
                 if name != "packages" {
@@ -487,7 +503,9 @@ fn extract_ipks(filename: &str, extraction_root: &Path) -> Result<(Vec<u8>, BTre
                     return Err(format!("IPKS has unexpected entry {name}"));
                 }
                 if packages.contains_key(file_name) || entry.size() > MAX_PACKAGE {
-                    return Err(format!("IPKS package {file_name} is duplicate or too large"));
+                    return Err(format!(
+                        "IPKS package {file_name} is duplicate or too large"
+                    ));
                 }
                 let destination = extraction_root.join(file_name);
                 let mut output = fs::OpenOptions::new()
@@ -514,12 +532,17 @@ fn valid_ipks_filename(name: &str) -> bool {
     let mut chars = stem.chars();
     matches!(chars.next(), Some('a'..='z' | '0'..='9'))
         && stem.len() <= 127
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '_' | '-'))
+        && chars.all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '_' | '-')
+        })
 }
 
 fn file_sha256(path: &Path) -> Result<String, String> {
     let data = fs::read(path).map_err(|e| e.to_string())?;
-    Ok(Sha256::digest(&data).iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(Sha256::digest(&data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn is_kernel_support_package(name: &str) -> bool {

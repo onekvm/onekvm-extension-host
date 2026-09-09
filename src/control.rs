@@ -27,7 +27,12 @@ pub fn parse_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
         fields.insert(current.clone(), value.trim().to_owned());
     }
     for required in ["Package", "Version", "Architecture"] {
-        if fields.get(required).map(String::as_str).unwrap_or_default().is_empty() {
+        if fields
+            .get(required)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
             return Err(format!("control field {required} is missing"));
         }
     }
@@ -40,7 +45,10 @@ mod tests {
 
     #[test]
     fn parses_required_fields() {
-        let fields = parse_control(b"Package: onekvm-extension-edid\nVersion: 1.0.0\nArchitecture: riscv64\n").unwrap();
+        let fields = parse_control(
+            b"Package: onekvm-extension-edid\nVersion: 1.0.0\nArchitecture: riscv64\n",
+        )
+        .unwrap();
         assert_eq!(fields["Package"], "onekvm-extension-edid");
         assert_eq!(fields["Version"], "1.0.0");
     }

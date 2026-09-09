@@ -74,7 +74,8 @@ fn host_simple(method: &str, id: &str, revision: u64) -> Result<(), String> {
     let method = c_string(method)?;
     let id = c_string(id)?;
     let mut err = std::ptr::null_mut();
-    let status = unsafe { onekvm_cli_host_simple(method.as_ptr(), id.as_ptr(), revision, &mut err) };
+    let status =
+        unsafe { onekvm_cli_host_simple(method.as_ptr(), id.as_ptr(), revision, &mut err) };
     if status != 0 {
         return Err(fail(status, err, "extension host"));
     }
@@ -103,7 +104,12 @@ pub fn invoke(id: &str, method: &str, request: &str) -> Result<String, String> {
     Ok(unsafe { take_string(response) })
 }
 
-pub fn apply_config(id: &str, revision: u64, settings: &str, keys: &[String]) -> Result<(), String> {
+pub fn apply_config(
+    id: &str,
+    revision: u64,
+    settings: &str,
+    keys: &[String],
+) -> Result<(), String> {
     let id = c_string(id)?;
     let settings = c_string(settings)?;
     let owned: Result<Vec<CString>, String> = keys.iter().map(|key| c_string(key)).collect();

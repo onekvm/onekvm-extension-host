@@ -29,7 +29,8 @@ pub fn available_extensions() -> BTreeMap<String, Manifest> {
     if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now()).is_err()
     {
         let err = crate::sys::with_lock(|| {
-            if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now()).is_ok()
+            if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())
+                .is_ok()
             {
                 return Ok(());
             }
@@ -80,7 +81,8 @@ fn manifest_from_package_fields(fields: &BTreeMap<String, String>) -> Result<Man
     let extension = decode_manifest(&data)?;
     let package_name = format!("onekvm-extension-{}", extension.id);
     if fields.get("Package").map(String::as_str) != Some(package_name.as_str())
-        || fields.get("X-OneKVM-Extension-Version").map(String::as_str) != Some(extension.version.as_str())
+        || fields.get("X-OneKVM-Extension-Version").map(String::as_str)
+            != Some(extension.version.as_str())
     {
         return Err("extension manifest metadata does not match package identity".into());
     }
@@ -137,7 +139,11 @@ pub fn refresh() -> Result<(), String> {
         .map_err(|err| format!("reject package feed: {err}"))
 }
 
-pub fn validate_feed_freshness(metadata_list: &str, lists_root: &str, now: SystemTime) -> Result<(), String> {
+pub fn validate_feed_freshness(
+    metadata_list: &str,
+    lists_root: &str,
+    now: SystemTime,
+) -> Result<(), String> {
     let data = fs::read(Path::new(lists_root).join(metadata_list))
         .map_err(|_| "read signed feed metadata".to_string())?;
     let text = String::from_utf8_lossy(&data);
@@ -264,7 +270,9 @@ fn read_configured_urls(filename: &str, feed_syntax: bool) -> Result<Vec<Configu
         let (name, value) = if feed_syntax {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() != 3 || (fields[0] != "src" && fields[0] != "src/gz") {
-                return Err(format!("feed configuration contains a forbidden line: {line:?}"));
+                return Err(format!(
+                    "feed configuration contains a forbidden line: {line:?}"
+                ));
             }
             (fields[1].to_owned(), fields[2].to_owned())
         } else {
@@ -285,7 +293,10 @@ fn parse_url(name: &str, value: &str) -> Result<ConfiguredUrl, String> {
     if rest.contains('@') || rest.contains('?') || rest.contains('#') {
         return Err(format!("invalid feed URL {value:?}"));
     }
-    let (host_path, _) = rest.split_once('/').map(|(h, p)| (h, p)).unwrap_or((rest, ""));
+    let (host_path, _) = rest
+        .split_once('/')
+        .map(|(h, p)| (h, p))
+        .unwrap_or((rest, ""));
     let host = if rest.contains('/') {
         rest.split('/').next().unwrap_or_default()
     } else {
@@ -308,7 +319,8 @@ fn parse_url(name: &str, value: &str) -> Result<ConfiguredUrl, String> {
 }
 
 fn same_url_prefix(prefix: &ConfiguredUrl, feed: &ConfiguredUrl) -> bool {
-    if !prefix.scheme.eq_ignore_ascii_case(&feed.scheme) || !prefix.host.eq_ignore_ascii_case(&feed.host)
+    if !prefix.scheme.eq_ignore_ascii_case(&feed.scheme)
+        || !prefix.host.eq_ignore_ascii_case(&feed.host)
     {
         return false;
     }
@@ -318,7 +330,9 @@ fn same_url_prefix(prefix: &ConfiguredUrl, feed: &ConfiguredUrl) -> bool {
     } else {
         feed.path.clone()
     };
-    prefix_path.is_empty() || feed_path == prefix_path || feed_path.starts_with(&(prefix_path + "/"))
+    prefix_path.is_empty()
+        || feed_path == prefix_path
+        || feed_path.starts_with(&(prefix_path + "/"))
 }
 
 #[cfg(test)]
