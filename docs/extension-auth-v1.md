@@ -40,10 +40,16 @@ The method must print one JSON object:
 cancelled from the Web UI (`POST /api/auth/mfa/cancel`); Core writes
 `cancel_path` and may Invoke `cancel_method`.
 
-OLED messages use `org.onekvm.Core1.Oled`:
+Screen alerts use `org.onekvm.Screen` (owned by Core). OLED, a future
+touchscreen, or any other display backend can subscribe:
 
+- Bus: `org.onekvm.Screen`
+- Path: `/org/onekvm/Screen`
+- Interface: `org.onekvm.Screen`
 - `ShowAlert(s alert_json) -> s id`
-- `DismissAlert(s id)`
+- `Dismiss(s id)`
+- Signals: `Alert(s id, s alert_json)`, `Dismissed(s id)`
 
 `alert_json` is `{"title":"...","body":"...","ttl_ms":120000}`. An empty `id`
-dismisses the current alert. Only `nanokvm-oled` writes `/dev/onekvm-oled`.
+dismisses the current alert. Display backends render the alert; they do not
+own the well-known name.
