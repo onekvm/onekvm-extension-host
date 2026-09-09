@@ -1156,7 +1156,8 @@ int onekvm_cli_host_invoke(const char *id, const char *method, const char *reque
     result = sd_bus_message_append(message, "sss", id, method, request ? request : "null");
     if (result < 0)
         goto out;
-    result = sd_bus_call(bus, message, 35000000, &error, &reply);
+    /* Auth confirm methods wait up to 120s; keep a small margin over that. */
+    result = sd_bus_call(bus, message, 130000000, &error, &reply);
     if (result < 0) {
         result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
         goto out;
