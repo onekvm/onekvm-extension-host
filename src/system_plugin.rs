@@ -81,6 +81,7 @@ impl SystemPlugin {
             memory_budget_used_bytes: 0,
             memory_budget_total_bytes: 0,
             directories: Vec::new(),
+            auth_provider: None,
         }
     }
 
@@ -115,6 +116,7 @@ impl SystemPlugin {
             page: self.page.clone(),
             toolbar: None,
             routes: Vec::new(),
+            auth_provider: None,
             settings_schema: schema,
             settings,
             secrets_configured: Vec::new(),
@@ -137,12 +139,19 @@ impl SystemPlugin {
             None,
             true,
         )?;
-        serde_json::from_str(&payload).map_err(|e| format!("decode system plugin {} settings: {e}", self.id))
+        serde_json::from_str(&payload)
+            .map_err(|e| format!("decode system plugin {} settings: {e}", self.id))
     }
 
-    pub fn update_settings(&self, update: serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    pub fn update_settings(
+        &self,
+        update: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
         let Some(endpoint) = &self.dbus else {
-            return Err(format!("system plugin {} has no editable settings", self.id));
+            return Err(format!(
+                "system plugin {} has no editable settings",
+                self.id
+            ));
         };
         let mut settings = match self.settings()? {
             serde_json::Value::Object(map) => map,

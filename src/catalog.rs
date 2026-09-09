@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::feed::available_extensions;
 use crate::manifest::{
-    load_installed, installed_versions, ActivationConflict, ExtensionPage, ExtensionRoute,
-    ExtensionToolbar,
-    Manifest, ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
+    installed_versions, load_installed, ActivationConflict, AuthProvider, ExtensionPage,
+    ExtensionRoute, ExtensionToolbar, Manifest, ManifestDirectory, ManifestVideo, PageIcon,
+    SettingsSchema, Translation,
 };
 use crate::memory;
 use crate::paths;
@@ -75,6 +75,8 @@ pub struct CatalogSummary {
     pub memory_budget_total_bytes: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub directories: Vec<ManifestDirectory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<AuthProvider>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -119,6 +121,8 @@ pub struct CatalogEntry {
     pub toolbar: Option<ExtensionToolbar>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<AuthProvider>,
     pub settings_schema: SettingsSchema,
     pub settings: serde_json::Value,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -166,7 +170,8 @@ pub fn build_catalog() -> Result<Vec<CatalogSummary>, String> {
             for entry in entries {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let id = entry.file_name().to_string_lossy().into_owned();
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !paths::valid_id(&id) {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !paths::valid_id(&id)
+                {
                     continue;
                 }
                 match installed_summary(&id) {
@@ -192,7 +197,11 @@ pub fn build_catalog() -> Result<Vec<CatalogSummary>, String> {
         }
         result.push(summary_from_manifest(&manifest, false));
     }
-    result.extend(system_plugins.into_iter().map(|(_, plugin)| plugin.summary()));
+    result.extend(
+        system_plugins
+            .into_iter()
+            .map(|(_, plugin)| plugin.summary()),
+    );
     result.sort_by(|a, b| a.id.cmp(&b.id));
     apply_memory(&mut result)?;
     Ok(result)
@@ -207,6 +216,9 @@ fn installed_summary(id: &str) -> Result<Option<CatalogSummary>, String> {
     let extension = load_installed(id, &state.active_version)?;
     let mut item = summary_from_manifest(&extension.manifest, true);
     item.enabled = state.enabled;
+    if state.enabled {
+        item.directories = directories_for_installed(id, &extension.manifest.directories)?;
+    }
     item.running = extension_running(id, extension.manifest.controller.is_some());
     item.services = catalog_services(&extension.manifest, id, true, state.enabled);
     Ok(Some(item))
@@ -225,7 +237,11 @@ pub fn detail(id: &str) -> Result<CatalogEntry, String> {
         let extension = available_extensions()
             .remove(id)
             .ok_or_else(|| format!("extension {id:?} not found"))?;
-        return Ok(entry_from_manifest(&extension, false, vec![extension.version.clone()]));
+        return Ok(entry_from_manifest(
+            &extension,
+            false,
+            vec![extension.version.clone()],
+        ));
     }
     let state = read_state(id)?;
     let installed = load_installed(id, &state.active_version)?;
@@ -233,12 +249,82 @@ pub fn detail(id: &str) -> Result<CatalogEntry, String> {
     settings::merge_output(&installed, &mut settings)?;
     let mut item = entry_from_manifest(&installed.manifest, true, versions);
     item.enabled = state.enabled;
+    if state.enabled {
+        item.directories = directories_for_installed(id, &installed.manifest.directories)?;
+    }
     item.running = extension_running(id, installed.manifest.controller.is_some());
     item.services = catalog_services(&installed.manifest, id, true, state.enabled);
     let (redacted, secrets) = settings::redact(&installed.manifest, &settings);
     item.settings = redacted;
     item.secrets_configured = secrets;
     Ok(item)
+}
+
+#[derive(Deserialize)]
+struct DirectoriesOutput {
+    directories: Vec<ManifestDirectory>,
+}
+
+fn directories_for_installed(
+    id: &str,
+    declared: &[ManifestDirectory],
+) -> Result<Vec<ManifestDirectory>, String> {
+    let path = Path::new(paths::APP_DATA_ROOT)
+        .join(id)
+        .join(paths::DIRECTORIES_OUTPUT);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(declared.to_vec()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(declared.to_vec())
+        }
+        Err(err) => return Err(format!("read dynamic extension directories: {err}")),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("dynamic extension directories output is not a regular file".into());
+    }
+    if metadata.size() > 64 << 10 {
+        return Err("dynamic extension directories output exceeds 64 KiB".into());
+    }
+    let data = fs::read(&path).map_err(|e| format!("read dynamic extension directories: {e}"))?;
+    decode_dynamic_directories(&data, declared)
+}
+
+fn decode_dynamic_directories(
+    data: &[u8],
+    declared: &[ManifestDirectory],
+) -> Result<Vec<ManifestDirectory>, String> {
+    let output: DirectoriesOutput = serde_json::from_slice(data)
+        .map_err(|e| format!("decode dynamic extension directories: {e}"))?;
+    if output.directories.len() > 32 {
+        return Err("extension may publish at most 32 dynamic directories".into());
+    }
+    let mut result = declared.to_vec();
+    let mut ids = declared
+        .iter()
+        .map(|directory| directory.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for directory in &output.directories {
+        if directory.location != "data" {
+            return Err(format!(
+                "dynamic directory {:?} location must be data",
+                directory.id
+            ));
+        }
+        if !paths::valid_id(&directory.id)
+            || !ids.insert(directory.id.clone())
+            || !paths::valid_directory_kind(&directory.kind)
+            || (!directory.role.is_empty() && !paths::valid_directory_kind(&directory.role))
+            || !paths::safe_relative(&directory.path)
+        {
+            return Err(format!(
+                "invalid or duplicate dynamic directory {:?}",
+                directory.id
+            ));
+        }
+        result.push(directory.clone());
+    }
+    Ok(result)
 }
 
 pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSummary {
@@ -275,10 +361,15 @@ pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSu
         memory_budget_used_bytes: 0,
         memory_budget_total_bytes: 0,
         directories: extension.directories.clone(),
+        auth_provider: extension.auth_provider.clone(),
     }
 }
 
-fn entry_from_manifest(extension: &Manifest, installed: bool, versions: Vec<String>) -> CatalogEntry {
+fn entry_from_manifest(
+    extension: &Manifest,
+    installed: bool,
+    versions: Vec<String>,
+) -> CatalogEntry {
     let budget = if extension.memory_budget.is_empty() {
         0
     } else {
@@ -313,6 +404,7 @@ fn entry_from_manifest(extension: &Manifest, installed: bool, versions: Vec<Stri
         page: extension.page.clone(),
         toolbar: extension.toolbar.clone(),
         routes: extension.routes.clone(),
+        auth_provider: extension.auth_provider.clone(),
         settings_schema: schema,
         settings: serde_json::json!({}),
         secrets_configured: Vec::new(),
@@ -323,7 +415,12 @@ fn entry_from_manifest(extension: &Manifest, installed: bool, versions: Vec<Stri
     }
 }
 
-fn catalog_services(extension: &Manifest, id: &str, installed: bool, enabled: bool) -> Vec<CatalogService> {
+fn catalog_services(
+    extension: &Manifest,
+    id: &str,
+    installed: bool,
+    enabled: bool,
+) -> Vec<CatalogService> {
     let mut running_instances = BTreeMap::new();
     if installed && extension.controller.is_some() {
         if let Ok(names) = crate::helper_client::call(id, "Ping", &[]) {
@@ -336,12 +433,11 @@ fn catalog_services(extension: &Manifest, id: &str, installed: bool, enabled: bo
         .services
         .iter()
         .map(|service| {
-            let translation = service
-                .i18n
-                .get("default")
-                .cloned()
-                .unwrap_or_default();
-            let unit = if extension.controller.is_some() {
+            let translation = service.i18n.get("default").cloned().unwrap_or_default();
+            let external_unit = !service.unit.is_empty();
+            let unit = if external_unit {
+                service.unit.clone()
+            } else if extension.controller.is_some() {
                 paths::helper_unit(id)
             } else {
                 paths::unit_name(id)
@@ -353,6 +449,11 @@ fn catalog_services(extension: &Manifest, id: &str, installed: bool, enabled: bo
             } else {
                 sandbox::is_active(&unit)
             };
+            let service_enabled = if installed && external_unit {
+                sandbox::is_enabled(&unit)
+            } else {
+                enabled
+            };
             CatalogService {
                 id: service.id.clone(),
                 name: translation.name,
@@ -360,7 +461,7 @@ fn catalog_services(extension: &Manifest, id: &str, installed: bool, enabled: bo
                 i18n: service.i18n.clone(),
                 unit,
                 running,
-                enabled,
+                enabled: service_enabled,
             }
         })
         .collect()
@@ -399,6 +500,7 @@ fn empty_summary() -> CatalogSummary {
         memory_budget_used_bytes: 0,
         memory_budget_total_bytes: 0,
         directories: Vec::new(),
+        auth_provider: None,
     }
 }
 
@@ -444,11 +546,20 @@ fn write_fingerprint(hash: &mut Sha256) -> Result<(), String> {
                 version_entries.sort_by_key(|entry| entry.file_name());
                 for version in version_entries {
                     if version.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        fingerprint_path(hash, &id_path.join(version.file_name()).join("manifest.json"))?;
+                        fingerprint_path(
+                            hash,
+                            &id_path.join(version.file_name()).join("manifest.json"),
+                        )?;
                     }
                 }
             }
             fingerprint_path(hash, &paths::state_path(&id))?;
+            fingerprint_path(
+                hash,
+                &Path::new(paths::APP_DATA_ROOT)
+                    .join(&id)
+                    .join(paths::DIRECTORIES_OUTPUT),
+            )?;
         }
     }
     fingerprint_path(hash, Path::new(paths::CONFIG_ROOT))?;
@@ -536,4 +647,65 @@ fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), Stri
     let mut payload = payload;
     payload.push(b'\n');
     crate::sys::atomic_write(Path::new(paths::CATALOG_CACHE), &payload, 0o600)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_directories_are_data_only_and_merge_with_declared_entries() {
+        let declared = vec![ManifestDirectory {
+            id: "built-in".into(),
+            kind: "documents".into(),
+            role: String::new(),
+            path: "documents".into(),
+            location: "data".into(),
+            writable: true,
+        }];
+        let data = br#"{
+            "directories": [{
+                "id": "gateway-0011223344556677",
+                "kind": "virtual-media",
+                "role": "gateway",
+                "path": "gateways/gateway-0011223344556677",
+                "location": "data",
+                "writable": false
+            }]
+        }"#;
+        let result = decode_dynamic_directories(data, &declared).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].kind, "virtual-media");
+    }
+
+    #[test]
+    fn dynamic_directories_reject_package_paths_and_duplicate_ids() {
+        let package = br#"{
+            "directories": [{
+                "id": "gateway-a",
+                "kind": "virtual-media",
+                "path": "media",
+                "location": "package"
+            }]
+        }"#;
+        assert!(decode_dynamic_directories(package, &[]).is_err());
+
+        let declared = vec![ManifestDirectory {
+            id: "gateway-a".into(),
+            kind: "virtual-media".into(),
+            role: String::new(),
+            path: "media".into(),
+            location: "data".into(),
+            writable: false,
+        }];
+        let duplicate = br#"{
+            "directories": [{
+                "id": "gateway-a",
+                "kind": "virtual-media",
+                "path": "other",
+                "location": "data"
+            }]
+        }"#;
+        assert!(decode_dynamic_directories(duplicate, &declared).is_err());
+    }
 }

@@ -62,8 +62,8 @@ pub struct Manifest {
     #[serde(default)]
     pub lifecycle: LifecycleHooks,
     pub controller: Option<ControllerSpec>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub methods: std::collections::BTreeMap<String, MethodSpec>,
+    #[serde(default, skip_serializing_if = "Methods::is_empty")]
+    pub methods: Methods,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub settings_reload: String,
     #[serde(default)]
@@ -76,6 +76,19 @@ pub struct Manifest {
     pub directories: Vec<ManifestDirectory>,
     #[serde(default)]
     pub healthcheck: Healthcheck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<AuthProvider>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct AuthProvider {
+    pub method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cancel_method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub login: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub enroll: String,
 }
 
 fn is_zero_i32(value: &i32) -> bool {
@@ -103,6 +116,8 @@ pub struct ManifestService {
     pub id: String,
     #[serde(default)]
     pub i18n: std::collections::BTreeMap<String, Translation>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unit: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -187,8 +202,99 @@ pub struct ControllerSpec {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct MethodSpec {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<MethodArgument>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub available_when_disabled: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct MethodArgument {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Methods(pub std::collections::BTreeMap<String, MethodSpec>);
+
+impl Methods {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&MethodSpec> {
+        self.0.get(name)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &MethodSpec> {
+        self.0.values()
+    }
+
+    pub fn has_commands(&self) -> bool {
+        self.0.values().any(|method| !method.command.is_empty())
+    }
+}
+
+impl<'de> Deserialize<'de> for Methods {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            List(Vec<MethodSpec>),
+            Legacy(std::collections::BTreeMap<String, MethodSpec>),
+        }
+
+        let mut methods = std::collections::BTreeMap::new();
+        match Repr::deserialize(deserializer)? {
+            Repr::List(items) => {
+                for item in items {
+                    if item.name.is_empty() {
+                        return Err(serde::de::Error::custom("method name is required"));
+                    }
+                    let name = item.name.clone();
+                    if methods.insert(name.clone(), item).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate method {name:?}"
+                        )));
+                    }
+                }
+            }
+            Repr::Legacy(items) => {
+                for (name, mut item) in items {
+                    item.name = name.clone();
+                    methods.insert(name, item);
+                }
+            }
+        }
+        Ok(Self(methods))
+    }
+}
+
+impl Serialize for Methods {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.values().collect::<Vec<_>>().serialize(serializer)
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -223,7 +329,11 @@ pub struct SettingProperty {
     pub maximum: Option<f64>,
     #[serde(default, rename = "maxLength", skip_serializing_if = "Option::is_none")]
     pub max_length: Option<usize>,
-    #[serde(default, rename = "readOnly", skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        rename = "readOnly",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_when: Option<SettingCondition>,
@@ -286,8 +396,7 @@ pub fn load_installed(id: &str, version: &str) -> Result<Installed, String> {
     }
     let root = paths::app_root(id, &version);
     let data = fs::read(root.join("manifest.json")).map_err(|e| format!("read manifest: {e}"))?;
-    let manifest: Manifest =
-        serde_json::from_slice(&data).map_err(|e| format!("decode manifest: {e}"))?;
+    let manifest = decode_manifest(&data)?;
     if manifest.id != id || manifest.version != version {
         return Err("manifest identity does not match installation path".into());
     }
@@ -367,7 +476,10 @@ pub fn runtime_architecture() -> String {
 
 fn validate_manifest(value: &Manifest) -> Result<(), String> {
     if value.manifest_version < 0 || value.manifest_version > 1 {
-        return Err(format!("unsupported manifest version {}", value.manifest_version));
+        return Err(format!(
+            "unsupported manifest version {}",
+            value.manifest_version
+        ));
     }
     if !paths::valid_id(&value.id) {
         return Err(format!("invalid extension id {:?}", value.id));
@@ -376,10 +488,12 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
         return Err(format!("invalid extension version {:?}", value.version));
     }
     if value.api_version != 1 && value.api_version != 2 {
-        return Err(format!("unsupported plugin API version {}", value.api_version));
+        return Err(format!(
+            "unsupported plugin API version {}",
+            value.api_version
+        ));
     }
-    if !value.author.is_empty()
-        && (value.author.trim() != value.author || value.author.len() > 120)
+    if !value.author.is_empty() && (value.author.trim() != value.author || value.author.len() > 120)
     {
         return Err(format!("invalid author {:?}", value.author));
     }
@@ -397,8 +511,11 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
             value.architecture
         ));
     }
-    if !paths::safe_relative(&value.entrypoint) {
+    if !value.entrypoint.is_empty() && !paths::safe_relative(&value.entrypoint) {
         return Err(format!("unsafe entrypoint {:?}", value.entrypoint));
+    }
+    if value.entrypoint.is_empty() && !value.methods.has_commands() {
+        return Err("entrypoint is required unless methods declare commands".into());
     }
     if value.api_version == 2 {
         if value.name.trim().is_empty() {
@@ -408,15 +525,167 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
             return Err("kind is required".into());
         }
     }
+    validate_services(value)?;
     validate_directories(&value.directories)?;
+    validate_methods(value)?;
+    validate_auth_provider(value)?;
     if let Some(toolbar) = &value.toolbar {
         if !paths::safe_relative(&toolbar.entrypoint)
             || !toolbar.entrypoint.starts_with("web/")
             || !toolbar.entrypoint.ends_with(".js")
         {
-            return Err(format!("unsafe toolbar entrypoint {:?}", toolbar.entrypoint));
+            return Err(format!(
+                "unsafe toolbar entrypoint {:?}",
+                toolbar.entrypoint
+            ));
         }
     }
+    Ok(())
+}
+
+fn validate_services(value: &Manifest) -> Result<(), String> {
+    if value.services.len() > 16 {
+        return Err("extension may declare at most 16 services".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for service in &value.services {
+        if !paths::valid_method_name(&service.id) || !seen.insert(&service.id) {
+            return Err(format!("invalid or duplicate service id {:?}", service.id));
+        }
+        if !service.unit.is_empty()
+            && !paths::valid_extension_service_unit(&value.id, &service.unit)
+        {
+            return Err(format!(
+                "service {:?} declares an unsafe unit {:?}",
+                service.id, service.unit
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_methods(value: &Manifest) -> Result<(), String> {
+    for method in value.methods.values() {
+        if !paths::valid_method_name(&method.name) {
+            return Err(format!("invalid public method name {:?}", method.name));
+        }
+        if method.command.is_empty() {
+            if value.controller.is_none() {
+                return Err(format!(
+                    "method {:?} requires command or controller",
+                    method.name
+                ));
+            }
+        } else {
+            if value.controller.is_some() {
+                return Err(format!(
+                    "method {:?} cannot declare command with controller",
+                    method.name
+                ));
+            }
+            if !paths::safe_relative(&method.command[0])
+                || method
+                    .command
+                    .iter()
+                    .any(|argument| argument.is_empty() || argument.contains('\0'))
+            {
+                return Err(format!("invalid command for method {:?}", method.name));
+            }
+            let timeout = if method.timeout_seconds == 0 {
+                10
+            } else {
+                method.timeout_seconds
+            };
+            let auth_method = value
+                .auth_provider
+                .as_ref()
+                .map(|provider| provider.method.as_str())
+                == Some(method.name.as_str());
+            let max_timeout = if auth_method { 120 } else { 30 };
+            if timeout < 1 || timeout > max_timeout {
+                return Err(format!(
+                    "method {:?} timeout must be between 1 and {max_timeout} seconds",
+                    method.name
+                ));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut optional_seen = false;
+        for argument in &method.args {
+            if !paths::valid_method_name(&argument.name) || !names.insert(&argument.name) {
+                return Err(format!(
+                    "invalid or duplicate argument {:?} for method {:?}",
+                    argument.name, method.name
+                ));
+            }
+            if !matches!(
+                argument.type_name.as_str(),
+                "string" | "integer" | "number" | "boolean"
+            ) {
+                return Err(format!(
+                    "unsupported type {:?} for method argument {:?}",
+                    argument.type_name, argument.name
+                ));
+            }
+            if argument.secret && argument.type_name != "string" {
+                return Err(format!(
+                    "secret method argument {:?} must be a string",
+                    argument.name
+                ));
+            }
+            if !argument.secret && optional_seen && argument.required {
+                return Err(format!(
+                    "required argument {:?} cannot follow an optional argument",
+                    argument.name
+                ));
+            }
+            if !argument.secret {
+                optional_seen |= !argument.required;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_auth_ui(path: &str, label: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    if !paths::safe_relative(path) || !path.starts_with("web/") || !path.ends_with(".js") {
+        return Err(format!("unsafe auth provider {label} {path:?}"));
+    }
+    Ok(())
+}
+
+fn validate_auth_provider(value: &Manifest) -> Result<(), String> {
+    let Some(provider) = &value.auth_provider else {
+        return Ok(());
+    };
+    if !paths::valid_method_name(&provider.method) {
+        return Err(format!("invalid auth provider method {:?}", provider.method));
+    }
+    if value.methods.get(&provider.method).is_none() {
+        return Err(format!(
+            "auth provider method {:?} is not declared",
+            provider.method
+        ));
+    }
+    if !provider.cancel_method.is_empty() {
+        if !paths::valid_method_name(&provider.cancel_method) {
+            return Err(format!(
+                "invalid auth provider cancel method {:?}",
+                provider.cancel_method
+            ));
+        }
+        if value.methods.get(&provider.cancel_method).is_none() {
+            return Err(format!(
+                "auth provider cancel method {:?} is not declared",
+                provider.cancel_method
+            ));
+        }
+    }
+    validate_auth_ui(&provider.login, "login")?;
+    validate_auth_ui(&provider.enroll, "enroll")?;
     Ok(())
 }
 
@@ -466,4 +735,121 @@ fn validate_directories(directories: &[ManifestDirectory]) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_methods_are_an_array_with_typed_arguments() {
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "edid-editor",
+                "i18n": {{"default": {{"name": "EDID", "description": "Editor"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{}",
+                "kind": "service",
+                "methods": [{{
+                    "name": "read",
+                    "command": ["bin/editor", "read"],
+                    "args": [{{"name": "id", "type": "string", "required": true}}]
+                }}]
+            }}"#,
+            runtime_architecture()
+        );
+        let manifest = decode_manifest(data.as_bytes()).unwrap();
+        let method = manifest.methods.get("read").unwrap();
+        assert_eq!(method.command, ["bin/editor", "read"]);
+        assert!(method.args[0].required);
+        assert!(manifest.entrypoint.is_empty());
+    }
+
+    #[test]
+    fn auth_provider_requires_declared_methods_and_web_js() {
+        let architecture = runtime_architecture();
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "nanokvm-boot-confirm",
+                "i18n": {{"default": {{"name": "BOOT", "description": "Confirm"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{architecture}",
+                "kind": "service",
+                "methods": [
+                    {{"name": "confirm", "command": ["bin/confirm"], "timeout_seconds": 120}},
+                    {{"name": "cancel", "command": ["bin/cancel"], "timeout_seconds": 5}}
+                ],
+                "auth_provider": {{
+                    "method": "confirm",
+                    "cancel_method": "cancel",
+                    "login": "web/login.js",
+                    "enroll": "web/enroll.js"
+                }}
+            }}"#
+        );
+        let manifest = decode_manifest(data.as_bytes()).unwrap();
+        let provider = manifest.auth_provider.unwrap();
+        assert_eq!(provider.method, "confirm");
+        assert_eq!(provider.cancel_method, "cancel");
+
+        let missing_method = data.replace(r#""method": "confirm""#, r#""method": "missing""#);
+        assert!(decode_manifest(missing_method.as_bytes()).is_err());
+        let bad_login = data.replace("web/login.js", "bin/login.js");
+        assert!(decode_manifest(bad_login.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn legacy_controller_method_object_remains_supported() {
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "legacy-controller",
+                "i18n": {{"default": {{"name": "Legacy", "description": "Controller"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{}",
+                "kind": "service",
+                "entrypoint": "bin/legacy",
+                "controller": {{
+                    "runtime": "executable",
+                    "entrypoint": "bin/legacy",
+                    "timeout_seconds": 5
+                }},
+                "methods": {{"status": {{}}}}
+            }}"#,
+            runtime_architecture()
+        );
+        let manifest = decode_manifest(data.as_bytes()).unwrap();
+        assert_eq!(manifest.methods.get("status").unwrap().name, "status");
+    }
+
+    #[test]
+    fn service_unit_is_limited_to_the_extension_namespace() {
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "samba",
+                "i18n": {{"default": {{"name": "Samba", "description": "SMB"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{}",
+                "kind": "service",
+                "methods": [{{"name": "status", "command": ["bin/samba", "status"]}}],
+                "services": [{{"id": "manager", "unit": "onekvm-samba-manager.service"}}]
+            }}"#,
+            runtime_architecture()
+        );
+        let manifest = decode_manifest(data.as_bytes()).unwrap();
+        assert_eq!(manifest.services[0].unit, "onekvm-samba-manager.service");
+
+        let unsafe_data = data.replace(
+            "onekvm-samba-manager.service",
+            "onekvm-extension-host.service",
+        );
+        assert!(decode_manifest(unsafe_data.as_bytes()).is_err());
+    }
 }
