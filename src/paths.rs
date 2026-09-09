@@ -32,6 +32,7 @@ pub const EXTENSIONS_SLICE: &str = "system-onekvm-extensions.slice";
 pub const TRANSIENT_ROOT: &str = "/run/systemd/transient";
 pub const RUNTIME_UNIT_ROOT: &str = "/run/systemd/system";
 pub const SETTINGS_OUTPUT: &str = "settings-output.json";
+pub const DIRECTORIES_OUTPUT: &str = "directories-output.json";
 pub const MAX_LOCAL_IPK: u64 = 32 << 20;
 
 pub fn state_path(id: &str) -> PathBuf {
@@ -55,6 +56,19 @@ pub fn helper_address(id: &str) -> PathBuf {
 
 pub fn unit_name(id: &str) -> String {
     format!("onekvm-extension-{id}.service")
+}
+
+pub fn valid_extension_service_unit(id: &str, unit: &str) -> bool {
+    if !valid_id(id) || !unit.ends_with(".service") {
+        return false;
+    }
+    let name = unit.strip_suffix(".service").unwrap_or_default();
+    let direct = format!("onekvm-{id}");
+    let extension = format!("onekvm-extension-{id}");
+    name == direct
+        || name.starts_with(&format!("{direct}-"))
+        || name == extension
+        || name.starts_with(&format!("{extension}-"))
 }
 
 pub fn valid_id(id: &str) -> bool {
