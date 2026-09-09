@@ -38,8 +38,13 @@ returned by `Invoke`. Diagnostics belong on stderr. Input and output are each
 limited to 1 MiB. The default timeout is 10 seconds and an explicit timeout
 must be between 1 and 30 seconds.
 
-Command-only extensions omit `entrypoint`, `controller`, and `healthcheck`.
-The host runs each command in the extension sandbox and tears the helper down
-after the request, so no extension process remains resident.
+Extensions that only need short-lived commands omit `entrypoint`,
+`controller`, and `healthcheck`. The host runs each command in the extension
+sandbox and tears the helper down after the request.
+
+A command-method extension may still declare `entrypoint` to run a legacy
+daemon. In that case the host starts and stops the daemon on enable, disable,
+and config changes, and `Invoke` uses the command methods. Do not declare
+`controller` together with command methods.
 
 The legacy object form of `methods` remains valid for controller extensions.
