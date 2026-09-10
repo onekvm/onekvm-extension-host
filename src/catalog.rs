@@ -219,7 +219,7 @@ fn installed_summary(id: &str) -> Result<Option<CatalogSummary>, String> {
     if state.enabled {
         item.directories = directories_for_installed(id, &extension.manifest.directories)?;
     }
-    item.running = extension_running(id, extension.manifest.controller.is_some());
+    item.running = extension_running(id, &extension.manifest, state.enabled);
     item.services = catalog_services(&extension.manifest, id, true, state.enabled);
     Ok(Some(item))
 }
@@ -252,7 +252,7 @@ pub fn detail(id: &str) -> Result<CatalogEntry, String> {
     if state.enabled {
         item.directories = directories_for_installed(id, &installed.manifest.directories)?;
     }
-    item.running = extension_running(id, installed.manifest.controller.is_some());
+    item.running = extension_running(id, &installed.manifest, state.enabled);
     item.services = catalog_services(&installed.manifest, id, true, state.enabled);
     let (redacted, secrets) = settings::redact(&installed.manifest, &settings);
     item.settings = redacted;
@@ -467,8 +467,17 @@ fn catalog_services(
         .collect()
 }
 
-pub fn extension_running(id: &str, controller: bool) -> bool {
-    if controller {
+pub fn command_only_extension(manifest: &Manifest) -> bool {
+    manifest.controller.is_none()
+        && manifest.entrypoint.is_empty()
+        && manifest.methods.has_commands()
+}
+
+pub fn extension_running(id: &str, manifest: &Manifest, enabled: bool) -> bool {
+    if command_only_extension(manifest) {
+        return enabled;
+    }
+    if manifest.controller.is_some() {
         sandbox::is_active(&paths::helper_unit(id))
     } else {
         sandbox::is_active(&paths::unit_name(id))
@@ -676,6 +685,29 @@ mod tests {
         let result = decode_dynamic_directories(data, &declared).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[1].kind, "virtual-media");
+    }
+
+    #[test]
+    fn command_only_auth_plugin_is_ready_when_enabled() {
+        let mut methods = std::collections::BTreeMap::new();
+        methods.insert(
+            "confirm".into(),
+            crate::manifest::MethodSpec {
+                name: "confirm".into(),
+                command: vec!["bin/onekvm-boot-confirm".into()],
+                ..crate::manifest::MethodSpec::default()
+            },
+        );
+        let mut manifest = Manifest {
+            methods: crate::manifest::Methods(methods),
+            ..Manifest::default()
+        };
+        assert!(command_only_extension(&manifest));
+        assert!(extension_running("nanokvm-boot-confirm", &manifest, true));
+        assert!(!extension_running("nanokvm-boot-confirm", &manifest, false));
+
+        manifest.entrypoint = "bin/daemon".into();
+        assert!(!command_only_extension(&manifest));
     }
 
     #[test]

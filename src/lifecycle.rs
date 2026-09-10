@@ -138,18 +138,18 @@ pub fn status(id: &str) -> Result<Value, String> {
         return Err(format!("invalid extension id {id:?}"));
     }
     let state = read_state(id)?;
-    let controller = if state.active_version.is_empty() {
+    let running = if state.active_version.is_empty() {
         false
     } else {
         load_installed(id, &state.active_version)
-            .map(|extension| extension.manifest.controller.is_some())
+            .map(|extension| extension_running(id, &extension.manifest, state.enabled))
             .unwrap_or(false)
     };
     Ok(serde_json::json!({
         "id": id,
         "active_version": if state.active_version.is_empty() { Value::Null } else { Value::String(state.active_version) },
         "enabled": state.enabled,
-        "running": extension_running(id, controller),
+        "running": running,
     }))
 }
 
@@ -370,7 +370,7 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
                 let allow_current = !ports::contains_changed_key(&changed_keys, "port")
                     && state.enabled
                     && settings::service_enabled(&previous)
-                    && extension_running(id, extension.manifest.controller.is_some());
+                    && extension_running(id, &extension.manifest, state.enabled);
                 ports::validate_extension_port(id, &settings, allow_current)?;
             }
             if let Value::Object(map) = settings {
