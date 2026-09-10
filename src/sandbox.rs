@@ -86,7 +86,7 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         arguments.push("--property=PrivateDevices=yes".into());
     } else {
         devices.sort();
-        arguments.push("--property=PrivateDevices=no".into());
+        arguments.push("--property=PrivateDevices=yes".into());
         arguments.push("--property=DevicePolicy=closed".into());
         for device in devices {
             arguments.push(format!("--property=DeviceAllow={device} rw"));
