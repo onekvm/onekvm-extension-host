@@ -77,6 +77,7 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     }
     if permissions.contains("gpio") {
         devices.extend(glob_paths("/dev/gpiochip*"));
+        devices.extend(glob_paths("/dev/input/event*"));
     }
     if permissions.contains("network-admin") {
         devices.push("/dev/net/tun".into());
