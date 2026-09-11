@@ -90,6 +90,9 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         arguments.push("--property=DevicePolicy=closed".into());
         for device in devices {
             arguments.push(format!("--property=DeviceAllow={device} rw"));
+            if device.starts_with("/dev/") {
+                arguments.push(format!("--property=BindPaths={device}"));
+            }
         }
     }
     if permissions.contains("network-admin") {

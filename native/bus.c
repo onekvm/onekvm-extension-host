@@ -348,6 +348,7 @@ static int append_transient_property(sd_bus_message *message,
             result = sd_bus_message_append(message, "(sv)", name, "b", boolean);
     } else if (strcmp(name, "ReadOnlyPaths") == 0 ||
                strcmp(name, "ReadWritePaths") == 0 ||
+               strcmp(name, "BindPaths") == 0 ||
                strcmp(name, "SystemCallArchitectures") == 0 ||
                strcmp(name, "BindsTo") == 0 || strcmp(name, "PartOf") == 0 ||
                strcmp(name, "After") == 0) {
