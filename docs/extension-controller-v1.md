@@ -79,3 +79,19 @@ directory at `/plugins/<extension-id>/`. A request for the route root serves
 accepts only `GET` and `HEAD`, rejects path traversal and escaping symlinks,
 and does not read any other extension files. `file` routes do not accept
 `socket` or `port` fields.
+
+## Route authentication
+
+Routes accept three authentication modes:
+
+- `session` is served below `/api/plugins/<extension-id>/` and requires a
+  valid OneKVM device session.
+- `passthrough` is served below `/plugins/<extension-id>/` and also requires a
+  valid OneKVM device session.
+- `public` is served below `/plugins/<extension-id>/` without a OneKVM device
+  session. It is reserved for narrow external identity-provider callbacks
+  that authenticate their own unguessable, expiring, single-use state.
+
+Only the route prefix explicitly marked `public` bypasses device login. Do
+not use `public` for settings, credential reads, disconnect actions, static
+pages, or long-lived sockets.
