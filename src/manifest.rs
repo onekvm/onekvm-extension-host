@@ -159,6 +159,8 @@ pub struct ExtensionRoute {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ManifestDirectory {
     pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub kind: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub role: String,
@@ -700,12 +702,19 @@ fn valid_homepage(value: &str) -> bool {
     !host.is_empty() && !host.contains('@')
 }
 
+pub(crate) fn valid_directory_name(name: &str) -> bool {
+    name.len() <= 255 && !name.chars().any(char::is_control)
+}
+
 fn validate_directories(directories: &[ManifestDirectory]) -> Result<(), String> {
     if directories.len() > 8 {
         return Err("extension may declare at most 8 directories".into());
     }
     let mut seen = std::collections::BTreeSet::new();
     for directory in directories {
+        if !valid_directory_name(&directory.name) {
+            return Err(format!("invalid directory name for {:?}", directory.id));
+        }
         if !paths::valid_id(&directory.id) {
             return Err(format!("invalid directory id {:?}", directory.id));
         }

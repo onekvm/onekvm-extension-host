@@ -38,6 +38,7 @@ writing `$ONEKVM_EXTENSION_DATA/directories-output.json`:
 {
   "directories": [{
     "id": "gateway-0011223344556677",
+    "name": "Lab NAS",
     "kind": "virtual-media",
     "role": "gateway",
     "path": "gateways/gateway-0011223344556677",
@@ -51,7 +52,8 @@ Dynamic entries are merged with the manifest's static `directories`. They are
 visible only while the extension is enabled, must use safe relative paths and
 `location: "data"`, may not repeat a static ID, and are limited to 32 entries
 and a 64 KiB output file. Use an atomic rename so catalog readers never observe
-partially written JSON.
+partially written JSON. The optional `name` is the user-facing directory label
+(up to 255 UTF-8 bytes, without control characters); `id` remains the stable identity.
 
 ## License
 

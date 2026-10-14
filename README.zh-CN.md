@@ -34,6 +34,7 @@ API v2 manifest 可以将 `methods` 声明为数组。方法可以提供插件�
 {
   "directories": [{
     "id": "gateway-0011223344556677",
+    "name": "Lab NAS",
     "kind": "virtual-media",
     "role": "gateway",
     "path": "gateways/gateway-0011223344556677",
@@ -45,7 +46,8 @@ API v2 manifest 可以将 `methods` 声明为数组。方法可以提供插件�
 
 动态项会和 manifest 中的静态 `directories` 合并，只在插件启用时可见。动态项
 必须使用安全相对路径和 `location: "data"`，不能与静态 ID 重复；最多 32 项，
-输出文件最大 64 KiB。写入时应使用原子 rename，避免 catalog 读到不完整 JSON。
+输出文件最大 64 KiB。写入时应使用原子 rename，避免 catalog 读到不完整 JSON。可选 `name` 用于显示用户填写的目录名称
+（最多 255 UTF-8 字节、不能含控制字符）；`id` 仍作为稳定标识。
 
 ## 许可证
 

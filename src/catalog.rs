@@ -311,7 +311,8 @@ fn decode_dynamic_directories(
                 directory.id
             ));
         }
-        if !paths::valid_id(&directory.id)
+        if !crate::manifest::valid_directory_name(&directory.name)
+            || !paths::valid_id(&directory.id)
             || !ids.insert(directory.id.clone())
             || !paths::valid_directory_kind(&directory.kind)
             || (!directory.role.is_empty() && !paths::valid_directory_kind(&directory.role))
@@ -637,7 +638,7 @@ fn fingerprint_path(hash: &mut Sha256, path: &Path) -> Result<(), String> {
 fn read_cache(fingerprint: &str) -> Option<Vec<CatalogSummary>> {
     let data = fs::read(paths::CATALOG_CACHE).ok()?;
     let cache: CatalogDiskCache = serde_json::from_slice(&data).ok()?;
-    if cache.version != 1 || cache.fingerprint != fingerprint {
+    if cache.version != 2 || cache.fingerprint != fingerprint {
         return None;
     }
     serde_json::from_value(serde_json::Value::Array(cache.entries)).ok()
@@ -645,7 +646,7 @@ fn read_cache(fingerprint: &str) -> Option<Vec<CatalogSummary>> {
 
 fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), String> {
     let payload = serde_json::to_vec(&CatalogDiskCache {
-        version: 1,
+        version: 2,
         fingerprint: fingerprint.to_owned(),
         entries: entries
             .iter()
@@ -665,6 +666,7 @@ mod tests {
     #[test]
     fn dynamic_directories_are_data_only_and_merge_with_declared_entries() {
         let declared = vec![ManifestDirectory {
+            name: String::new(),
             id: "built-in".into(),
             kind: "documents".into(),
             role: String::new(),
@@ -675,6 +677,7 @@ mod tests {
         let data = br#"{
             "directories": [{
                 "id": "gateway-0011223344556677",
+                "name": "Lab NAS",
                 "kind": "virtual-media",
                 "role": "gateway",
                 "path": "gateways/gateway-0011223344556677",
@@ -685,6 +688,7 @@ mod tests {
         let result = decode_dynamic_directories(data, &declared).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[1].kind, "virtual-media");
+        assert_eq!(result[1].name, "Lab NAS");
     }
 
     #[test]
@@ -723,6 +727,7 @@ mod tests {
         assert!(decode_dynamic_directories(package, &[]).is_err());
 
         let declared = vec![ManifestDirectory {
+            name: String::new(),
             id: "gateway-a".into(),
             kind: "virtual-media".into(),
             role: String::new(),
@@ -739,5 +744,22 @@ mod tests {
             }]
         }"#;
         assert!(decode_dynamic_directories(duplicate, &declared).is_err());
+    }
+    #[test]
+    fn directory_names_are_optional_and_reject_control_characters() {
+        let base = serde_json::json!({"directories":[{
+            "id":"gateway-test", "kind":"virtual-media", "path":"gateways/test", "location":"data"
+        }]});
+        let decode = |value: &serde_json::Value| {
+            decode_dynamic_directories(&serde_json::to_vec(value).unwrap(), &[])
+        };
+        assert!(decode(&base).unwrap()[0].name.is_empty());
+        let mut named = base.clone();
+        named["directories"][0]["name"] = serde_json::json!("资料库 NAS");
+        assert_eq!(decode(&named).unwrap()[0].name, "资料库 NAS");
+        for name in ["bad\nname".to_owned(), "x".repeat(256)] {
+            named["directories"][0]["name"] = serde_json::json!(name);
+            assert!(decode(&named).is_err());
+        }
     }
 }
