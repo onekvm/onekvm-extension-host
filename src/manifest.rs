@@ -31,12 +31,18 @@ pub struct Manifest {
     pub homepage: String,
     #[serde(default)]
     pub entrypoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_activation: Option<SocketActivation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernel_modules: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_points: Vec<ExtensionPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributions: Vec<Contribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<ManifestVideo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -57,6 +63,10 @@ pub struct Manifest {
     pub page: Option<ExtensionPage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbar: Option<ExtensionToolbar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbox: Option<ExtensionToolbox>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
     #[serde(default)]
@@ -78,6 +88,29 @@ pub struct Manifest {
     pub healthcheck: Healthcheck,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_provider: Option<AuthProvider>,
+}
+
+impl Manifest {
+    pub fn is_environment(&self) -> bool {
+        self.kind == "environment"
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct ExtensionPoint {
+    pub id: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct Contribution {
+    pub point: String,
+    pub id: String,
+    pub version: u32,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -120,6 +153,13 @@ pub struct ManifestService {
     pub unit: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SocketActivation {
+    pub address_setting: String,
+    pub port_setting: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct PageIcon {
     pub source: String,
@@ -141,6 +181,80 @@ pub struct ExtensionPage {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExtensionToolbar {
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct ExtensionShell {
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionToolbox {
+    pub items: Vec<ToolboxItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ToolboxItem {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub i18n: std::collections::BTreeMap<String, ToolboxTitle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<ToolboxIcon>,
+    #[serde(default)]
+    pub order: i32,
+    pub presentation: String,
+    #[serde(
+        default = "default_toolbox_layout",
+        skip_serializing_if = "toolbox_layout_is_default"
+    )]
+    pub layout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<ToolboxSize>,
+    pub view: ToolboxView,
+}
+
+fn default_toolbox_layout() -> String {
+    "padded".into()
+}
+
+fn toolbox_layout_is_default(value: &str) -> bool {
+    value == "padded"
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ToolboxTitle {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ToolboxIcon {
+    Lucide { name: String },
+    Custom { path: String },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ToolboxSize {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ToolboxView {
+    pub renderer: String,
     pub entrypoint: String,
 }
 
@@ -416,6 +530,7 @@ pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
             && paths::valid_version(&entry.file_name().to_string_lossy())
+            && entry.path().join("manifest.json").is_file()
         {
             versions.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -516,7 +631,7 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
     if !value.entrypoint.is_empty() && !paths::safe_relative(&value.entrypoint) {
         return Err(format!("unsafe entrypoint {:?}", value.entrypoint));
     }
-    if value.entrypoint.is_empty() && !value.methods.has_commands() {
+    if value.entrypoint.is_empty() && !value.methods.has_commands() && !value.is_environment() {
         return Err("entrypoint is required unless methods declare commands".into());
     }
     if value.api_version == 2 {
@@ -526,11 +641,38 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
         if value.kind.trim().is_empty() {
             return Err("kind is required".into());
         }
+        if !matches!(
+            value.kind.as_str(),
+            "protocol" | "service" | "network" | "cloud-provider" | "environment"
+        ) {
+            return Err(format!("unsupported extension kind {:?}", value.kind));
+        }
+    }
+    if value.is_environment()
+        && (!value.entrypoint.is_empty()
+            || value.controller.is_some()
+            || value.socket_activation.is_some()
+            || !value.services.is_empty()
+            || value.default_enabled)
+    {
+        return Err(
+            "environment packages cannot declare a resident service or default_enabled".into(),
+        );
+    }
+    if !value.healthcheck.type_name.is_empty() && (value.healthcheck.type_name != "exec"
+        || value.healthcheck.command.first().is_none_or(|command| !paths::safe_relative(command))
+        || value.healthcheck.timeout_seconds > 30) {
+        return Err("healthcheck requires an extension-relative exec command and a timeout up to 30 seconds".into());
     }
     validate_services(value)?;
+    validate_socket_activation(value)?;
     validate_directories(&value.directories)?;
     validate_methods(value)?;
+    validate_contributions(value)?;
     validate_auth_provider(value)?;
+    if let Some(toolbox) = &value.toolbox {
+        validate_toolbox(toolbox)?;
+    }
     if let Some(toolbar) = &value.toolbar {
         if !paths::safe_relative(&toolbar.entrypoint)
             || !toolbar.entrypoint.starts_with("web/")
@@ -542,7 +684,282 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
             ));
         }
     }
+    if let Some(shell) = &value.shell {
+        if !paths::safe_relative(&shell.entrypoint)
+            || !shell.entrypoint.starts_with("web/")
+            || !shell.entrypoint.ends_with(".js")
+        {
+            return Err(format!("unsafe shell entrypoint {:?}", shell.entrypoint));
+        }
+    }
     Ok(())
+}
+
+fn valid_point_id(id: &str) -> bool {
+    let Some((owner, name)) = id.split_once('.') else {
+        return false;
+    };
+    paths::valid_id(owner) && paths::valid_id(name)
+}
+
+fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
+    if toolbox.items.len() > 16 {
+        return Err("toolbox may contain at most 16 items".into());
+    }
+    let valid_text = |text: &str, limit: usize| {
+        !text.trim().is_empty()
+            && text.chars().count() <= limit
+            && !text.chars().any(char::is_control)
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for item in &toolbox.items {
+        if item.id.len() < 2 || !paths::valid_id(&item.id) || !seen.insert(&item.id) {
+            return Err(format!("invalid or duplicate toolbox id {:?}", item.id));
+        }
+        if !valid_text(&item.title, 120)
+            || item
+                .subtitle
+                .as_deref()
+                .is_some_and(|text| !valid_text(text, 160))
+            || item.i18n.len() > 32
+        {
+            return Err(format!(
+                "invalid toolbox title or translations for {:?}",
+                item.id
+            ));
+        }
+        for (locale, translation) in &item.i18n {
+            if locale.is_empty()
+                || locale.len() > 35
+                || !locale
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                || !valid_text(&translation.title, 120)
+                || translation.subtitle.is_some() != item.subtitle.is_some()
+                || translation
+                    .subtitle
+                    .as_deref()
+                    .is_some_and(|text| !valid_text(text, 160))
+            {
+                return Err(format!("invalid toolbox translation for {:?}", item.id));
+            }
+        }
+        if !matches!(item.presentation.as_str(), "drawer" | "window") {
+            return Err(format!("invalid toolbox presentation for {:?}", item.id));
+        }
+        if !matches!(item.layout.as_str(), "padded" | "edge-to-edge") {
+            return Err(format!("invalid toolbox layout for {:?}", item.id));
+        }
+        if let Some(size) = &item.size {
+            if size
+                .width
+                .into_iter()
+                .chain(size.height)
+                .any(|n| !(1..=4096).contains(&n))
+            {
+                return Err(format!(
+                    "toolbox dimensions must be from 1 to 4096 for {:?}",
+                    item.id
+                ));
+            }
+        }
+        if item.view.renderer != "vue"
+            || !paths::safe_relative(&item.view.entrypoint)
+            || item
+                .view
+                .entrypoint
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !item.view.entrypoint.starts_with("web/")
+            || !item.view.entrypoint.ends_with(".js")
+        {
+            return Err(format!(
+                "toolbox view must be Vue JavaScript under web/ for {:?}",
+                item.id
+            ));
+        }
+        match &item.icon {
+            Some(ToolboxIcon::Lucide { name }) => {
+                if name.is_empty()
+                    || name.len() > 63
+                    || !name.as_bytes()[0].is_ascii_lowercase()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                {
+                    return Err(format!("invalid toolbox Lucide icon for {:?}", item.id));
+                }
+            }
+            Some(ToolboxIcon::Custom { path }) => {
+                if !paths::safe_relative(path)
+                    || path
+                        .split('/')
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                    || !path.starts_with("web/")
+                    || ![".svg", ".png", ".webp"]
+                        .iter()
+                        .any(|ext| path.to_ascii_lowercase().ends_with(ext))
+                {
+                    return Err(format!("unsafe toolbox custom icon for {:?}", item.id));
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_contributions(value: &Manifest) -> Result<(), String> {
+    let mut points = std::collections::BTreeSet::new();
+    for point in &value.extension_points {
+        if !valid_point_id(&point.id)
+            || !point.id.starts_with(&format!("{}.", value.id))
+            || point.version == 0
+        {
+            return Err(format!("invalid extension point {:?}", point.id));
+        }
+        if !points.insert(&point.id) {
+            return Err(format!("duplicate extension point {:?}", point.id));
+        }
+    }
+    let mut entries = std::collections::BTreeSet::new();
+    for item in &value.contributions {
+        if !valid_point_id(&item.point) || !paths::valid_id(&item.id) || item.version == 0 {
+            return Err(format!(
+                "invalid contribution {:?}/{:?}",
+                item.point, item.id
+            ));
+        }
+        if !entries.insert((&item.point, &item.id)) {
+            return Err(format!(
+                "duplicate contribution {:?}/{:?}",
+                item.point, item.id
+            ));
+        }
+        if !item.method.is_empty() && value.methods.get(&item.method).is_none() {
+            return Err(format!(
+                "contribution method {:?} is not declared",
+                item.method
+            ));
+        }
+        if serde_json::to_vec(&item.data)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 16384
+        {
+            return Err(format!("contribution {:?} data exceeds 16 KiB", item.id));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod contribution_tests {
+    use super::*;
+
+    #[test]
+    fn contribution_ids_are_scoped_and_methods_declared() {
+        let mut manifest = Manifest {
+            id: "weather".into(),
+            ..Manifest::default()
+        };
+        manifest.contributions.push(Contribution {
+            point: "screen-display.widget".into(),
+            id: "temperature".into(),
+            version: 1,
+            data: serde_json::json!({"title":"Temperature"}),
+            method: "state".into(),
+        });
+        assert!(validate_contributions(&manifest).is_err());
+        manifest.contributions[0].method.clear();
+        assert!(validate_contributions(&manifest).is_ok());
+        manifest.contributions[0].id = "../temperature".into();
+        assert!(validate_contributions(&manifest).is_err());
+    }
+
+    #[test]
+    fn provider_can_only_declare_its_own_points() {
+        let mut manifest = Manifest {
+            id: "weather".into(),
+            ..Manifest::default()
+        };
+        manifest.extension_points.push(ExtensionPoint {
+            id: "screen-display.widget".into(),
+            version: 1,
+        });
+        assert!(validate_contributions(&manifest).is_err());
+        manifest.extension_points[0].id = "weather.widget".into();
+        assert!(validate_contributions(&manifest).is_ok());
+    }
+}
+
+fn validate_socket_activation(value: &Manifest) -> Result<(), String> {
+    let Some(socket) = &value.socket_activation else {
+        return Ok(());
+    };
+    if value.controller.is_some() || value.entrypoint.is_empty() || value.settings_reload == "watch"
+    {
+        return Err("socket_activation requires an entrypoint without a controller and restart-based settings".into());
+    }
+    if !value
+        .permissions
+        .iter()
+        .any(|permission| permission == "network")
+    {
+        return Err("socket_activation requires network permission".into());
+    }
+    for (setting, kind) in [
+        (&socket.address_setting, "string"),
+        (&socket.port_setting, "integer"),
+    ] {
+        if !paths::valid_method_name(setting)
+            || value
+                .settings_schema
+                .properties
+                .get(setting)
+                .map(|property| property.type_name.as_str())
+                != Some(kind)
+        {
+            return Err(format!(
+                "socket_activation setting {setting:?} must declare type {kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod socket_activation_tests {
+    use super::*;
+
+    #[test]
+    fn socket_activation_requires_network_and_typed_settings() {
+        let mut manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "id":"vnc", "version":"1.1.3", "entrypoint":"bin/vnc",
+            "permissions":["network"],
+            "socket_activation":{"address_setting":"listen_address","port_setting":"port"},
+            "settings_schema":{"properties":{"listen_address":{"type":"string"},"port":{"type":"integer"}}}
+        })).unwrap();
+        assert!(validate_socket_activation(&manifest).is_ok());
+        manifest.permissions.clear();
+        assert!(validate_socket_activation(&manifest).is_err());
+        manifest.permissions.push("network".into());
+        manifest
+            .settings_schema
+            .properties
+            .get_mut("port")
+            .unwrap()
+            .type_name = "string".into();
+        assert!(validate_socket_activation(&manifest).is_err());
+        manifest
+            .settings_schema
+            .properties
+            .get_mut("port")
+            .unwrap()
+            .type_name = "integer".into();
+        manifest.entrypoint.clear();
+        assert!(validate_socket_activation(&manifest).is_err());
+    }
 }
 
 fn validate_services(value: &Manifest) -> Result<(), String> {
@@ -603,7 +1020,7 @@ fn validate_methods(value: &Manifest) -> Result<(), String> {
                 .as_ref()
                 .map(|provider| provider.method.as_str())
                 == Some(method.name.as_str());
-            let max_timeout = if auth_method { 120 } else { 30 };
+            let max_timeout = if auth_method { 300 } else { 30 };
             if timeout < 1 || timeout > max_timeout {
                 return Err(format!(
                     "method {:?} timeout must be between 1 and {max_timeout} seconds",
@@ -653,7 +1070,13 @@ fn validate_auth_ui(path: &str, label: &str) -> Result<(), String> {
     if path.is_empty() {
         return Ok(());
     }
-    if !paths::safe_relative(path) || !path.starts_with("web/") || !path.ends_with(".js") {
+    if !paths::safe_relative(path)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !path.starts_with("web/")
+        || !path.ends_with(".js")
+    {
         return Err(format!("unsafe auth provider {label} {path:?}"));
     }
     Ok(())
@@ -664,7 +1087,10 @@ fn validate_auth_provider(value: &Manifest) -> Result<(), String> {
         return Ok(());
     };
     if !paths::valid_method_name(&provider.method) {
-        return Err(format!("invalid auth provider method {:?}", provider.method));
+        return Err(format!(
+            "invalid auth provider method {:?}",
+            provider.method
+        ));
     }
     if value.methods.get(&provider.method).is_none() {
         return Err(format!(
@@ -751,6 +1177,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn toolbox_protocol_bounds_and_paths() {
+        let valid = serde_json::json!({"items":[{"id":"inspect","title":"Inspector","subtitle":"Inspect this device","i18n":{"zh":{"title":"检查器","subtitle":"检查这台设备"}},"presentation":"window","layout":"edge-to-edge","size":{"width":4096,"height":1},"view":{"renderer":"vue","entrypoint":"web/inspect.js"}}]});
+        let parse = |v| serde_json::from_value::<ExtensionToolbox>(v).unwrap();
+        validate_toolbox(&parse(valid.clone())).unwrap();
+        for path in [
+            "/web/view.js",
+            "web/../view.js",
+            "web//view.js",
+            "web/./view.js",
+            "web/view.css",
+            "bin/view.js",
+        ] {
+            let mut value = valid.clone();
+            value["items"][0]["view"]["entrypoint"] = serde_json::json!(path);
+            assert!(validate_toolbox(&parse(value)).is_err(), "{path}");
+        }
+        for width in [0, 4097] {
+            let mut v = valid.clone();
+            v["items"][0]["size"]["width"] = serde_json::json!(width);
+            assert!(validate_toolbox(&parse(v)).is_err());
+        }
+        let mut duplicate = valid.clone();
+        let item = duplicate["items"][0].clone();
+        duplicate["items"].as_array_mut().unwrap().push(item);
+        assert!(validate_toolbox(&parse(duplicate))
+            .unwrap_err()
+            .contains("duplicate"));
+        let mut excessive = valid.clone();
+        excessive["items"] = serde_json::json!(vec![valid["items"][0].clone(); 17]);
+        assert!(validate_toolbox(&parse(excessive))
+            .unwrap_err()
+            .contains("16"));
+        let mut missing_subtitle = valid.clone();
+        missing_subtitle["items"][0]["i18n"]["zh"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subtitle");
+        assert!(validate_toolbox(&parse(missing_subtitle))
+            .unwrap_err()
+            .contains("translation"));
+        let mut long_subtitle = valid.clone();
+        long_subtitle["items"][0]["subtitle"] = serde_json::json!("x".repeat(161));
+        assert!(validate_toolbox(&parse(long_subtitle)).is_err());
+        let mut invalid_layout = valid.clone();
+        invalid_layout["items"][0]["layout"] = serde_json::json!("bleed");
+        assert!(validate_toolbox(&parse(invalid_layout))
+            .unwrap_err()
+            .contains("layout"));
+        let mut unknown = valid;
+        unknown["items"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ExtensionToolbox>(unknown).is_err());
+    }
+
+    #[test]
     fn command_methods_are_an_array_with_typed_arguments() {
         let data = format!(
             r#"{{
@@ -774,6 +1254,82 @@ mod tests {
         assert_eq!(method.command, ["bin/editor", "read"]);
         assert!(method.args[0].required);
         assert!(manifest.entrypoint.is_empty());
+    }
+
+    #[test]
+    fn supported_extension_kinds_are_accepted_and_unknown_kinds_are_rejected() {
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "cloud-example",
+                "i18n": {{"default": {{"name": "Example Cloud", "description": "Cloud provider"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{}",
+                "kind": "cloud-provider",
+                "entrypoint": "bin/cloud-example"
+            }}"#,
+            runtime_architecture()
+        );
+        for kind in ["service", "protocol", "network", "cloud-provider"] {
+            let manifest =
+                decode_manifest(data.replace("cloud-provider", kind).as_bytes()).unwrap();
+            assert_eq!(manifest.kind, kind);
+        }
+
+        let unknown = data.replace("cloud-provider", "cloud-protocol");
+        assert_eq!(
+            decode_manifest(unknown.as_bytes()).unwrap_err(),
+            "unsupported extension kind \"cloud-protocol\""
+        );
+    }
+
+    #[test]
+    fn environments_are_install_only_and_cannot_start_resident_services() {
+        let data = serde_json::json!({
+            "id": "network-environment", "name": "Network environment",
+            "version": "1.0.0", "api_version": 2, "kind": "environment",
+            "kernel_modules": ["wireguard"]
+        });
+        let manifest = decode_manifest(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert!(manifest.is_environment());
+        for (field, value) in [
+            ("entrypoint", serde_json::json!("bin/daemon")),
+            ("default_enabled", serde_json::json!(true)),
+            ("services", serde_json::json!([{"id": "daemon"}])),
+        ] {
+            let mut invalid = data.clone();
+            invalid[field] = value;
+            assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap())
+                .unwrap_err()
+                .contains("environment packages cannot declare a resident service"));
+        }
+    }
+
+    #[test]
+    fn shell_entrypoint_must_be_web_javascript() {
+        let data = format!(
+            r#"{{
+                "manifest_version": 1,
+                "id": "shell-example",
+                "i18n": {{"default": {{"name": "Shell", "description": "Shell methods"}}}},
+                "version": "1.0.0",
+                "api_version": 2,
+                "architecture": "{}",
+                "kind": "service",
+                "entrypoint": "bin/shell-example",
+                "shell": {{"entrypoint": "web/shell.js"}}
+            }}"#,
+            runtime_architecture()
+        );
+        let manifest = decode_manifest(data.as_bytes()).unwrap();
+        assert_eq!(manifest.shell.unwrap().entrypoint, "web/shell.js");
+
+        let unsafe_path = data.replace("web/shell.js", "../shell.js");
+        assert_eq!(
+            decode_manifest(unsafe_path.as_bytes()).unwrap_err(),
+            "unsafe shell entrypoint \"../shell.js\""
+        );
     }
 
     #[test]
