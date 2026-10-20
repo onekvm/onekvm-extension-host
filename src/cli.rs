@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 
 use crate::catalog;
+use crate::contributions;
 use crate::feed;
 use crate::install;
 use crate::lifecycle;
@@ -13,8 +14,10 @@ usage: onekvm-extension <command> [arguments]
 commands:
   list
   catalog
+  contributions <point>
   detail <id>
   status <id>
+  health <id>
   validate <id> [version]
   activate <id> [version]
   enable <id>
@@ -32,17 +35,24 @@ commands:
   remove <onekvm-extension-name>
   purge <id>
   restore
+  load-network-module <module>
   invoke <id> <method>  (JSON request on stdin)";
 
 pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
         return Err(usage(argv0).into());
     }
+    if args[0].starts_with("update-") {
+        let value = sys::with_lock(|| crate::update::command(args, &mut io::stdin()))?;
+        return Ok(write_json(&value)?);
+    }
     const COMMANDS: &[&str] = &[
         "list",
         "catalog",
+        "contributions",
         "detail",
         "status",
+        "health",
         "validate",
         "activate",
         "enable",
@@ -60,14 +70,19 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
         "remove",
         "purge",
         "restore",
+        "load-network-module",
         "invoke",
     ];
     if !COMMANDS.contains(&args[0].as_str()) {
         return Err(format!("unknown command {:?}\n{}", args[0], usage(argv0)).into());
     }
-    sys::with_lock(lifecycle::migrate_legacy_layout)
+    sys::with_lock(|| { crate::transaction::recover_all(true)?; lifecycle::migrate_legacy_layout() })
         .map_err(|err| format!("migrate extension configuration: {err}"))?;
     match args[0].as_str() {
+        "load-network-module" => {
+            require_len(args, 2, "load-network-module requires <module>")?;
+            crate::dbus_client::load_network_module(&args[1])?;
+        }
         "list" => {
             require_len(args, 1, "list takes no arguments")?;
             print!("{}", lifecycle::list()?);
@@ -76,9 +91,14 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
             require_len(args, 1, "catalog takes no arguments")?;
             write_json(&catalog::catalog()?)?;
         }
+        "contributions" => {
+            require_len(args, 2, "contributions requires <point>")?;
+            write_json(&contributions::list(&args[1])?)?;
+        }
         "detail" => {
             write_json(&catalog::detail(&one_id(args)?)?)?;
         }
+        "health" => { crate::lifecycle::check_started(&one_id(args)?)?; }
         "status" => {
             write_json(&lifecycle::status(&one_id(args)?)?)?;
         }

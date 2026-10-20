@@ -161,23 +161,36 @@ pub fn validate(id: &str, version: &str) -> Result<String, String> {
     ))
 }
 
+pub fn check_started(id: &str) -> Result<(), String> {
+    let state = read_state(id)?;
+    let extension = load_installed(id, &state.active_version)?;
+    if !state.enabled || extension.manifest.is_environment() { return Ok(()); }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if !extension_running(id, &extension.manifest, state.enabled) { return Err(format!("extension {id} failed its startup health check")); }
+    crate::dbus_client::health(id,state.revision)
+}
+
 pub fn activate(id: &str, version: &str) -> Result<(), String> {
     sys::with_lock(|| {
-        let extension = load_installed(id, version)?;
+        let extension = load_installed(id,version)?;
         let mut state = read_state(id)?;
-        let changed = state.active_version != extension.manifest.version;
-        if changed {
-            let _ = disable_unlocked(id);
-        }
-        state.active_version = extension.manifest.version;
-        if changed {
+        if state.active_version == extension.manifest.version { return Ok(()); }
+        let mut snapshot = crate::transaction::Snapshot::begin(id)?;
+        let result = (|| {
+            disable_unlocked(id)?;
+            host::stop_extension_runtime(id)?;
+            snapshot.capture()?;
+            state.active_version = extension.manifest.version.clone();
             state.revision += 1;
+            crate::state::normalize_environment(&extension.manifest, &mut state);
+            write_state(id,&state)?;
+            if state.enabled { enable_unlocked(id)?; check_started(id)?; }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => snapshot.commit(),
+            Err(error) => crate::transaction::failed(&snapshot,error),
         }
-        write_state(id, &state)?;
-        if changed && state.enabled {
-            enable_unlocked(id)?;
-        }
-        Ok(())
     })
 }
 
@@ -191,38 +204,63 @@ pub fn disable(id: &str) -> Result<(), String> {
 
 pub fn enable_unlocked(id: &str) -> Result<(), String> {
     let mut state = read_state(id)?;
+    let original = state.clone();
     if state.active_version.is_empty() {
         let extension = load_installed(id, "")?;
         state.active_version = extension.manifest.version;
     }
     let extension = load_installed(id, &state.active_version)?;
+    if extension.manifest.is_environment() {
+        return Err(format!("environment {id} is ready after installation and does not need enabling; configure its interfaces in Network settings"));
+    }
     host::validate_conflicts(id, &extension.manifest)?;
     let was_enabled = state.enabled;
     if !was_enabled {
         memory::validate(id, &extension.manifest)?;
     }
-    crate::sandbox::load_kernel_modules(&extension)?;
     state.enabled = true;
     if !was_enabled {
         state.revision += 1;
     }
     write_state(id, &state)?;
-    if was_enabled {
+    let result = if was_enabled {
         crate::dbus_client::reconcile(id, state.revision)
     } else {
         crate::dbus_client::enable(id, state.revision)
+    };
+    if let Err(error) = result {
+        if !was_enabled {
+            let stop = host::stop_extension_runtime(id);
+            let mut restored = original;
+            restored.revision = state.revision.saturating_add(1);
+            write_state(id,&restored)?;
+            if let Err(stop_error) = stop { return Err(format!("{error}; cleanup after failed enable: {stop_error}")); }
+        }
+        return Err(error);
     }
+    crate::contributions::changed()
 }
 
 pub fn disable_unlocked(id: &str) -> Result<(), String> {
     let mut state = read_state(id)?;
     if !state.enabled {
-        return crate::dbus_client::disable(id, state.revision);
+        let result = crate::dbus_client::disable(id, state.revision);
+        if result.is_ok() {
+            let _ = crate::contributions::changed();
+        }
+        return result;
     }
     state.enabled = false;
     state.revision += 1;
     write_state(id, &state)?;
-    crate::dbus_client::disable(id, state.revision)
+    let result = crate::dbus_client::disable(id, state.revision);
+    if let Err(error) = result {
+        state.enabled = true;
+        state.revision = state.revision.saturating_add(1);
+        write_state(id,&state)?;
+        return Err(error);
+    }
+    crate::contributions::changed()
 }
 
 pub fn start(id: &str) -> Result<(), String> {
@@ -231,8 +269,6 @@ pub fn start(id: &str) -> Result<(), String> {
         if state.active_version.is_empty() {
             return Err(format!("extension {id} has no active version"));
         }
-        let extension = load_installed(id, &state.active_version)?;
-        crate::sandbox::load_kernel_modules(&extension)?;
         crate::dbus_client::reconcile(id, state.revision)
     })
 }
@@ -285,7 +321,7 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
         ))
     })?;
     if !registered_service.unit.is_empty() {
-        return sandbox::systemctl(&[action, &registered_service.unit]);
+        return sandbox::unit_action(action, &registered_service.unit);
     }
     match action {
         "enable" => enable(id),
@@ -320,17 +356,19 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
     }
 }
 
+fn read_configure_request(stdin: &mut dyn Read) -> Result<ConfigureRequest, String> {
+    let mut payload = Vec::new();
+    stdin
+        .read_to_end(&mut payload)
+        .map_err(|e| format!("decode extension configuration: {e}"))?;
+    serde_json::from_slice(&payload).map_err(|e| format!("decode extension configuration: {e}"))
+}
+
 pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
-    let mut payload = Vec::new();
-    stdin
-        .take(1 << 20)
-        .read_to_end(&mut payload)
-        .map_err(|e| format!("decode extension configuration: {e}"))?;
-    let request: ConfigureRequest = serde_json::from_slice(&payload)
-        .map_err(|e| format!("decode extension configuration: {e}"))?;
+    let request = read_configure_request(stdin)?;
     let system_plugins = load_system_plugins()?;
     if let Some(plugin) = system_plugins.get(id) {
         if request.enabled.is_some() {
@@ -344,6 +382,13 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
     sys::with_lock(|| {
         let mut state = read_state(id)?;
         let extension = load_installed(id, &state.active_version)?;
+        if extension.manifest.is_environment() && request.enabled == Some(true) {
+            return Err(format!(
+                "environment {id} is ready after installation and does not need enabling"
+            ));
+        }
+        let environment_normalized =
+            crate::state::normalize_environment(&extension.manifest, &mut state);
         let state_initialized = state.active_version.is_empty();
         if state_initialized {
             state.active_version = extension.manifest.version.clone();
@@ -388,7 +433,11 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
                 ports::validate_extension_port(id, &settings, false)?;
             }
         }
-        if !state_initialized && !enabled_changed && changed_keys.is_empty() {
+        if !state_initialized
+            && !enabled_changed
+            && changed_keys.is_empty()
+            && !environment_normalized
+        {
             if extension.manifest.controller.is_none()
                 && extension.manifest.settings_reload == "watch"
             {
@@ -403,6 +452,9 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
             state.revision += 1;
         }
         write_state(id, &state)?;
+        if environment_normalized {
+            crate::dbus_client::disable(id, state.revision)?;
+        }
         if !changed_keys.is_empty() {
             if extension.manifest.controller.is_some() {
                 let settings = serde_json::to_string(&Value::Object(
@@ -415,13 +467,11 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
                 settings::write_runtime_settings(id, &settings)?;
             } else if state.enabled {
                 crate::dbus_client::disable(id, state.revision)?;
-                crate::sandbox::load_kernel_modules(&extension)?;
                 crate::dbus_client::reconcile(id, state.revision)?;
             }
         }
         if enabled_changed {
             if state.enabled {
-                crate::sandbox::load_kernel_modules(&extension)?;
                 crate::dbus_client::enable(id, state.revision)?;
             } else {
                 crate::dbus_client::disable(id, state.revision)?;
@@ -432,6 +482,14 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
 }
 
 pub fn invoke(id: &str, method: &str, request: &[u8]) -> Result<String, String> {
+    if let Some(system) = load_system_plugins()?.get(id) {
+        let payload = if request.is_empty() {
+            "{}"
+        } else {
+            std::str::from_utf8(request).map_err(|err| err.to_string())?
+        };
+        return system.invoke(method, payload);
+    }
     crate::dbus_client::invoke(id, method, std::str::from_utf8(request).unwrap_or("null"))
 }
 
@@ -475,11 +533,7 @@ pub fn restore() -> Result<(), String> {
                     }
                 }
                 match load_installed(id, &state.active_version) {
-                    Ok(extension) => {
-                        if let Err(err) = crate::sandbox::load_kernel_modules(&extension) {
-                            failures.push(format!("{id}: {err}"));
-                            continue;
-                        }
+                    Ok(_) => {
                         if let Err(err) = crate::dbus_client::reconcile(id, state.revision) {
                             failures.push(format!("{id}: {err}"));
                         }
@@ -495,5 +549,40 @@ pub fn restore() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("restore failures: {}", failures.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod configure_input_tests {
+    use super::read_configure_request;
+
+    #[test]
+    fn reads_media_settings_larger_than_one_mib_without_truncating() {
+        let media = "x".repeat(3 * 1024 * 1024);
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"settings":{"media_assets":media}})).unwrap();
+        let request = read_configure_request(&mut encoded.as_slice()).unwrap();
+        assert_eq!(
+            request.settings.unwrap()["media_assets"]
+                .as_str()
+                .unwrap()
+                .len(),
+            media.len()
+        );
+    }
+
+    #[test]
+    fn accepts_configuration_larger_than_the_old_transport_cap() {
+        let media = "x".repeat(73 * 1024 * 1024);
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"settings":{"media_assets":media}})).unwrap();
+        let request = read_configure_request(&mut encoded.as_slice()).unwrap();
+        assert_eq!(
+            request.settings.unwrap()["media_assets"]
+                .as_str()
+                .unwrap()
+                .len(),
+            media.len()
+        );
     }
 }

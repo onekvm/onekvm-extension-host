@@ -5,18 +5,20 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::install;
 use crate::manifest::{load_installed, Installed, Manifest};
 use crate::paths;
 use crate::sandbox::{
-    helper_sandbox_arguments, is_active, load_kernel_modules, sandbox_arguments, systemd_run,
+    helper_sandbox_arguments, is_active, is_failed, load_kernel_modules, sandbox_arguments,
+    systemd_run, systemd_run_with_socket, unit_action, unit_has_dependency,
 };
 use crate::settings::{
     repair_settings_output_permission, repair_settings_output_permissions, settings_for_state,
     write_runtime_settings,
 };
 use crate::state::{
-    initialize_default_enabled_states, prepare_credential, prepare_runtime_dirs, read_generation,
-    read_state, remove_credential, write_generation, PluginState,
+    initialize_default_enabled_states, prepare_authorization, prepare_runtime_dirs,
+    read_generation, read_state, remove_authorization, write_generation, PluginState,
 };
 use crate::sys;
 
@@ -94,7 +96,7 @@ pub fn apply(
             .methods
             .get(method)
             .ok_or_else(|| format!("extension {id} does not export method {method:?}"))?;
-        if !state.enabled && !spec.available_when_disabled {
+        if !state.enabled && !extension.manifest.is_environment() && !spec.available_when_disabled {
             return Err(format!(
                 "method {method:?} is unavailable while extension {id} is disabled"
             ));
@@ -103,11 +105,18 @@ pub fn apply(
             return apply_command_method(&extension, &state, spec, request);
         }
     }
+    if extension.manifest.is_environment() {
+        cleanup_disabled_controller(id)?;
+        return Ok(Value::Null);
+    }
     if extension.manifest.controller.is_none() {
         if manages_legacy_service(&extension.manifest) {
             return apply_legacy(&extension, &state, event);
         }
         if extension.manifest.methods.has_commands() {
+            if state.enabled && matches!(event, "enable" | "reconcile" | "config_changed") {
+                prepare_enabled_extension(&extension)?;
+            }
             stop_helper(id)?;
             stop_legacy(id)?;
             return Ok(Value::Null);
@@ -133,6 +142,87 @@ fn apply_command_method(
     request: Option<Value>,
 ) -> Result<Value, String> {
     let id = &extension.manifest.id;
+    if extension
+        .manifest
+        .permissions
+        .iter()
+        .any(|permission| permission == "opkg-admin")
+    {
+        match spec.name.as_str() {
+            "list_packages" => {
+                let refresh = request
+                    .as_ref()
+                    .and_then(|value| value.get("refresh"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if refresh
+                    && crate::feed::list_feed_sources()?.iter().any(|source| {
+                        source.enabled
+                            && source.feeds_text.lines().any(|line| {
+                                matches!(line.split_whitespace().next(), Some("src" | "src/gz"))
+                            })
+                    })
+                {
+                    sys::with_lock(crate::feed::refresh)?;
+                }
+                return Ok(marketplace_list_packages()?);
+            }
+            "list_sources" => {
+                return Ok(marketplace_list_sources()?);
+            }
+            "set_source" => {
+                marketplace_set_source(request.as_ref())?;
+                return Ok(json!({"status": "ok"}));
+            }
+            "set_source_enabled" => {
+                marketplace_set_source_enabled(request.as_ref())?;
+                return Ok(json!({"status": "ok"}));
+            }
+            "remove_source" => {
+                crate::feed::remove_custom_source(&marketplace_source_key(request.as_ref())?)?;
+                return Ok(json!({"status": "ok"}));
+            }
+            "install_package" => {
+                let package = marketplace_package_name(request.as_ref())?;
+                let object = request.as_ref().and_then(Value::as_object);
+                let wait = object
+                    .and_then(|object| object.get("wait"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let size_bytes = object
+                    .and_then(|object| object.get("size_bytes"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                install::install_package_with_options(&package, wait, size_bytes)?;
+                if wait {
+                    return Ok(serde_json::json!({"status": "ok", "package": package}));
+                }
+                return Ok(serde_json::json!({"status": "started", "package": package}));
+            }
+            "install_progress" => {
+                return Ok(install::install_progress());
+            }
+            "remove_package" => {
+                let package = marketplace_package_name(request.as_ref())?;
+                let delete_data = request
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|object| object.get("delete_data"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if delete_data {
+                    let id = package
+                        .strip_prefix("onekvm-extension-")
+                        .unwrap_or(package.as_str());
+                    install::purge(id)?;
+                } else {
+                    install::remove_package(&package)?;
+                }
+                return Ok(serde_json::json!({"status": "ok", "package": package}));
+            }
+            _ => {}
+        }
+    }
     prepare_runtime_dirs(id)?;
     let settings = settings_for_state(extension, state)?;
     write_runtime_settings(id, &settings)?;
@@ -160,6 +250,517 @@ fn apply_command_method(
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),
     }
+}
+
+pub fn check_health(id: &str, revision: u64) -> Result<(), String> {
+    let state = read_state(id)?;
+    if state.revision != revision { return Err("extension changed during health check".into()); }
+    let extension = load_installed(id,&state.active_version)?;
+    let health = &extension.manifest.healthcheck;
+    if health.type_name.is_empty() { return Ok(()); }
+    if health.type_name != "exec" || health.command.is_empty() { return Err("unsupported extension health check".into()); }
+    if !state.enabled { return Err("health check requires an enabled extension".into()); }
+    validate_command(&extension,&health.command)?;
+    prepare_runtime_dirs(id)?;
+    write_runtime_settings(id,&settings_for_state(&extension,&state)?)?;
+    let timeout = health.timeout_seconds.clamp(1,30);
+    let temporary = ensure_helper(&extension,Some((&health.command,timeout)))?;
+    let mut command = health.command.clone();
+    command[0] = extension.root.join(&command[0]).to_string_lossy().into_owned();
+    let result = crate::helper_client::exec_capture(id,&command,&[],b"",timeout as u32).map(|_| ());
+    let cleanup = if temporary && extension.manifest.controller.is_none() { stop_helper(id) } else { Ok(()) };
+    result.and(cleanup)
+}
+
+fn marketplace_list_sources() -> Result<Value, String> {
+    let sources = crate::feed::list_feed_sources()?
+        .into_iter()
+        .map(|source| {
+            json!({
+                "key": source.key,
+                "name": source.name,
+                "path": source.path,
+                "feeds_text": source.feeds_text,
+                "builtin": source.builtin,
+                "enabled": source.enabled,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "sources": sources }))
+}
+
+fn marketplace_source_key(request: Option<&Value>) -> Result<String, String> {
+    let object = request.and_then(Value::as_object);
+    let key = object
+        .and_then(|object| object.get("key"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let key = if key.is_empty() {
+        object
+            .and_then(|object| object.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+    } else {
+        key
+    };
+    if !paths::valid_feed_source_key(key) {
+        return Err("invalid source key".into());
+    }
+    Ok(key.to_owned())
+}
+
+fn marketplace_set_source(request: Option<&Value>) -> Result<(), String> {
+    let object = request
+        .and_then(Value::as_object)
+        .ok_or_else(|| "key, name, and feeds_text are required".to_string())?;
+    let key = object
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let key = if key.is_empty() { name } else { key };
+    let name = if name.is_empty() { key } else { name };
+    let feeds_text = object
+        .get("feeds_text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "key, name, and feeds_text are required".to_string())?;
+    crate::feed::set_custom_source(key, name, feeds_text)
+}
+
+fn marketplace_set_source_enabled(request: Option<&Value>) -> Result<(), String> {
+    let object = request
+        .and_then(Value::as_object)
+        .ok_or_else(|| "set_source_enabled requires an object".to_string())?;
+    let enabled = object
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "set_source_enabled requires boolean enabled".to_string())?;
+    if object.get("builtin").and_then(Value::as_bool) == Some(true) {
+        crate::feed::set_builtin_source_enabled(enabled)?;
+        return Ok(());
+    }
+    crate::feed::set_custom_source_enabled(&marketplace_source_key(request)?, enabled)
+}
+
+fn marketplace_package_name(request: Option<&Value>) -> Result<String, String> {
+    let object = request
+        .and_then(Value::as_object)
+        .ok_or_else(|| "install/remove request must be an object".to_string())?;
+    if let Some(package) = object.get("package").and_then(Value::as_str) {
+        return install::resolve_extension_package(package);
+    }
+    if let Some(id) = object.get("id").and_then(Value::as_str) {
+        return install::resolve_extension_package(id);
+    }
+    Err("package or id is required".into())
+}
+
+const MARKETPLACE_CACHE_VERSION: i32 = 6;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MarketplaceDiskCache {
+    version: i32,
+    fingerprint: String,
+    packages: Value,
+}
+
+fn marketplace_list_packages() -> Result<Value, String> {
+    let mut result = if let Ok(fingerprint) = marketplace_fingerprint() {
+        if let Some(cached) = read_marketplace_cache(&fingerprint) {
+            cached
+        } else {
+            let built = build_marketplace_list_packages()?;
+            let _ = write_marketplace_cache(&fingerprint, &built);
+            built
+        }
+    } else {
+        build_marketplace_list_packages()?
+    };
+    if let Some(object) = result.as_object_mut() {
+        object.insert("storage".into(), marketplace_storage());
+    }
+    Ok(result)
+}
+
+fn marketplace_storage() -> Value {
+    let (total, available) = storage_usage(paths::APPS_ROOT)
+        .or_else(|| storage_usage("/data"))
+        .or_else(|| storage_usage("/"))
+        .unwrap_or((0, 0));
+    json!({
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": total.saturating_sub(available),
+    })
+}
+
+fn storage_usage(path: &str) -> Option<(u64, u64)> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    let mut vfs = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    let frsize = vfs.f_frsize as u64;
+    if frsize == 0 || vfs.f_blocks == 0 {
+        return None;
+    }
+    Some((
+        (vfs.f_blocks as u64).saturating_mul(frsize),
+        (vfs.f_bavail as u64).saturating_mul(frsize),
+    ))
+}
+
+fn build_marketplace_list_packages() -> Result<Value, String> {
+    use crate::manifest::{installed_versions, load_installed, PageIcon};
+    use std::collections::BTreeSet;
+
+    let available = crate::feed::available_extensions();
+    let mut seen = BTreeSet::new();
+    let mut packages = Vec::new();
+
+    let push_manifest = |packages: &mut Vec<Value>,
+                         seen: &mut BTreeSet<String>,
+                         id: String,
+                         manifest: &crate::manifest::Manifest,
+                         installed: bool,
+                         package_version: &str,
+                         icon_data_url: String,
+                         size_bytes: u64,
+                         installed_size_bytes: u64| {
+        if id == "plugin-marketplace" || id == "plugin-market" || !seen.insert(id.clone()) {
+            return;
+        }
+        let installed_version = marketplace_installed_version(&id).unwrap_or_default();
+        let installed_package_version = crate::control::installed_package_version(
+            &format!("onekvm-extension-{id}"),
+            &installed_version,
+        )
+        .unwrap_or_default();
+        let update_available = marketplace_update_available(
+            &installed_version,
+            &installed_package_version,
+            &manifest.version,
+            package_version,
+        );
+        let name = if manifest.name.is_empty() {
+            id.clone()
+        } else {
+            manifest.name.clone()
+        };
+        let icon = manifest
+            .icon
+            .clone()
+            .or_else(|| manifest.page.as_ref().and_then(|page| page.icon.clone()));
+        let mut icon_value = match icon {
+            Some(PageIcon { source, name, path }) => {
+                let custom = source == "custom";
+                let mut value = json!({ "source": source });
+                if !name.is_empty() {
+                    value["name"] = json!(name);
+                }
+                if !path.is_empty() {
+                    value["path"] = json!(path);
+                }
+                if custom && !icon_data_url.is_empty() {
+                    value["data"] = json!(icon_data_url);
+                }
+                value
+            }
+            None => Value::Null,
+        };
+        if icon_value.is_null() && !icon_data_url.is_empty() {
+            icon_value = json!({
+                "source": "custom",
+                "data": icon_data_url,
+            });
+        }
+        packages.push(json!({
+            "id": id,
+            "package": format!("onekvm-extension-{id}"),
+            "name": name,
+            "description": manifest.description,
+            "version": manifest.version,
+            "kind": manifest.kind,
+            "installed": installed,
+            "installed_version": installed_version,
+            "package_version": package_version,
+            "installed_package_version": installed_package_version,
+            "update_available": update_available,
+            "i18n": manifest.i18n,
+            "icon": icon_value,
+            "icon_data_url": icon_data_url,
+            "size_bytes": size_bytes,
+            "installed_size_bytes": installed_size_bytes,
+        }));
+    };
+
+    for (id, available_extension) in &available {
+        let installed = !installed_versions(id)?.is_empty();
+        let mut icon_data_url = available_extension.icon_data_url.clone();
+        if icon_data_url.is_empty() && installed {
+            if let Ok(versions) = installed_versions(id) {
+                if let Some(version) = versions.last() {
+                    if let Ok(installed_ext) = load_installed(id, version) {
+                        icon_data_url = installed_custom_icon_data_url(&installed_ext.manifest);
+                    }
+                }
+            }
+        }
+        let mut installed_size_bytes = available_extension.installed_size_bytes;
+        if installed_size_bytes == 0 && installed {
+            if let Ok(versions) = installed_versions(id) {
+                if let Some(version) = versions.last() {
+                    installed_size_bytes = directory_size(&crate::paths::app_root(id, version));
+                }
+            }
+        }
+        push_manifest(
+            &mut packages,
+            &mut seen,
+            id.clone(),
+            &available_extension.manifest,
+            installed,
+            &available_extension.package_version,
+            icon_data_url,
+            available_extension.size_bytes,
+            installed_size_bytes,
+        );
+    }
+
+    if let Ok(entries) = std::fs::read_dir(crate::paths::APPS_ROOT) {
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if seen.contains(&id) || !crate::paths::valid_id(&id) {
+                continue;
+            }
+            let Ok(versions) = installed_versions(&id) else {
+                continue;
+            };
+            let Some(version) = versions.last() else {
+                continue;
+            };
+            let Ok(installed) = load_installed(&id, version) else {
+                continue;
+            };
+            let icon_data_url = installed_custom_icon_data_url(&installed.manifest);
+            push_manifest(
+                &mut packages,
+                &mut seen,
+                id.clone(),
+                &installed.manifest,
+                true,
+                "",
+                icon_data_url,
+                0,
+                directory_size(&crate::paths::app_root(&id, version)),
+            );
+        }
+    }
+
+    packages.sort_by(|a, b| {
+        a.get("id")
+            .and_then(Value::as_str)
+            .cmp(&b.get("id").and_then(Value::as_str))
+    });
+    Ok(json!({ "packages": packages }))
+}
+
+fn marketplace_installed_version(id: &str) -> Result<String, String> {
+    let versions = crate::manifest::installed_versions(id)?;
+    let state = read_state(id)?;
+    if versions.contains(&state.active_version) {
+        return Ok(state.active_version);
+    }
+    Ok(versions
+        .into_iter()
+        .max_by(|a, b| crate::control::compare_versions(a, b))
+        .unwrap_or_default())
+}
+
+fn marketplace_update_available(
+    installed: &str,
+    installed_package: &str,
+    available: &str,
+    available_package: &str,
+) -> bool {
+    if installed.is_empty() || available_package.is_empty() {
+        return false;
+    }
+    if !installed_package.is_empty() {
+        crate::control::compare_versions(available_package, installed_package).is_gt()
+    } else {
+        // Old/shared payloads may have no matching opkg record after an OS slot switch.
+        crate::control::compare_versions(available, installed).is_gt()
+    }
+}
+
+fn marketplace_fingerprint() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::UNIX_EPOCH;
+
+    fn fingerprint_path(hash: &mut Sha256, path: &Path) -> Result<(), String> {
+        match fs::symlink_metadata(path) {
+            Ok(info) => {
+                let nanos = info
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                hash.update(
+                    format!(
+                        "{} {} {} {:o}\n",
+                        path.display(),
+                        info.size(),
+                        nanos,
+                        info.mode()
+                    )
+                    .as_bytes(),
+                );
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                hash.update(format!("absent {}\n", path.display()).as_bytes());
+                Ok(())
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    let mut hash = Sha256::new();
+    fingerprint_path(&mut hash, Path::new(paths::APPS_ROOT))?;
+    if let Ok(mut entries) = fs::read_dir(paths::APPS_ROOT) {
+        let mut names = Vec::new();
+        for entry in entries.by_ref() {
+            names.push(entry.map_err(|e| e.to_string())?);
+        }
+        names.sort_by_key(|entry| entry.file_name());
+        for entry in names {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !paths::valid_id(&id) {
+                continue;
+            }
+            let id_path = Path::new(paths::APPS_ROOT).join(&id);
+            fingerprint_path(&mut hash, &id_path)?;
+            fingerprint_path(&mut hash, &paths::state_path(&id))?;
+            let package = format!("onekvm-extension-{id}");
+            fingerprint_path(
+                &mut hash,
+                &Path::new("/var/lib/opkg/info").join(format!("{package}.control")),
+            )?;
+            for slot in ["A", "B"] {
+                fingerprint_path(
+                    &mut hash,
+                    &Path::new(paths::OPKG_SLOTS)
+                        .join(slot)
+                        .join("opkg/info")
+                        .join(format!("{package}.control")),
+                )?;
+            }
+            if let Ok(mut versions) = fs::read_dir(&id_path) {
+                let mut version_entries = Vec::new();
+                for version in versions.by_ref() {
+                    version_entries.push(version.map_err(|e| e.to_string())?);
+                }
+                version_entries.sort_by_key(|entry| entry.file_name());
+                for version in version_entries {
+                    if version.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        fingerprint_path(
+                            &mut hash,
+                            &Path::new(paths::EXTENSION_PACKAGE_METADATA)
+                                .join(&package)
+                                .join(format!("{}.control", version.file_name().to_string_lossy())),
+                        )?;
+                        fingerprint_path(
+                            &mut hash,
+                            &id_path.join(version.file_name()).join("manifest.json"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    fingerprint_path(&mut hash, Path::new(paths::OPKG_LISTS))?;
+    if let Ok(mut lists) = fs::read_dir(paths::OPKG_LISTS) {
+        let mut names = Vec::new();
+        for entry in lists.by_ref() {
+            names.push(entry.map_err(|e| e.to_string())?);
+        }
+        names.sort_by_key(|entry| entry.file_name());
+        for entry in names {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+                fingerprint_path(&mut hash, &entry.path())?;
+            }
+        }
+    }
+    for path in paths::feed_config_paths() {
+        fingerprint_path(&mut hash, &path)?;
+    }
+    // Dependency estimates change when any system package is installed or removed.
+    fingerprint_path(&mut hash, Path::new("/var/lib/opkg/status"))?;
+    fingerprint_path(&mut hash, Path::new("/etc/opkg/arch.conf"))?;
+    fingerprint_path(&mut hash, Path::new(paths::TRUSTED_FEEDS))?;
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn read_marketplace_cache(fingerprint: &str) -> Option<Value> {
+    let data = fs::read(paths::MARKETPLACE_CACHE).ok()?;
+    let cache: MarketplaceDiskCache = serde_json::from_slice(&data).ok()?;
+    if cache.version != MARKETPLACE_CACHE_VERSION || cache.fingerprint != fingerprint {
+        return None;
+    }
+    if !cache.packages.is_object() {
+        return None;
+    }
+    Some(cache.packages)
+}
+
+fn write_marketplace_cache(fingerprint: &str, packages: &Value) -> Result<(), String> {
+    let payload = serde_json::to_vec(&MarketplaceDiskCache {
+        version: MARKETPLACE_CACHE_VERSION,
+        fingerprint: fingerprint.to_owned(),
+        packages: packages.clone(),
+    })
+    .map_err(|e| e.to_string())?;
+    let mut payload = payload;
+    payload.push(b'\n');
+    sys::atomic_write(Path::new(paths::MARKETPLACE_CACHE), &payload, 0o600)
+}
+
+fn installed_custom_icon_data_url(manifest: &Manifest) -> String {
+    crate::catalog::custom_icon_data_url(manifest)
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path()));
+        } else if file_type.is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
 }
 
 fn build_method_command(
@@ -257,6 +858,9 @@ fn apply_controller(
     request: Option<Value>,
 ) -> Result<Value, String> {
     let id = &extension.manifest.id;
+    if state.enabled && matches!(event, "enable" | "reconcile" | "config_changed") {
+        prepare_enabled_extension(extension)?;
+    }
     prepare_runtime_dirs(id)?;
     let settings = settings_for_state(extension, state)?;
     write_runtime_settings(id, &settings)?;
@@ -438,6 +1042,9 @@ fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), Strin
         return Ok(());
     }
     let extension = load_installed(id, &state.active_version)?;
+    if extension.manifest.is_environment() {
+        return cleanup_disabled_controller(id);
+    }
     if manages_legacy_service(&extension.manifest) {
         if state.enabled {
             start_legacy(&extension, &state)
@@ -457,6 +1064,9 @@ fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), Strin
         )
         .map(|_| ())
     } else {
+        if state.enabled {
+            prepare_enabled_extension(&extension)?;
+        }
         cleanup_disabled_controller(id)
     }
 }
@@ -466,10 +1076,8 @@ fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), Strin
 // disabled extension has no runtime state left to reconcile.  Avoid spawning a
 // fully sandboxed helper merely to return remove_all during every cold boot.
 fn cleanup_disabled_controller(id: &str) -> Result<(), String> {
-    stop_helper(id)?;
-    stop_legacy_unit(id)?;
-    stop_legacy_controller_units(id)?;
-    remove_credential(id);
+    stop_extension_runtime(id)?;
+    remove_authorization(id);
     let runtime = Path::new(paths::RUNTIME_ROOT).join(id);
     match fs::remove_dir_all(runtime) {
         Ok(()) => Ok(()),
@@ -537,25 +1145,35 @@ fn manages_legacy_service(manifest: &Manifest) -> bool {
     manifest.controller.is_none() && !manifest.entrypoint.is_empty()
 }
 
+// Module loading belongs to the privileged D-Bus host. Manager CLI callers
+// include Core, whose service intentionally does not have CAP_SYS_MODULE.
+fn prepare_enabled_extension(extension: &Installed) -> Result<(), String> {
+    validate_device_variant(&extension.manifest)?;
+    validate_conflicts(&extension.manifest.id, &extension.manifest)?;
+    load_kernel_modules(extension)
+}
+
 fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String> {
     eprintln!(
         "extension {}: preparing legacy service",
         extension.manifest.id
     );
-    validate_device_variant(&extension.manifest)?;
-    crate::host::validate_conflicts(&extension.manifest.id, &extension.manifest)?;
-    load_kernel_modules(extension)?;
+    prepare_enabled_extension(extension)?;
     let unit = paths::unit_name(&extension.manifest.id);
+    let socket_unit = paths::socket_unit(&extension.manifest.id);
+    if extension.manifest.socket_activation.is_some() && is_active(&socket_unit) {
+        return Ok(());
+    }
     if is_active(&unit) {
-        if legacy_unit_has_core_lifetime(&unit) {
+        if extension.manifest.socket_activation.is_none() && legacy_unit_has_core_lifetime(&unit) {
             return Ok(());
         }
         eprintln!(
             "extension {}: replacing legacy PartOf unit with ordered BindsTo unit",
             extension.manifest.id
         );
-        crate::sandbox::systemctl(&["stop", &unit])?;
-        let _ = crate::sandbox::systemctl(&["reset-failed", &unit]);
+        unit_action("stop", &unit)?;
+        let _ = unit_action("reset-failed", &unit);
     }
     prepare_runtime_dirs(&extension.manifest.id)?;
     let settings = settings_for_state(extension, state)?;
@@ -563,7 +1181,8 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
     if !service_enabled(&settings) {
         return Ok(());
     }
-    let credential = prepare_credential(&extension.manifest)?;
+    let listen_address = socket_listen_address(&extension.manifest, &settings)?;
+    prepare_authorization(&extension.manifest)?;
     let mut arguments = vec![
         "--quiet".into(),
         "--collect".into(),
@@ -575,7 +1194,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
     arguments.extend(legacy_core_lifetime_properties());
     arguments.extend(sandbox_arguments(extension));
     arguments.extend([
-        format!("--property=LoadCredential=onekvm-token:{credential}"),
+        "--setenv=CREDENTIALS_DIRECTORY=/usr/share/onekvm/extension-compat".into(),
         format!("--working-directory={}", extension.root.display()),
         format!("--setenv=ONEKVM_EXTENSION_ID={}", extension.manifest.id),
         format!(
@@ -608,14 +1227,31 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         "extension {}: submitting transient service",
         extension.manifest.id
     );
-    if let Err(err) = systemd_run(&arguments) {
-        remove_credential(&extension.manifest.id);
+    let socket = listen_address
+        .as_deref()
+        .map(|address| (socket_unit.as_str(), address));
+    if let Err(err) = systemd_run_with_socket(&arguments, socket) {
+        let _ = stop_systemd_unit(&socket_unit);
+        let _ = stop_systemd_unit(&unit);
+        remove_authorization(&extension.manifest.id);
         let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(&extension.manifest.id));
         return Err(err);
     }
     std::thread::sleep(Duration::from_millis(200));
-    if !is_active(&paths::unit_name(&extension.manifest.id)) {
-        remove_credential(&extension.manifest.id);
+    let active_unit = if socket.is_some() {
+        &socket_unit
+    } else {
+        &unit
+    };
+    if !is_active(active_unit) {
+        /* Restart=on-failure may already have queued a retry. Stop the unit
+         * before removing its authorization record and runtime directories;
+         * otherwise queued retries obscure the original process error. */
+        let _ = unit_action("stop", active_unit);
+        if is_failed(&unit) {
+            let _ = unit_action("reset-failed", &unit);
+        }
+        remove_authorization(&extension.manifest.id);
         let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(&extension.manifest.id));
         return Err(format!(
             "extension {} exited during startup",
@@ -630,35 +1266,16 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
 }
 
 fn legacy_unit_has_core_lifetime(unit: &str) -> bool {
-    let property = |name: &str| {
-        sys::output(
-            paths::SYSTEMCTL,
-            &[
-                "show".to_owned(),
-                format!("--property={name}"),
-                "--value".to_owned(),
-                unit.to_owned(),
-            ],
-        )
-        .ok()
-        .and_then(|value| String::from_utf8(value).ok())
-        .unwrap_or_default()
-    };
-    property("BindsTo")
-        .split_whitespace()
-        .any(|value| value == "onekvm.service")
-        && property("After")
-            .split_whitespace()
-            .any(|value| value == "onekvm.service")
+    unit_has_dependency(unit, "BindsTo", "onekvm.service")
+        && unit_has_dependency(unit, "After", "onekvm.service")
 }
 
 fn legacy_core_lifetime_properties() -> [String; 2] {
     /* BindsTo stops the extension when Core disappears, while After prevents
      * systemd from automatically restarting it during the middle of a Core
      * restart. The host then creates the new service after Core is active and
-     * LoadCredential snapshots the matching freshly generated token. PartOf
-     * propagates the Core restart job and can race credential preparation,
-     * leaving the service with the old token and Core with the new one. */
+     * authorization is registered before starting its service. PartOf propagates
+     * the Core restart job and can race authorization preparation. */
     [
         "--property=BindsTo=onekvm.service".into(),
         "--property=After=onekvm.service".into(),
@@ -666,14 +1283,14 @@ fn legacy_core_lifetime_properties() -> [String; 2] {
 }
 
 fn stop_legacy(id: &str) -> Result<(), String> {
-    remove_credential(id);
-    let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(id));
-    if !is_active(&paths::unit_name(id)) {
-        let _ = crate::sandbox::systemctl(&["reset-failed", &paths::unit_name(id)]);
-        return Ok(());
+    unit_action("stop", &paths::socket_unit(id))?;
+    let unit = paths::unit_name(id);
+    unit_action("stop", &unit)?;
+    if is_failed(&unit) {
+        let _ = unit_action("reset-failed", &unit);
     }
-    crate::sandbox::systemctl(&["stop", &paths::unit_name(id)])?;
-    let _ = crate::sandbox::systemctl(&["reset-failed", &paths::unit_name(id)]);
+    remove_authorization(id);
+    let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(id));
     Ok(())
 }
 
@@ -685,7 +1302,32 @@ fn service_enabled(settings: &Value) -> bool {
     }
 }
 
+fn socket_listen_address(manifest: &Manifest, settings: &Value) -> Result<Option<String>, String> {
+    let Some(socket) = &manifest.socket_activation else {
+        return Ok(None);
+    };
+    let address = settings
+        .get(&socket.address_setting)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "socket activation bind address is missing".to_string())?
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| {
+            "socket activation bind address must be an IPv4 or IPv6 address".to_string()
+        })?;
+    let port = settings
+        .get(&socket.port_setting)
+        .and_then(Value::as_u64)
+        .filter(|port| (1..=65535).contains(port))
+        .ok_or_else(|| "socket activation port must be between 1 and 65535".to_string())?;
+    Ok(Some(
+        std::net::SocketAddr::new(address, port as u16).to_string(),
+    ))
+}
+
 pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
+    if manifest.kind == "cloud-provider" {
+        validate_cloud_provider_conflict(id)?;
+    }
     if manifest.activation_conflicts.is_empty() {
         return Ok(());
     }
@@ -705,6 +1347,36 @@ pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_cloud_provider_conflict(id: &str) -> Result<(), String> {
+    let entries = match fs::read_dir(paths::APPS_ROOT) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.file_name().to_string_lossy().into_owned();
+        if candidate == id
+            || !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            || !paths::valid_id(&candidate)
+        {
+            continue;
+        }
+        let state = read_state(&candidate)?;
+        if !state.enabled || state.active_version.is_empty() {
+            continue;
+        }
+        let Ok(extension) = load_installed(&candidate, &state.active_version) else {
+            continue;
+        };
+        if extension.manifest.kind == "cloud-provider" {
+            return Err(format!(
+                "cloud provider {id} conflicts with enabled cloud provider {candidate}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Result<bool, String> {
     let id = &extension.manifest.id;
     let command_only = direct.is_some() && extension.manifest.controller.is_none();
@@ -713,7 +1385,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
     } else {
         "controller"
     };
-    let reuse_key = format!("sandbox-v2:{}:{mode}", extension.manifest.version);
+    let reuse_key = format!("sandbox-v3:{}:{mode}", extension.manifest.version);
     if helper_ready(id, &reuse_key) {
         return Ok(false);
     }
@@ -722,7 +1394,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
         stop_legacy_unit(id)?;
         stop_legacy_controller_units(id)?;
     }
-    let credential = prepare_credential(&extension.manifest)?;
+    prepare_authorization(&extension.manifest)?;
     let address = paths::helper_address(id);
     let _ = fs::remove_file(&address);
     let (controller_command, controller_timeout, idle_timeout) =
@@ -755,7 +1427,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
     ];
     arguments.extend(helper_sandbox_arguments(extension));
     arguments.extend([
-        format!("--property=LoadCredential=onekvm-token:{credential}"),
+        "--setenv=CREDENTIALS_DIRECTORY=/usr/share/onekvm/extension-compat".into(),
         format!("--working-directory={}", extension.root.display()),
         format!("--setenv=ONEKVM_EXTENSION_ID={id}"),
         format!(
@@ -813,35 +1485,83 @@ fn helper_ready(id: &str, reuse_key: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn declared_service_units(manifest: &Manifest) -> Vec<String> {
+    let mut units = Vec::new();
+    for service in &manifest.services {
+        if service.unit.is_empty() {
+            continue;
+        }
+        if !paths::valid_extension_service_unit(&manifest.id, &service.unit) {
+            continue;
+        }
+        if !units.iter().any(|existing| existing == &service.unit) {
+            units.push(service.unit.clone());
+        }
+    }
+    units
+}
+
+pub fn stop_declared_service_units(manifest: &Manifest, disable: bool) -> Result<(), String> {
+    for unit in declared_service_units(manifest) {
+        stop_systemd_unit(&unit)?;
+        if disable {
+            let _ = unit_action("disable", &unit);
+        }
+    }
+    Ok(())
+}
+
+pub fn stop_extension_runtime(id: &str) -> Result<(), String> {
+    stop_helper(id)?;
+    stop_legacy_unit(id)?;
+    stop_legacy_controller_units(id)
+}
+
+fn stop_systemd_unit(unit: &str) -> Result<(), String> {
+    if is_active(unit) {
+        unit_action("stop", unit).map_err(|err| format!("stop {unit}: {err}"))?;
+    }
+    if is_failed(unit) {
+        let _ = unit_action("reset-failed", unit);
+    }
+    Ok(())
+}
+
 fn stop_helper(id: &str) -> Result<(), String> {
     let unit = paths::helper_unit(id);
     let address = paths::helper_address(id);
     if !address.exists() && !Path::new(paths::TRANSIENT_ROOT).join(&unit).exists() {
         return Ok(());
     }
-    let _ = crate::sandbox::systemctl(&["stop", &unit]);
+    if is_active(&unit) {
+        unit_action("stop", &unit)?;
+    } else if is_failed(&unit) {
+        let _ = unit_action("reset-failed", &unit);
+    }
     let _ = fs::remove_file(address);
     Ok(())
 }
 
 fn stop_legacy_unit(id: &str) -> Result<(), String> {
+    // Stop the listener first, otherwise pending connections can reactivate
+    // the service while it is being disabled or upgraded.
+    unit_action("stop", &paths::socket_unit(id))?;
     let unit = paths::unit_name(id);
     if !Path::new(paths::TRANSIENT_ROOT).join(&unit).exists() {
         return Ok(());
     }
-    if !is_active(&unit) {
-        let _ = crate::sandbox::systemctl(&["reset-failed", &unit]);
-        return Ok(());
+    if is_active(&unit) {
+        unit_action("stop", &unit)?;
     }
-    crate::sandbox::systemctl(&["stop", &unit])?;
-    let _ = crate::sandbox::systemctl(&["reset-failed", &unit]);
+    if is_failed(&unit) {
+        let _ = unit_action("reset-failed", &unit);
+    }
     Ok(())
 }
 
 fn stop_legacy_controller_units(id: &str) -> Result<(), String> {
-    let pattern = format!("onekvm-extension-{id}-*.service");
     let helper = paths::helper_unit(id);
-    let mut has_legacy = false;
+    let mut legacy_units = Vec::new();
     if let Ok(entries) = fs::read_dir(paths::TRANSIENT_ROOT) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -850,15 +1570,14 @@ fn stop_legacy_controller_units(id: &str) -> Result<(), String> {
                 && name.ends_with(".service")
                 && name != helper
             {
-                has_legacy = true;
-                break;
+                legacy_units.push(name.into_owned());
             }
         }
     }
-    if !has_legacy {
-        return remove_legacy_slice(id);
+    legacy_units.sort();
+    for unit in legacy_units {
+        stop_systemd_unit(&unit)?;
     }
-    let _ = crate::sandbox::systemctl(&["stop", &pattern]);
     remove_legacy_slice(id)
 }
 
@@ -869,7 +1588,7 @@ fn remove_legacy_slice(id: &str) -> Result<(), String> {
     );
     let path = Path::new(paths::RUNTIME_UNIT_ROOT).join(&name);
     if path.exists() {
-        let _ = crate::sandbox::systemctl(&["stop", &name]);
+        let _ = unit_action("stop", &name);
         let _ = fs::remove_file(path);
     }
     Ok(())
@@ -1015,7 +1734,17 @@ pub fn core_lost(host: &Host) {
         generation.clear();
     }
     let _ = fs::remove_file(paths::GENERATION_PATH);
-    let _ = crate::sandbox::systemctl(&["stop", paths::EXTENSIONS_SLICE]);
+    // Socket units also have BindsTo=onekvm.service, but Core can lose its
+    // bus name before systemd sees it exit. Prevent reactivation in that gap.
+    if let Ok(entries) = fs::read_dir(paths::TRANSIENT_ROOT) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("onekvm-extension-") && name.ends_with(".socket") {
+                let _ = unit_action("stop", &name);
+            }
+        }
+    }
+    let _ = unit_action("stop", paths::EXTENSIONS_SLICE);
 }
 
 pub fn repair_permissions() -> Result<(), String> {
@@ -1026,6 +1755,64 @@ pub fn repair_permissions() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn marketplace_updates_require_a_newer_installable_package() {
+        assert!(marketplace_update_available(
+            "1.9", "1.9-r9", "1.10", "1.10-r0"
+        ));
+        assert!(marketplace_update_available(
+            "1.0", "1.0-r2", "1.0", "1.0-r10"
+        ));
+        assert!(!marketplace_update_available(
+            "1.0", "1.0-r10", "1.0", "1.0-r2"
+        ));
+        assert!(!marketplace_update_available(
+            "1.0", "1.0-r2", "1.0", "1.0-r2"
+        ));
+        assert!(!marketplace_update_available(
+            "1.0",
+            "1.0-r2.debug20261014",
+            "1.0",
+            "1.0-r2"
+        ));
+        assert!(!marketplace_update_available("", "", "1.0", "1.0-r0"));
+        assert!(!marketplace_update_available("1.0", "1.0-r0", "1.0", ""));
+        assert!(marketplace_update_available("1.9", "", "1.10", "1.10-r0"));
+        assert!(!marketplace_update_available("1.0", "", "1.0", "1.0-r10"));
+    }
+
+    #[test]
+    fn socket_activation_only_accepts_numeric_tcp_addresses() {
+        let manifest = Manifest {
+            socket_activation: Some(crate::manifest::SocketActivation {
+                address_setting: "listen_address".into(),
+                port_setting: "port".into(),
+            }),
+            ..Manifest::default()
+        };
+        for (address, expected) in [("0.0.0.0", "0.0.0.0:5900"), ("::1", "[::1]:5900")] {
+            assert_eq!(
+                socket_listen_address(&manifest, &json!({"listen_address":address,"port":5900}))
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        for settings in [
+            json!({"listen_address":"localhost","port":5900}),
+            json!({"listen_address":"0.0.0.0\nService=other","port":5900}),
+            json!({"listen_address":"0.0.0.0","port":0}),
+            json!({"listen_address":"::","port":65536}),
+            json!({"port":5900}),
+        ] {
+            assert!(socket_listen_address(&manifest, &settings).is_err());
+        }
+        assert_eq!(
+            socket_listen_address(&Manifest::default(), &json!({})).unwrap(),
+            None
+        );
+    }
+
     fn candidate(id: &str, enabled: bool) -> ReconcileCandidate {
         ReconcileCandidate {
             id: id.into(),
@@ -1034,6 +1821,33 @@ mod tests {
                 ..PluginState::default()
             },
         }
+    }
+
+    #[test]
+    fn declared_service_units_keep_namespaced_systemd_units() {
+        let mut manifest = Manifest::default();
+        manifest.id = "samba".into();
+        manifest.services = vec![
+            crate::manifest::ManifestService {
+                id: "manager".into(),
+                unit: "onekvm-samba-manager.service".into(),
+                ..crate::manifest::ManifestService::default()
+            },
+            crate::manifest::ManifestService {
+                id: "helper".into(),
+                unit: String::new(),
+                ..crate::manifest::ManifestService::default()
+            },
+            crate::manifest::ManifestService {
+                id: "unsafe".into(),
+                unit: "sshd.service".into(),
+                ..crate::manifest::ManifestService::default()
+            },
+        ];
+        assert_eq!(
+            declared_service_units(&manifest),
+            vec!["onekvm-samba-manager.service"]
+        );
     }
 
     #[test]
@@ -1162,5 +1976,43 @@ mod tests {
             build_method_command(&spec, Some(&request)).unwrap(),
             ["bin/onekvm-boot-confirm"]
         );
+    }
+
+    #[test]
+    fn marketplace_source_key_rejects_invalid_ids() {
+        assert_eq!(
+            marketplace_source_key(Some(&json!({"name": "mirror"}))).unwrap(),
+            "mirror"
+        );
+        assert_eq!(
+            marketplace_source_key(Some(&json!({"key": "lab", "name": "内部镜像"}))).unwrap(),
+            "lab"
+        );
+        assert!(marketplace_source_key(Some(&json!({"name": "Bad"}))).is_err());
+        assert!(marketplace_source_key(Some(&json!({"key": "Bad"}))).is_err());
+        assert!(marketplace_source_key(Some(&json!({"name": ""}))).is_err());
+        assert!(marketplace_set_source(Some(&json!({"name": "mirror"}))).is_err());
+        assert!(marketplace_set_source(Some(&json!({
+            "key": "lab",
+            "name": "内部镜像"
+        })))
+        .is_err());
+        assert!(marketplace_set_source(Some(&json!({
+            "name": "mirror",
+            "feeds_text": "not a feed"
+        })))
+        .is_err());
+        assert!(marketplace_set_source(Some(&json!({
+            "key": "Bad",
+            "name": "内部镜像",
+            "feeds_text": "src a https://example.org/a\n"
+        })))
+        .is_err());
+        assert!(marketplace_set_source_enabled(Some(&json!({"name": "mirror"}))).is_err());
+        assert!(marketplace_set_source_enabled(Some(&json!({
+            "key": "lab",
+            "enabled": "yes"
+        })))
+        .is_err());
     }
 }

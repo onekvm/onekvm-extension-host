@@ -13,6 +13,7 @@ extern "C" {
         size: usize,
         output: *mut *mut c_void,
         out_size: *mut usize,
+        err: *mut *mut c_char,
     ) -> c_int;
     fn onekvm_helper_client_ensure(
         unique: *const c_char,
@@ -180,6 +181,7 @@ pub fn run_controller(id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
     let unique = unique_name(id)?;
     let mut output = std::ptr::null_mut();
     let mut size = 0usize;
+    let mut error = std::ptr::null_mut();
     let status = unsafe {
         onekvm_helper_client_run_controller(
             unique.as_ptr(),
@@ -187,10 +189,20 @@ pub fn run_controller(id: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
             payload.len(),
             &mut output,
             &mut size,
+            &mut error,
         )
     };
     if status != 0 {
-        return Err(fail(status, "RunController"));
+        let message = if error.is_null() {
+            fail(status, "RunController")
+        } else {
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { libc::free(error.cast()) };
+            message
+        };
+        return Err(message);
     }
     let slice = unsafe { std::slice::from_raw_parts(output as *const u8, size) };
     let data = slice.to_vec();

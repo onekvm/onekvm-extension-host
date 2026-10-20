@@ -275,7 +275,10 @@ fn inspect_dependency_data(compressed: &[u8], root: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn inspect_kernel_dependency_data(package_name: &str, compressed: &[u8]) -> Result<String, String> {
+pub(crate) fn inspect_kernel_dependency_data(
+    package_name: &str,
+    compressed: &[u8],
+) -> Result<String, String> {
     let decoder = GzDecoder::new(compressed);
     let mut archive = Archive::new(decoder);
     let mut present = BTreeSet::new();

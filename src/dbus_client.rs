@@ -70,6 +70,15 @@ pub fn reconcile(id: &str, revision: u64) -> Result<(), String> {
     host_simple("Reconcile", id, revision)
 }
 
+pub fn load_network_module(module: &str) -> Result<(), String> {
+    host_simple("LoadNetworkModule", module, 0)
+}
+
+
+pub fn health(id: &str, revision: u64) -> Result<(),String> { host_simple("CheckHealth",id,revision) }
+
+pub fn transaction(operation: &str,id: &str) -> Result<(),String> { host_simple(operation,id,0) }
+
 fn host_simple(method: &str, id: &str, revision: u64) -> Result<(), String> {
     let method = c_string(method)?;
     let id = c_string(id)?;
@@ -169,6 +178,11 @@ pub fn call_string(
     };
     if status != 0 {
         unsafe { take_string(response) };
+        // sd_bus_call returns >0 on success; the C helper used to pass that
+        // through for fire-and-forget UpdateSettings. Treat it as success.
+        if !want_response && status > 0 && err.is_null() {
+            return Ok(String::new());
+        }
         return Err(fail(status, err, "system plugin D-Bus"));
     }
     Ok(unsafe { take_string(response) })

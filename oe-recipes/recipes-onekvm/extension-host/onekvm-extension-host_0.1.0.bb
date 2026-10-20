@@ -1,7 +1,8 @@
 SUMMARY = "OneKVM extension host, lifecycle policy, and manager CLI"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=8a5a0a588995e3e2c2bfa68f5413df57"
-PR = "r14"
+PR = "r36"
+OPKGBUILDCMD = "opkg-build -Z gzip"
 
 ONEKVM_TRUSTED_FEED_PREFIXES ?= ""
 
@@ -26,6 +27,13 @@ do_install() {
 
     install -Dm0644 ${S}/packaging/onekvm-extension-host.service \
         ${D}${systemd_system_unitdir}/onekvm-extension-host.service
+    install -Dm0644 ${S}/packaging/onekvm-plugin-update.service \
+        ${D}${systemd_system_unitdir}/onekvm-plugin-update.service
+    install -d ${D}${systemd_system_unitdir}/onekvm-pre.target.requires
+    ln -s ../onekvm-plugin-update.service \
+        ${D}${systemd_system_unitdir}/onekvm-pre.target.requires/onekvm-plugin-update.service
+    install -d ${D}${datadir}/onekvm
+    printf '1\n' >${D}${datadir}/onekvm/plugin-update-version
     install -Dm0644 ${S}/packaging/30-onekvm-extension-group.conf \
         ${D}${systemd_system_unitdir}/onekvm.service.d/30-onekvm-extension-group.conf
     install -Dm0644 ${S}/packaging/system-onekvm.slice \
@@ -41,12 +49,17 @@ do_install() {
         ${D}${docdir}/onekvm/extension-controller-v1.md
     install -Dm0644 ${S}/docs/extension-command-method-v1.md \
         ${D}${docdir}/onekvm/extension-command-method-v1.md
+    install -Dm0644 ${S}/docs/extension-points.md \
+        ${D}${docdir}/onekvm/extension-points.md
     install -Dm0644 ${S}/docs/extension-logging-v1.md \
         ${D}${docdir}/onekvm/extension-logging-v1.md
+    install -Dm0644 ${S}/docs/extension-toolbox-v1.md \
+        ${D}${docdir}/onekvm/extension-toolbox-v1.md
     install -Dm0644 ${S}/docs/ipks-v1.md \
         ${D}${docdir}/onekvm/ipks-v1.md
 
-    install -d ${D}${datadir}/onekvm
+    install -d ${D}${datadir}/onekvm/extension-compat
+    install -m0644 ${S}/packaging/onekvm-token ${D}${datadir}/onekvm/extension-compat/onekvm-token
     if [ -n "${ONEKVM_TRUSTED_FEED_PREFIXES}" ]; then
         : >${D}${datadir}/onekvm/trusted-feed-prefixes
         for prefix in ${ONEKVM_TRUSTED_FEED_PREFIXES}; do
@@ -68,6 +81,8 @@ RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"
 
 FILES:${PN} += "\
+    ${systemd_system_unitdir}/onekvm-plugin-update.service \
+    ${systemd_system_unitdir}/onekvm-pre.target.requires \
     ${datadir}/onekvm \
     ${datadir}/dbus-1/system.d/org.onekvm.ExtensionHost1.conf \
     ${datadir}/dbus-1/system-services/org.onekvm.ExtensionHost1.service \
@@ -79,3 +94,5 @@ FILES:${PN} += "\
 
 USERADD_PACKAGES = "${PN}"
 USERADD_PARAM:${PN} = "--system --home /nonexistent --no-create-home --shell /sbin/nologin onekvm-extension"
+
+GROUPADD_PARAM:${PN} = "--system onekvm-crypto"

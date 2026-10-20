@@ -1,14 +1,17 @@
 [Unit]
+Requires=onekvm-plugin-update.service
+After=onekvm-plugin-update.service
 Description=OneKVM extension lifecycle host
 BindsTo=onekvm.service
-After=dbus.socket
+After=dbus.socket onekvm.service
 Requires=dbus.socket
 
 [Service]
 Type=notify
 NotifyAccess=main
-# The host claims its D-Bus name immediately, then reports READY only after
-# Core's initial ReconcileAll has finished applying all enabled extensions.
+# The host claims its D-Bus name immediately, then reports READY after the first
+# ReconcileAll attempt (including partial per-extension failures) so a single
+# extension start error cannot hold Type=notify until TimeoutStartSec.
 ExecStart=/usr/bin/onekvm-extension-host
 Restart=on-failure
 RestartSec=1s
@@ -24,7 +27,9 @@ PrivateDevices=no
 DevicePolicy=closed
 ProtectSystem=strict
 ProtectHome=yes
-ProtectKernelModules=yes
+# The host modprobes kernel_modules named in extension manifests.
+# Each extension unit still sets ProtectKernelModules=yes.
+ProtectKernelModules=no
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
@@ -33,4 +38,7 @@ ProtectHostname=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
-ReadWritePaths=/etc/onekvm /data /run/onekvm /run/systemd/system
+ReadWritePaths=/etc/onekvm /etc/opkg /data /run/onekvm /run/systemd/system
+# Signed extension dependencies may install optional kernel modules and their
+# boot loading configuration and units. Keep the rest of /usr read-only.
+ReadWritePaths=/usr/lib/modules /usr/lib/modules-load.d /usr/lib/systemd/system

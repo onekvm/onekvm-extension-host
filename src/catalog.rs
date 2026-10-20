@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::feed::available_extensions;
 use crate::manifest::{
     installed_versions, load_installed, ActivationConflict, AuthProvider, ExtensionPage,
-    ExtensionRoute, ExtensionToolbar, Manifest, ManifestDirectory, ManifestVideo, PageIcon,
-    SettingsSchema, Translation,
+    ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, Manifest,
+    ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
 };
 use crate::memory;
 use crate::paths;
@@ -57,12 +57,20 @@ pub struct CatalogSummary {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<PageIcon>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon_data_url: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_page: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_toolbar: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolbar: Option<ExtensionToolbar>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_shell: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_settings: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -81,6 +89,9 @@ pub struct CatalogSummary {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct CatalogEntry {
+    pub permissions: Vec<String>,
+    pub kernel_modules: Vec<String>,
+    pub package_dependencies: Option<Vec<String>>,
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -119,6 +130,10 @@ pub struct CatalogEntry {
     pub page: Option<ExtensionPage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolbar: Option<ExtensionToolbar>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,9 +163,12 @@ struct CatalogDiskCache {
     entries: Vec<serde_json::Value>,
 }
 
+const CATALOG_CACHE_VERSION: i32 = 8;
+const CATALOG_RUNTIME_TTL: Duration = Duration::from_secs(2);
+
 pub fn catalog() -> Result<Vec<CatalogSummary>, String> {
     if let Ok(fingerprint) = catalog_fingerprint() {
-        if let Some(entries) = read_cache(&fingerprint) {
+        if let Some(entries) = read_cache(Path::new(paths::CATALOG_CACHE), &fingerprint) {
             return Ok(entries);
         }
         let entries = build_catalog()?;
@@ -161,10 +179,10 @@ pub fn catalog() -> Result<Vec<CatalogSummary>, String> {
 }
 
 pub fn build_catalog() -> Result<Vec<CatalogSummary>, String> {
-    let available = available_extensions();
+    // Feed packages that are not installed belong in the plugin marketplace, not
+    // the local plugin manager list.
     let system_plugins = load_system_plugins()?;
     let mut result = Vec::new();
-    let mut installed = BTreeMap::new();
     match fs::read_dir(paths::APPS_ROOT) {
         Ok(entries) => {
             for entry in entries {
@@ -176,10 +194,7 @@ pub fn build_catalog() -> Result<Vec<CatalogSummary>, String> {
                 }
                 match installed_summary(&id) {
                     Ok(None) => {}
-                    Ok(Some(item)) => {
-                        installed.insert(id, true);
-                        result.push(item);
-                    }
+                    Ok(Some(item)) => result.push(item),
                     Err(err) => result.push(CatalogSummary {
                         id,
                         error: err,
@@ -190,12 +205,6 @@ pub fn build_catalog() -> Result<Vec<CatalogSummary>, String> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.to_string()),
-    }
-    for (id, manifest) in available {
-        if installed.contains_key(&id) {
-            continue;
-        }
-        result.push(summary_from_manifest(&manifest, false));
     }
     result.extend(
         system_plugins
@@ -214,9 +223,13 @@ fn installed_summary(id: &str) -> Result<Option<CatalogSummary>, String> {
     }
     let state = read_state(id)?;
     let extension = load_installed(id, &state.active_version)?;
-    let mut item = summary_from_manifest(&extension.manifest, true);
-    item.enabled = state.enabled;
-    if state.enabled {
+    let mut item = summary_from_manifest(
+        &extension.manifest,
+        true,
+        custom_icon_data_url(&extension.manifest),
+    );
+    item.enabled = state.enabled && !extension.manifest.is_environment();
+    if item.enabled {
         item.directories = directories_for_installed(id, &extension.manifest.directories)?;
     }
     item.running = extension_running(id, &extension.manifest, state.enabled);
@@ -237,19 +250,21 @@ pub fn detail(id: &str) -> Result<CatalogEntry, String> {
         let extension = available_extensions()
             .remove(id)
             .ok_or_else(|| format!("extension {id:?} not found"))?;
-        return Ok(entry_from_manifest(
-            &extension,
+        let mut item = entry_from_manifest(
+            &extension.manifest,
             false,
-            vec![extension.version.clone()],
-        ));
+            vec![extension.manifest.version.clone()],
+        );
+        item.package_dependencies = Some(extension.package_dependencies);
+        return Ok(item);
     }
     let state = read_state(id)?;
     let installed = load_installed(id, &state.active_version)?;
     let mut settings = settings::settings_for_state(&installed, &state)?;
     settings::merge_output(&installed, &mut settings)?;
     let mut item = entry_from_manifest(&installed.manifest, true, versions);
-    item.enabled = state.enabled;
-    if state.enabled {
+    item.enabled = state.enabled && !installed.manifest.is_environment();
+    if item.enabled {
         item.directories = directories_for_installed(id, &installed.manifest.directories)?;
     }
     item.running = extension_running(id, &installed.manifest, state.enabled);
@@ -328,7 +343,11 @@ fn decode_dynamic_directories(
     Ok(result)
 }
 
-pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSummary {
+pub fn summary_from_manifest(
+    extension: &Manifest,
+    installed: bool,
+    icon_data_url: String,
+) -> CatalogSummary {
     let icon = extension
         .icon
         .clone()
@@ -353,9 +372,13 @@ pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSu
         system: false,
         error: String::new(),
         icon,
+        icon_data_url,
         has_page: extension.page.is_some(),
         has_toolbar: extension.toolbar.is_some(),
         toolbar: extension.toolbar.clone(),
+        has_shell: extension.shell.is_some(),
+        shell: extension.shell.clone(),
+        toolbox: extension.toolbox.clone(),
         has_settings: !extension.settings_schema.properties.is_empty(),
         services: catalog_services(extension, &extension.id, installed, false),
         memory_budget_bytes: budget,
@@ -364,6 +387,46 @@ pub fn summary_from_manifest(extension: &Manifest, installed: bool) -> CatalogSu
         directories: extension.directories.clone(),
         auth_provider: extension.auth_provider.clone(),
     }
+}
+
+pub fn custom_icon_data_url(manifest: &Manifest) -> String {
+    use std::path::Path;
+
+    let icon = manifest
+        .icon
+        .as_ref()
+        .or_else(|| manifest.page.as_ref().and_then(|page| page.icon.as_ref()));
+    let Some(icon) = icon else {
+        return String::new();
+    };
+    if icon.source != "custom" || icon.path.is_empty() {
+        return String::new();
+    }
+    let mime = match Path::new(&icon.path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => return String::new(),
+    };
+    let path = Path::new(paths::APPS_ROOT)
+        .join(&manifest.id)
+        .join(&manifest.version)
+        .join(&icon.path);
+    let Ok(meta) = fs::metadata(&path) else {
+        return String::new();
+    };
+    if !meta.is_file() || meta.len() == 0 || meta.len() > 256 * 1024 {
+        return String::new();
+    }
+    let Ok(content) = fs::read(&path) else {
+        return String::new();
+    };
+    format!("data:{mime};base64,{}", crate::ipk::base64_encode(&content))
 }
 
 fn entry_from_manifest(
@@ -382,6 +445,16 @@ fn entry_from_manifest(
         schema.type_name = "object".into();
     }
     CatalogEntry {
+        permissions: extension.permissions.clone(),
+        kernel_modules: extension.kernel_modules.clone(),
+        package_dependencies: if installed {
+            crate::control::installed_package_dependencies(
+                &format!("onekvm-extension-{}", extension.id),
+                &extension.version,
+            )
+        } else {
+            None
+        },
         id: extension.id.clone(),
         name: extension.name.clone(),
         description: extension.description.clone(),
@@ -404,6 +477,8 @@ fn entry_from_manifest(
         icon: extension.icon.clone(),
         page: extension.page.clone(),
         toolbar: extension.toolbar.clone(),
+        shell: extension.shell.clone(),
+        toolbox: extension.toolbox.clone(),
         routes: extension.routes.clone(),
         auth_provider: extension.auth_provider.clone(),
         settings_schema: schema,
@@ -440,6 +515,8 @@ fn catalog_services(
                 service.unit.clone()
             } else if extension.controller.is_some() {
                 paths::helper_unit(id)
+            } else if extension.socket_activation.is_some() {
+                paths::socket_unit(id)
             } else {
                 paths::unit_name(id)
             };
@@ -474,12 +551,41 @@ pub fn command_only_extension(manifest: &Manifest) -> bool {
         && manifest.methods.has_commands()
 }
 
+/// A package whose process is never started. The plugin list should say it is
+/// enabled, not stopped, because there is no service that can be down.
+fn resident_service_expected(manifest: &Manifest) -> bool {
+    if manifest.controller.is_some()
+        || manifest
+            .services
+            .iter()
+            .any(|service| !service.unit.is_empty())
+    {
+        return true;
+    }
+    if manifest.entrypoint.is_empty() {
+        return false;
+    }
+    !service_locked_off(manifest)
+}
+
+fn service_locked_off(manifest: &Manifest) -> bool {
+    let Some(property) = manifest.settings_schema.properties.get("service_enabled") else {
+        return false;
+    };
+    property.read_only && property.default.as_ref().and_then(|value| value.as_bool()) == Some(false)
+}
+
 pub fn extension_running(id: &str, manifest: &Manifest, enabled: bool) -> bool {
-    if command_only_extension(manifest) {
-        return enabled;
+    if !enabled || manifest.is_environment() {
+        return false;
+    }
+    if command_only_extension(manifest) || !resident_service_expected(manifest) {
+        return true;
     }
     if manifest.controller.is_some() {
         sandbox::is_active(&paths::helper_unit(id))
+    } else if manifest.socket_activation.is_some() {
+        sandbox::is_active(&paths::socket_unit(id))
     } else {
         sandbox::is_active(&paths::unit_name(id))
     }
@@ -501,9 +607,13 @@ fn empty_summary() -> CatalogSummary {
         system: false,
         error: String::new(),
         icon: None,
+        icon_data_url: String::new(),
         has_page: false,
         has_toolbar: false,
         toolbar: None,
+        has_shell: false,
+        shell: None,
+        toolbox: None,
         has_settings: false,
         services: Vec::new(),
         memory_budget_bytes: 0,
@@ -534,6 +644,8 @@ fn catalog_fingerprint() -> Result<String, String> {
 }
 
 fn write_fingerprint(hash: &mut Sha256) -> Result<(), String> {
+    fingerprint_path(hash, Path::new(paths::CONTRIBUTIONS_GENERATION))?;
+    fingerprint_path(hash, Path::new(paths::GENERATION_PATH))?;
     fingerprint_path(hash, Path::new(paths::APPS_ROOT))?;
     if let Ok(mut entries) = fs::read_dir(paths::APPS_ROOT) {
         let mut names = Vec::new();
@@ -602,7 +714,9 @@ fn write_fingerprint(hash: &mut Sha256) -> Result<(), String> {
             }
         }
     }
-    fingerprint_path(hash, Path::new(paths::FEED_CONFIG))?;
+    for path in paths::feed_config_paths() {
+        fingerprint_path(hash, &path)?;
+    }
     fingerprint_path(hash, Path::new(paths::MACHINE_PROFILE))
 }
 
@@ -635,10 +749,21 @@ fn fingerprint_path(hash: &mut Sha256, path: &Path) -> Result<(), String> {
     }
 }
 
-fn read_cache(fingerprint: &str) -> Option<Vec<CatalogSummary>> {
-    let data = fs::read(paths::CATALOG_CACHE).ok()?;
+fn read_cache(path: &Path, fingerprint: &str) -> Option<Vec<CatalogSummary>> {
+    // Service readiness can change without modifying a manifest or settings.
+    // Expire on demand; an idle system does not need a polling task.
+    let age = fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()?;
+    if age >= CATALOG_RUNTIME_TTL {
+        return None;
+    }
+    let data = fs::read(path).ok()?;
     let cache: CatalogDiskCache = serde_json::from_slice(&data).ok()?;
-    if cache.version != 2 || cache.fingerprint != fingerprint {
+    if cache.version != CATALOG_CACHE_VERSION || cache.fingerprint != fingerprint {
         return None;
     }
     serde_json::from_value(serde_json::Value::Array(cache.entries)).ok()
@@ -646,7 +771,7 @@ fn read_cache(fingerprint: &str) -> Option<Vec<CatalogSummary>> {
 
 fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), String> {
     let payload = serde_json::to_vec(&CatalogDiskCache {
-        version: 2,
+        version: CATALOG_CACHE_VERSION,
         fingerprint: fingerprint.to_owned(),
         entries: entries
             .iter()
@@ -662,6 +787,29 @@ fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_runtime_status_expires_and_rejects_clock_rollback() {
+        let path = std::env::temp_dir().join(format!(
+            "onekvm-catalog-cache-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let payload = serde_json::to_vec(&CatalogDiskCache {
+            version: CATALOG_CACHE_VERSION,
+            fingerprint: "installed".into(),
+            entries: Vec::new(),
+        }).unwrap();
+        fs::write(&path, payload).unwrap();
+        assert!(read_cache(&path, "installed").is_some());
+        assert!(read_cache(&path, "changed").is_none());
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - CATALOG_RUNTIME_TTL - Duration::from_secs(1)).unwrap();
+        assert!(read_cache(&path, "installed").is_none());
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(30)).unwrap();
+        assert!(read_cache(&path, "installed").is_none());
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn dynamic_directories_are_data_only_and_merge_with_declared_entries() {
@@ -712,6 +860,32 @@ mod tests {
 
         manifest.entrypoint = "bin/daemon".into();
         assert!(!command_only_extension(&manifest));
+    }
+
+    #[test]
+    fn extensions_without_a_resident_process_are_ready_when_enabled() {
+        let page_only = Manifest::default();
+        assert!(extension_running("edid-editor", &page_only, true));
+        assert!(!extension_running("edid-editor", &page_only, false));
+
+        let mut property = crate::manifest::SettingProperty::default();
+        property.read_only = true;
+        property.default = Some(serde_json::Value::Bool(false));
+        let mut stub = Manifest {
+            entrypoint: "bin/onekvm-example-toolbox".into(),
+            ..Manifest::default()
+        };
+        stub.settings_schema
+            .properties
+            .insert("service_enabled".into(), property);
+        assert!(extension_running("example-toolbox", &stub, true));
+        assert!(!extension_running("example-toolbox", &stub, false));
+
+        let daemon = Manifest {
+            entrypoint: "bin/daemon".into(),
+            ..Manifest::default()
+        };
+        assert!(!extension_running("example-daemon", &daemon, true));
     }
 
     #[test]

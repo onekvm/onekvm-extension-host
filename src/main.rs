@@ -1,5 +1,6 @@
 mod catalog;
 mod cli;
+mod contributions;
 mod control;
 mod dbus_client;
 mod feed;
@@ -13,6 +14,8 @@ mod ipks;
 mod lifecycle;
 mod manifest;
 mod memory;
+mod network_modules;
+mod package_sizes;
 mod paths;
 mod ports;
 mod sandbox;
@@ -20,6 +23,8 @@ mod settings;
 mod state;
 mod sys;
 mod system_plugin;
+mod update;
+mod transaction;
 
 fn main() {
     let mut arguments = std::env::args();
@@ -53,6 +58,7 @@ fn is_host_binary(argv0: &str) -> bool {
 
 fn run_host() -> Result<(), Box<dyn std::error::Error>> {
     host::repair_permissions()?;
+    sys::with_lock(|| transaction::recover_all(false))?;
     let host = Box::into_raw(Box::new(host::Host::new()));
     let status = unsafe { ffi::onekvm_host_serve(host.cast()) };
     unsafe {

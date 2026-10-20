@@ -1,0 +1,17 @@
+[Unit]
+Description=Install staged plugin packages for the booted kernel
+DefaultDependencies=no
+Requires=onekvm-persistence.service
+After=onekvm-persistence.service
+Before=onekvm-pre.target onekvm.service onekvm-extension-host.service shutdown.target
+Conflicts=shutdown.target
+OnFailure=onekvm-rauc-failure.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/onekvm-extension update-boot
+RemainAfterExit=yes
+TimeoutStartSec=300s
+
+[Install]
+RequiredBy=onekvm-pre.target

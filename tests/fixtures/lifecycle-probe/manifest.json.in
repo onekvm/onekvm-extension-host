@@ -1,0 +1,31 @@
+{
+  "manifest_version": 1,
+  "api_version": 2,
+  "id": "lifecycle-probe",
+  "version": "@VERSION@",
+  "architecture": "@ARCH@",
+  "i18n": {
+    "default": {"name": "Lifecycle probe", "description": "Temporary lifecycle acceptance fixture."},
+    "zh": {"name": "麒麟生命周期测试", "description": "临时生命周期验收插件。"},
+    "zh-TW": {"name": "麒麟生命週期測試", "description": "暫時的生命週期驗收擴充。"}
+  },
+  "kind": "service",
+  "entrypoint": "bin/probe",
+  "permissions": [],
+  "capabilities": [],
+  "default_enabled": true,
+  "settings_schema": {"type": "object", "additionalProperties": false, "properties": {"service_enabled": {"type": "boolean", "title": "Probe service", "i18n": {"default": "Probe service", "zh": "测试服务", "zh-TW": "測試服務"}, "default": true}}},
+  "secret_fields": [],
+  "resource_limits": {"memory_max": "8M", "cpu_quota": "5%", "tasks_max": 8, "limit_nofile": 32},
+  "healthcheck": {"type": "exec", "command": ["bin/probe", "--health"], "timeout_seconds": 3},
+  "methods": [{"name": "status", "command": ["bin/probe", "--status"]}],
+  "extension_points": [{"id": "lifecycle-probe.state", "version": 1}],
+  "contributions": [
+    {"point": "lifecycle-probe.state", "id": "main", "version": 1, "data": {"title": "probe"}},
+    {"point": "screen-display.app", "id": "main", "version": 1, "data": {
+      "title": "Lifecycle probe", "i18n": {"zh": "麒麟生命周期测试", "zh-TW": "麒麟生命週期測試"},
+      "bundle": "screen-app", "icon": "icon.bin", "runtime": "pocketjs-vue-vapor", "bridge_version": 2,
+      "permissions": {"rpc": [{"methods": ["status"]}]}
+    }}
+  ]
+}

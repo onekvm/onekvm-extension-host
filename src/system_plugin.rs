@@ -5,12 +5,19 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::catalog::{CatalogEntry, CatalogService, CatalogSummary};
-use crate::manifest::{ExtensionPage, PageIcon, SettingsSchema, Translation};
+use crate::manifest::{
+    Contribution, ExtensionPage, ExtensionPoint, ExtensionRoute, PageIcon, SettingsSchema,
+    Translation,
+};
 use crate::paths;
 use crate::sandbox;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemPlugin {
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub kernel_modules: Vec<String>,
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -22,6 +29,10 @@ pub struct SystemPlugin {
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
+    pub extension_points: Vec<ExtensionPoint>,
+    #[serde(default)]
+    pub contributions: Vec<Contribution>,
+    #[serde(default)]
     pub icon: Option<PageIcon>,
     #[serde(default)]
     pub page: Option<ExtensionPage>,
@@ -30,6 +41,8 @@ pub struct SystemPlugin {
     pub settings_schema: SettingsSchema,
     #[serde(default)]
     pub dbus: Option<SystemPluginDBus>,
+    #[serde(default)]
+    pub routes: Vec<ExtensionRoute>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,9 +52,32 @@ pub struct SystemPluginDBus {
     pub interface: String,
     pub get_settings: String,
     pub update_settings: String,
+    #[serde(default)]
+    pub methods: BTreeMap<String, String>,
 }
 
 impl SystemPlugin {
+    pub fn invoke(&self, method: &str, payload: &str) -> Result<String, String> {
+        let endpoint = self
+            .dbus
+            .as_ref()
+            .ok_or("system plugin has no D-Bus endpoint")?;
+        let member = endpoint.methods.get(method).ok_or_else(|| {
+            format!(
+                "system plugin {} does not export method {method:?}",
+                self.id
+            )
+        })?;
+        crate::dbus_client::call_string(
+            &endpoint.bus_name,
+            &endpoint.object_path,
+            &endpoint.interface,
+            member,
+            Some(payload),
+            true,
+        )
+    }
+
     pub fn summary(&self) -> CatalogSummary {
         let running = sandbox::is_active(&self.unit);
         let enabled = sandbox::is_enabled(&self.unit);
@@ -64,9 +100,13 @@ impl SystemPlugin {
             system: true,
             error: String::new(),
             icon,
+            icon_data_url: String::new(),
             has_page: self.page.is_some(),
             has_toolbar: false,
             toolbar: None,
+            has_shell: false,
+            shell: None,
+            toolbox: None,
             has_settings: !self.settings_schema.properties.is_empty(),
             services: vec![CatalogService {
                 id: "main".into(),
@@ -93,6 +133,9 @@ impl SystemPlugin {
             schema.type_name = "object".into();
         }
         Ok(CatalogEntry {
+            permissions: self.permissions.clone(),
+            kernel_modules: self.kernel_modules.clone(),
+            package_dependencies: crate::control::system_plugin_dependencies(&self.id),
             id: self.id.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
@@ -115,7 +158,9 @@ impl SystemPlugin {
             icon: self.icon.clone(),
             page: self.page.clone(),
             toolbar: None,
-            routes: Vec::new(),
+            shell: None,
+            toolbox: None,
+            routes: self.routes.clone(),
             auth_provider: None,
             settings_schema: schema,
             settings,
@@ -218,4 +263,19 @@ pub fn load_system_plugins() -> Result<BTreeMap<String, SystemPlugin>, String> {
         result.insert(registration.id.clone(), registration);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn system_plugins_publish_session_routes_without_changing_legacy_registrations() {
+        let mut value = serde_json::json!({"id":"screen-display", "name":"Screen", "kind":"device", "version":"0.1.0", "unit":"screen.service"});
+        let legacy: SystemPlugin = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.routes.is_empty());
+        value["routes"] = serde_json::json!([{"path":"remote","backend":"unix","socket":"remote.sock","auth":"session"}]);
+        let screen: SystemPlugin = serde_json::from_value(value).unwrap();
+        assert_eq!(screen.routes[0].socket, "remote.sock");
+        assert_eq!(screen.routes[0].auth, "session");
+    }
 }

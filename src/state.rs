@@ -17,6 +17,8 @@ pub struct PluginState {
     pub active_version: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub revision: u64,
+    #[serde(default)]
+    pub lifecycle_revision: u64,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub settings: std::collections::BTreeMap<String, Value>,
 }
@@ -43,10 +45,32 @@ pub fn read_state(id: &str) -> Result<PluginState, String> {
 }
 
 pub fn write_state(id: &str, state: &PluginState) -> Result<(), String> {
-    let data = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+    let previous = read_state(id)?;
+    let mut state = state.clone();
+    state.lifecycle_revision = state.lifecycle_revision.max(previous.lifecycle_revision);
+    if previous.enabled != state.enabled || previous.active_version != state.active_version {
+        state.lifecycle_revision = state.lifecycle_revision.saturating_add(1);
+    }
+    let data = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
     let mut payload = data;
     payload.push(b'\n');
-    sys::atomic_write(&paths::state_path(id), &payload, 0o600)
+    sys::atomic_write(&paths::state_path(id), &payload, 0o600)?;
+    crate::contributions::changed()
+}
+
+pub fn starts_enabled(manifest: &Manifest) -> bool {
+    manifest.default_enabled && manifest.kind != "cloud-provider" && !manifest.is_environment()
+}
+
+// Installed environments provide tools and modules, without an enabled runtime.
+// Preserve configuration when migrating packages that previously used kind=network.
+pub fn normalize_environment(manifest: &Manifest, state: &mut PluginState) -> bool {
+    if !manifest.is_environment() || !state.enabled {
+        return false;
+    }
+    state.enabled = false;
+    state.revision = state.revision.saturating_add(1);
+    true
 }
 
 pub fn initialize_default_enabled_states() -> Result<(), String> {
@@ -62,12 +86,18 @@ pub fn initialize_default_enabled_states() -> Result<(), String> {
             continue;
         }
         if paths::state_path(&id).exists() {
+            let mut state = read_state(&id)?;
+            if let Ok(extension) = load_installed(&id, &state.active_version) {
+                if normalize_environment(&extension.manifest, &mut state) {
+                    write_state(&id, &state)?;
+                }
+            }
             continue;
         }
         let Ok(extension) = load_installed(&id, "") else {
             continue;
         };
-        if !extension.manifest.default_enabled {
+        if !starts_enabled(&extension.manifest) && !extension.manifest.is_environment() {
             continue;
         }
         if crate::host::validate_device_variant(&extension.manifest).is_err() {
@@ -76,12 +106,65 @@ pub fn initialize_default_enabled_states() -> Result<(), String> {
         write_state(
             &id,
             &PluginState {
-                enabled: true,
+                enabled: starts_enabled(&extension.manifest),
                 active_version: extension.manifest.version,
+                lifecycle_revision: 0,
                 revision: 1,
                 settings: std::collections::BTreeMap::new(),
             },
         )?;
+    }
+    disable_conflicting_cloud_provider_states()
+}
+
+fn disable_conflicting_cloud_provider_states() -> Result<(), String> {
+    let entries = match fs::read_dir(paths::CONFIG_ROOT) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    let mut enabled = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+            || !paths::valid_id(id)
+        {
+            continue;
+        }
+        let state = read_state(id)?;
+        if !state.enabled || state.active_version.is_empty() {
+            continue;
+        }
+        let Ok(extension) = load_installed(id, &state.active_version) else {
+            continue;
+        };
+        if extension.manifest.kind == "cloud-provider" {
+            enabled.push((id.to_owned(), state));
+        }
+    }
+    if enabled.len() <= 1 {
+        return Ok(());
+    }
+    enabled.sort_by(|left, right| left.0.cmp(&right.0));
+    eprintln!(
+        "multiple cloud providers were enabled; disabling {} until the user selects one",
+        enabled
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (id, mut state) in enabled {
+        state.enabled = false;
+        state.revision = state.revision.saturating_add(1);
+        write_state(&id, &state)?;
     }
     Ok(())
 }
@@ -152,23 +235,20 @@ fn c_path(path: &Path) -> Result<std::ffi::CString, String> {
     std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| "path contains NUL".into())
 }
 
-pub fn prepare_credential(manifest: &Manifest) -> Result<String, String> {
-    fs::create_dir_all(paths::AUTH_ROOT).map_err(|e| e.to_string())?;
-    let mut random = [0u8; 32];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut file| {
-            use std::io::Read;
-            file.read_exact(&mut random)
-        })
-        .map_err(|_| "read credential entropy".to_string())?;
-    let token = hex(&random);
-    let token_path = Path::new(paths::AUTH_ROOT).join(format!("{}.token", manifest.id));
-    sys::atomic_write(&token_path, format!("{token}\n").as_bytes(), 0o600)?;
-    let authorization = serde_json::json!({
+fn authorization_record(manifest: &Manifest) -> Value {
+    // A legacy service may also expose methods through a command helper. Keep
+    // both identities stable so invoking a method cannot revoke its daemon.
+    serde_json::json!({
         "id": manifest.id,
-        "token": token,
+        "unit": paths::unit_name(&manifest.id),
+        "units": [paths::unit_name(&manifest.id), paths::helper_unit(&manifest.id)],
         "capabilities": manifest.capabilities,
-    });
+    })
+}
+
+pub fn prepare_authorization(manifest: &Manifest) -> Result<(), String> {
+    fs::create_dir_all(paths::AUTH_ROOT).map_err(|e| e.to_string())?;
+    let authorization = authorization_record(manifest);
     let mut body = serde_json::to_vec(&authorization).map_err(|e| e.to_string())?;
     body.push(b'\n');
     sys::atomic_write(
@@ -176,27 +256,37 @@ pub fn prepare_credential(manifest: &Manifest) -> Result<String, String> {
         &body,
         0o600,
     )?;
-    Ok(token_path.to_string_lossy().into_owned())
+    // Retire bearer credentials left by hosts using the previous protocol.
+    let _ = fs::remove_file(Path::new(paths::AUTH_ROOT).join(format!("{}.token", manifest.id)));
+    Ok(())
 }
 
-pub fn remove_credential(id: &str) {
+pub fn remove_authorization(id: &str) {
     let _ = fs::remove_file(Path::new(paths::AUTH_ROOT).join(format!("{id}.token")));
     let _ = fs::remove_file(Path::new(paths::AUTH_ROOT).join(format!("{id}.json")));
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(TABLE[(byte >> 4) as usize] as char);
-        out.push(TABLE[(byte & 0xf) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_keeps_daemon_and_command_helper_identities() {
+        let manifest = Manifest {
+            id: "cloud".into(),
+            capabilities: vec!["auth".into()],
+            ..Manifest::default()
+        };
+        let record = authorization_record(&manifest);
+        assert_eq!(
+            record["units"],
+            serde_json::json!([
+                "onekvm-extension-cloud.service",
+                "onekvm-extension-cloud@helper.service"
+            ])
+        );
+        assert_eq!(record["capabilities"], serde_json::json!(["auth"]));
+    }
 
     fn temporary_directory(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -243,6 +333,43 @@ mod tests {
         .unwrap();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o750);
         fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn cloud_providers_never_start_enabled_by_default() {
+        let mut manifest = Manifest {
+            default_enabled: true,
+            kind: "cloud-provider".into(),
+            ..Manifest::default()
+        };
+        assert!(!starts_enabled(&manifest));
+        manifest.kind = "service".into();
+        assert!(starts_enabled(&manifest));
+        manifest.default_enabled = false;
+        assert!(!starts_enabled(&manifest));
+    }
+
+    #[test]
+    fn environment_upgrade_clears_enabled_without_losing_configuration() {
+        let manifest = Manifest {
+            kind: "environment".into(),
+            ..Manifest::default()
+        };
+        let mut state = PluginState {
+            enabled: true,
+            active_version: "1.0.0".into(),
+            revision: 4,
+            lifecycle_revision: 0,
+            settings: [("interface".into(), serde_json::json!("wg0"))].into(),
+        };
+        assert!(normalize_environment(&manifest, &mut state));
+        assert!(!state.enabled);
+        assert_eq!(state.revision, 5);
+        assert_eq!(state.active_version, "1.0.0");
+        assert_eq!(state.settings["interface"], "wg0");
+        assert!(!normalize_environment(&manifest, &mut state));
+        assert_eq!(state.revision, 5);
+        assert!(!crate::catalog::extension_running("test", &manifest, true));
     }
 }
 

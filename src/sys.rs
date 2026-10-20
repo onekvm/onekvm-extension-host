@@ -63,7 +63,8 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     temporary.file.write_all(data).map_err(|e| e.to_string())?;
     temporary.file.sync_all().map_err(|e| e.to_string())?;
-    fs::rename(&tmp_path, path).map_err(|e| e.to_string())
+    fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
+    File::open(dir).and_then(|file| file.sync_all()).map_err(|e| e.to_string())
 }
 
 struct Temp {

@@ -12,7 +12,15 @@ const MAX_IPK_MEMBER: u64 = 256 << 20;
 const MAX_PREVIEW_ICON: u64 = 1 << 20;
 const MAX_LAYOUT: u64 = 64 * 1024;
 
+// Platform libs plus companion program packages split out of extension recipes
+// (feed install downloads the extension IPK only; opkg still resolves these).
+// `onekvm-kernel-module-*` is allowed the same way: opkg installs the signed
+// module package. An IPKS bundle still inspects any module payload it carries.
 const PLATFORM_DEPENDENCIES: &[&str] = &[
+    "cloudflared",
+    "ddns-go",
+    "easytier",
+    "frpc",
     "kmod",
     "libcrypto3",
     "libgcc1",
@@ -22,10 +30,19 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "libstdc++6",
     "libsystemd0",
     "musl",
+    "netbird",
+    "newt",
+    "npc",
     "onekvm-core",
-    "onekvm-plugin-manager",
+    "onekvm-ui",
     "onekvm-extension-host",
+    "onekvm-plugin-manager",
     "onekvm-samba-runtime",
+    "rathole",
+    "tailscale",
+    "vnt",
+    "wireguard-tools",
+    "zerotier-one",
 ];
 
 #[derive(Debug, Clone)]
@@ -185,12 +202,16 @@ fn validate_dep_name(name: &str) -> Result<(), String> {
     Err(format!("extension package has invalid dependency {name:?}"))
 }
 
+fn feed_dependency_allowed(name: &str) -> bool {
+    PLATFORM_DEPENDENCIES.contains(&name) || name.starts_with("onekvm-kernel-module-")
+}
+
 pub fn validate_package_dependencies(
     dependencies: &[PackageDependency],
     bundled: Option<&BTreeSet<String>>,
 ) -> Result<(), String> {
     for dependency in dependencies {
-        let allowed = PLATFORM_DEPENDENCIES.contains(&dependency.name.as_str())
+        let allowed = feed_dependency_allowed(&dependency.name)
             || bundled.is_some_and(|set| set.contains(&dependency.name));
         if !allowed {
             return Err(format!(
@@ -344,6 +365,17 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
     }
     if let Some(toolbar) = &manifest.toolbar {
         require_regular(&present, &root, &toolbar.entrypoint)?;
+    }
+    if let Some(shell) = &manifest.shell {
+        require_regular(&present, &root, &shell.entrypoint)?;
+    }
+    if let Some(toolbox) = &manifest.toolbox {
+        for item in &toolbox.items {
+            require_regular(&present, &root, &item.view.entrypoint)?;
+            if let Some(crate::manifest::ToolboxIcon::Custom { path }) = &item.icon {
+                require_regular(&present, &root, path)?;
+            }
+        }
     }
     if let Some(icon) = &manifest.icon {
         if icon.source == "custom" {
@@ -521,7 +553,7 @@ pub fn members_from_bytes(data: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, Stri
     Ok(members)
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in data.chunks(3) {
@@ -569,6 +601,19 @@ mod tests {
     #[test]
     fn accepts_sqlite_runtime_dependency() {
         let deps = parse_package_dependencies("libsqlite3-0 (>= 3.51.3)").unwrap();
+        validate_package_dependencies(&deps, None).unwrap();
+    }
+
+    #[test]
+    fn accepts_extension_companion_program_packages() {
+        let deps = parse_package_dependencies("ddns-go, frpc, cloudflared").unwrap();
+        validate_package_dependencies(&deps, None).unwrap();
+    }
+
+    #[test]
+    fn accepts_wireguard_plugin_dependencies() {
+        let deps =
+            parse_package_dependencies("wireguard-tools, onekvm-kernel-module-wireguard").unwrap();
         validate_package_dependencies(&deps, None).unwrap();
     }
 }

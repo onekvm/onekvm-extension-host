@@ -17,6 +17,15 @@
 #define HELPER_PATH "/org/onekvm/ExtensionHelper1"
 #define HELPER_IFACE "org.onekvm.ExtensionHelper1"
 #define CORE_NAME "org.onekvm.Core1"
+#define SYSTEMD_NAME "org.freedesktop.systemd1"
+#define SYSTEMD_PATH "/org/freedesktop/systemd1"
+#define SYSTEMD_MANAGER "org.freedesktop.systemd1.Manager"
+#define SYSTEMD_UNIT "org.freedesktop.systemd1.Unit"
+#define SYSTEMD_NO_SUCH_UNIT "org.freedesktop.systemd1.NoSuchUnit"
+
+#define UNIT_STATUS_ACTIVE  (1u << 0)
+#define UNIT_STATUS_FAILED  (1u << 1)
+#define UNIT_STATUS_ENABLED (1u << 2)
 
 int onekvm_host_apply_config(void *host, const char *id, uint64_t revision,
                              const char *settings, char **keys, size_t nkeys,
@@ -278,6 +287,54 @@ out:
     return result;
 }
 
+static int append_bind_paths_property(sd_bus_message *message, const char *name,
+                                      const char *value) {
+    char *copy = strdup(value ? value : "");
+    if (!copy)
+        return -ENOMEM;
+    int result = sd_bus_message_open_container(message, 'r', "sv");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", name);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'v', "a(ssbt)");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "(ssbt)");
+    if (result < 0)
+        goto out;
+    char *state = NULL;
+    for (char *word = strtok_r(copy, " \t", &state); word;
+         word = strtok_r(NULL, " \t", &state)) {
+        char *destination = strchr(word, ':');
+        const char *source = word;
+        if (destination) {
+            *destination++ = '\0';
+            if (!source[0] || !destination[0] || strchr(destination, ':')) {
+                result = -EINVAL;
+                goto out;
+            }
+        } else {
+            destination = word;
+        }
+        /* (source, destination, ignore_enoent, recursive) */
+        result = sd_bus_message_append(message, "(ssbt)", source, destination, 0, 0);
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+out:
+    free(copy);
+    return result;
+}
+
 static int append_pair_array_property(sd_bus_message *message, const char *name,
                                       const char *first, const char *second) {
     return sd_bus_message_append(message, "(sv)", name, "a(ss)", 1,
@@ -295,7 +352,11 @@ static int append_capabilities(sd_bus_message *message, const char *name,
     for (char *word = strtok_r(copy, " \t", &state); word;
          word = strtok_r(NULL, " \t", &state)) {
         unsigned capability;
-        if (strcmp(word, "CAP_NET_ADMIN") == 0)
+        if (strcmp(word, "CAP_SETGID") == 0)
+            capability = CAP_SETGID;
+        else if (strcmp(word, "CAP_SETUID") == 0)
+            capability = CAP_SETUID;
+        else if (strcmp(word, "CAP_NET_ADMIN") == 0)
             capability = CAP_NET_ADMIN;
         else if (strcmp(word, "CAP_NET_RAW") == 0)
             capability = CAP_NET_RAW;
@@ -346,9 +407,12 @@ static int append_transient_property(sd_bus_message *message,
         result = parse_boolean(value, &boolean);
         if (result >= 0)
             result = sd_bus_message_append(message, "(sv)", name, "b", boolean);
+    } else if (strcmp(name, "BindPaths") == 0 ||
+               strcmp(name, "BindReadOnlyPaths") == 0) {
+        result = append_bind_paths_property(message, name, value);
     } else if (strcmp(name, "ReadOnlyPaths") == 0 ||
                strcmp(name, "ReadWritePaths") == 0 ||
-               strcmp(name, "BindPaths") == 0 ||
+               strcmp(name, "SupplementaryGroups") == 0 ||
                strcmp(name, "SystemCallArchitectures") == 0 ||
                strcmp(name, "BindsTo") == 0 || strcmp(name, "PartOf") == 0 ||
                strcmp(name, "After") == 0) {
@@ -483,17 +547,151 @@ static int wait_for_unit_start(sd_bus *bus, const char *unit) {
     }
 }
 
+static int systemd_error_is_missing(const sd_bus_error *error, int result) {
+    return result == -ENOENT || result == -ENXIO ||
+           sd_bus_error_has_name(error, SYSTEMD_NO_SUCH_UNIT) ||
+           sd_bus_error_has_name(error, SD_BUS_ERROR_UNKNOWN_OBJECT);
+}
+
+static int wait_for_unit_stop(sd_bus *bus, const char *unit) {
+    const uint64_t deadline = now_usec() + 35000000ull;
+    for (;;) {
+        sd_bus_message *reply = NULL;
+        sd_bus_error error = SD_BUS_ERROR_NULL;
+        char *state = NULL;
+        const char *path = NULL;
+        int result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                        SYSTEMD_MANAGER, "GetUnit",
+                                        &error, &reply, "s", unit);
+        if (systemd_error_is_missing(&error, result))
+            result = 0;
+        else {
+            if (result >= 0)
+                result = sd_bus_message_read(reply, "o", &path);
+            if (result >= 0)
+                result = sd_bus_get_property_string(bus, SYSTEMD_NAME, path,
+                                                    SYSTEMD_UNIT, "ActiveState",
+                                                    &error, &state);
+            if (result >= 0 && strcmp(state, "inactive") == 0)
+                result = 0;
+            else if (now_usec() >= deadline)
+                result = -ETIMEDOUT;
+            else
+                result = -EAGAIN;
+        }
+        free(state);
+        sd_bus_error_free(&error);
+        sd_bus_message_unref(reply);
+        if (result != -EAGAIN)
+            return result;
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 25000000 };
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+            ;
+    }
+}
+
+static int append_service_properties(sd_bus_message *message, const char *unit,
+                                     const char *slice, const char *working_directory,
+                                     char **properties, size_t nproperties,
+                                     char **environment, size_t nenv,
+                                     char **command, size_t ncommand) {
+    int result;
+    result = sd_bus_message_append(message, "(sv)", "Description", "s", unit);
+    if (result < 0)
+        return result;
+    if (slice && slice[0]) {
+        result = sd_bus_message_append(message, "(sv)", "Slice", "s", slice);
+        if (result < 0)
+            return result;
+    }
+    for (size_t i = 0; i < nproperties; i++) {
+        result = append_transient_property(message, properties[i]);
+        if (result < 0)
+            return result;
+    }
+    if (working_directory && working_directory[0]) {
+        result = sd_bus_message_append(message, "(sv)", "WorkingDirectory", "s",
+                                       working_directory);
+        if (result < 0)
+            return result;
+    }
+    if (environment && nenv > 0) {
+        result = sd_bus_message_open_container(message, 'r', "sv");
+        if (result < 0)
+            return result;
+        result = sd_bus_message_append(message, "s", "Environment");
+        if (result < 0)
+            return result;
+        result = sd_bus_message_open_container(message, 'v', "as");
+        if (result < 0)
+            return result;
+        result = append_string_array(message, environment, nenv);
+        if (result < 0)
+            return result;
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            return result;
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            return result;
+    }
+    result = sd_bus_message_open_container(message, 'r', "sv");
+    if (result < 0)
+        return result;
+    result = sd_bus_message_append(message, "s", "ExecStart");
+    if (result < 0)
+        return result;
+    result = sd_bus_message_open_container(message, 'v', "a(sasb)");
+    if (result < 0)
+        return result;
+    result = sd_bus_message_open_container(message, 'a', "(sasb)");
+    if (result < 0)
+        return result;
+    result = sd_bus_message_open_container(message, 'r', "sasb");
+    if (result < 0)
+        return result;
+    result = sd_bus_message_append(message, "s", command[0]);
+    if (result < 0)
+        return result;
+    result = append_string_array(message, command, ncommand);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_append(message, "b", 0);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        return result;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        return result;
+    return 0;
+}
+
 int onekvm_start_transient_service(const char *unit, const char *slice,
                                    const char *working_directory,
                                    char **properties, size_t nproperties,
                                    char **environment, size_t nenv,
-                                   char **command, size_t ncommand) {
+                                   char **command, size_t ncommand,
+                                   const char *socket_unit, const char *listen_address) {
+    if (socket_unit && (!socket_unit[0] || !listen_address || !listen_address[0]))
+        return -EINVAL;
     if (!unit || !unit[0] || !command || ncommand == 0 || !command[0] || !command[0][0])
         return -EINVAL;
     sd_bus *bus = NULL;
     sd_bus_message *message = NULL, *reply = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
-    int result = sd_bus_default_system(&bus);
+    /* Private connection: StartTransientUnit is also called from reconcile /
+     * prewarm worker threads while the main host loop owns
+     * sd_bus_default_system(). Sharing that bus from another thread returns
+     * ENXIO and leaves Type=notify stuck until TimeoutStartSec. */
+    int result = sd_bus_open_system(&bus);
     if (result < 0)
         goto out;
     result = sd_bus_message_new_method_call(bus, &message, "org.freedesktop.systemd1",
@@ -502,42 +700,53 @@ int onekvm_start_transient_service(const char *unit, const char *slice,
                                             "StartTransientUnit");
     if (result < 0)
         goto out;
-    result = sd_bus_message_append(message, "ss", unit, "replace");
+    result = sd_bus_message_append(message, "ss", socket_unit ? socket_unit : unit, "replace");
     if (result < 0)
         goto out;
     result = sd_bus_message_open_container(message, 'a', "(sv)");
     if (result < 0)
         goto out;
-    result = sd_bus_message_append(message, "(sv)", "Description", "s", unit);
+    if (socket_unit) {
+        /* Matching .socket/.service names select the auxiliary service.
+         * Service= is not a supported transient socket D-Bus property. */
+        result = sd_bus_message_append(message, "(sv)(sv)(sv)",
+                                       "Description", "s", socket_unit,
+                                       "Accept", "b", 0,
+                                       "CollectMode", "s", "inactive-or-failed");
+        if (result < 0)
+            goto out;
+        result = append_property_strv(message, "BindsTo", "onekvm.service");
+        if (result < 0)
+            goto out;
+        result = append_property_strv(message, "After", "onekvm.service");
+        if (result < 0)
+            goto out;
+        result = append_pair_array_property(message, "Listen", "Stream", listen_address);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_open_container(message, 'a', "(sa(sv))");
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_open_container(message, 'r', "sa(sv)");
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_append(message, "s", unit);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_open_container(message, 'a', "(sv)");
+        if (result < 0)
+            goto out;
+    }
+    result = append_service_properties(message, unit, slice, working_directory,
+                                       properties, nproperties, environment, nenv,
+                                       command, ncommand);
     if (result < 0)
         goto out;
-    if (slice && slice[0]) {
-        result = sd_bus_message_append(message, "(sv)", "Slice", "s", slice);
-        if (result < 0)
-            goto out;
-    }
-    for (size_t i = 0; i < nproperties; i++) {
-        result = append_transient_property(message, properties[i]);
-        if (result < 0)
-            goto out;
-    }
-    if (working_directory && working_directory[0]) {
-        result = sd_bus_message_append(message, "(sv)", "WorkingDirectory", "s",
-                                       working_directory);
-        if (result < 0)
-            goto out;
-    }
-    if (environment && nenv > 0) {
-        result = sd_bus_message_open_container(message, 'r', "sv");
-        if (result < 0)
-            goto out;
-        result = sd_bus_message_append(message, "s", "Environment");
-        if (result < 0)
-            goto out;
-        result = sd_bus_message_open_container(message, 'v', "as");
-        if (result < 0)
-            goto out;
-        result = append_string_array(message, environment, nenv);
+    if (socket_unit) {
+        result = append_property_strv(message, "BindsTo", socket_unit);
         if (result < 0)
             goto out;
         result = sd_bus_message_close_container(message);
@@ -546,53 +755,19 @@ int onekvm_start_transient_service(const char *unit, const char *slice,
         result = sd_bus_message_close_container(message);
         if (result < 0)
             goto out;
+        result = sd_bus_message_close_container(message);
+    } else {
+        result = sd_bus_message_close_container(message);
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_append(message, "a(sa(sv))", 0);
     }
-    result = sd_bus_message_open_container(message, 'r', "sv");
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_append(message, "s", "ExecStart");
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_open_container(message, 'v', "a(sasb)");
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_open_container(message, 'a', "(sasb)");
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_open_container(message, 'r', "sasb");
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_append(message, "s", command[0]);
-    if (result < 0)
-        goto out;
-    result = append_string_array(message, command, ncommand);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_append(message, "b", 0);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_close_container(message);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_close_container(message);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_close_container(message);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_close_container(message);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_close_container(message);
-    if (result < 0)
-        goto out;
-    result = sd_bus_message_append(message, "a(sa(sv))", 0);
     if (result < 0)
         goto out;
     result = sd_bus_call(bus, message, 0, &error, &reply);
     if (result >= 0)
-        result = wait_for_unit_start(bus, unit);
-    else if (result == -EEXIST) {
+        result = wait_for_unit_start(bus, socket_unit ? socket_unit : unit);
+    else if (result == -EEXIST && !socket_unit) {
         /* A just-stopped transient unit can remain loaded until systemd's
          * garbage collector runs. StartTransientUnit still restarts that
          * existing unit before reporting EEXIST; accept it once Type=exec has
@@ -606,7 +781,223 @@ out:
     sd_bus_error_free(&error);
     sd_bus_message_unref(reply);
     sd_bus_message_unref(message);
-    sd_bus_unref(bus);
+    if (bus)
+        sd_bus_flush_close_unref(bus);
+    return result < 0 ? result : 0;
+}
+
+int onekvm_systemd_unit_status(const char *unit) {
+    if (!unit || !unit[0])
+        return -EINVAL;
+    sd_bus *bus = NULL;
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    const char *path = NULL;
+    char *state = NULL;
+    int status = 0;
+    int result = sd_bus_open_system(&bus);
+    if (result < 0)
+        goto out;
+
+    result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                SYSTEMD_MANAGER, "GetUnit",
+                                &error, &reply, "s", unit);
+    if (!systemd_error_is_missing(&error, result)) {
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_read(reply, "o", &path);
+        if (result < 0)
+            goto out;
+        result = sd_bus_get_property_string(bus, SYSTEMD_NAME, path,
+                                            SYSTEMD_UNIT, "ActiveState",
+                                            &error, &state);
+        if (result < 0)
+            goto out;
+        if (strcmp(state, "active") == 0 || strcmp(state, "reloading") == 0)
+            status |= UNIT_STATUS_ACTIVE;
+        if (strcmp(state, "failed") == 0)
+            status |= UNIT_STATUS_FAILED;
+    }
+    free(state);
+    state = NULL;
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    reply = NULL;
+
+    result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                SYSTEMD_MANAGER, "GetUnitFileState",
+                                &error, &reply, "s", unit);
+    if (!systemd_error_is_missing(&error, result)) {
+        if (result < 0)
+            goto out;
+        result = sd_bus_message_read(reply, "s", &path);
+        if (result < 0)
+            goto out;
+        if (strcmp(path, "enabled") == 0 ||
+            strcmp(path, "enabled-runtime") == 0 ||
+            strcmp(path, "static") == 0 || strcmp(path, "indirect") == 0 ||
+            strcmp(path, "generated") == 0 || strcmp(path, "alias") == 0 ||
+            strcmp(path, "linked") == 0 || strcmp(path, "linked-runtime") == 0 ||
+            strcmp(path, "transient") == 0)
+            status |= UNIT_STATUS_ENABLED;
+    }
+    result = status;
+out:
+    free(state);
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    if (bus)
+        sd_bus_flush_close_unref(bus);
+    return result;
+}
+
+int onekvm_systemd_unit_has_dependency(const char *unit, const char *property,
+                                       const char *dependency) {
+    if (!unit || !unit[0] || !property || !property[0] ||
+        !dependency || !dependency[0])
+        return -EINVAL;
+    sd_bus *bus = NULL;
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    const char *path = NULL;
+    char **values = NULL;
+    int result = sd_bus_open_system(&bus);
+    if (result < 0)
+        goto out;
+    result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                SYSTEMD_MANAGER, "GetUnit",
+                                &error, &reply, "s", unit);
+    if (systemd_error_is_missing(&error, result)) {
+        result = 0;
+        goto out;
+    }
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_read(reply, "o", &path);
+    if (result < 0)
+        goto out;
+    result = sd_bus_get_property_strv(bus, SYSTEMD_NAME, path, SYSTEMD_UNIT,
+                                      property, &error, &values);
+    if (result < 0)
+        goto out;
+    result = 0;
+    for (size_t i = 0; values && values[i]; i++) {
+        if (strcmp(values[i], dependency) == 0) {
+            result = 1;
+            break;
+        }
+    }
+out:
+    if (values) {
+        for (size_t i = 0; values[i]; i++)
+            free(values[i]);
+        free(values);
+    }
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    if (bus)
+        sd_bus_flush_close_unref(bus);
+    return result;
+}
+
+static int systemd_unit_file_action(sd_bus *bus, const char *action,
+                                    const char *unit) {
+    sd_bus_message *message = NULL, *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    const char *method = strcmp(action, "enable") == 0
+                             ? "EnableUnitFiles" : "DisableUnitFiles";
+    int result = sd_bus_message_new_method_call(bus, &message, SYSTEMD_NAME,
+                                                SYSTEMD_PATH, SYSTEMD_MANAGER,
+                                                method);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_open_container(message, 'a', "s");
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "s", unit);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_close_container(message);
+    if (result < 0)
+        goto out;
+    result = sd_bus_message_append(message, "b", 0);
+    if (result < 0)
+        goto out;
+    if (strcmp(action, "enable") == 0) {
+        result = sd_bus_message_append(message, "b", 0);
+        if (result < 0)
+            goto out;
+    }
+    result = sd_bus_call(bus, message, 0, &error, &reply);
+    if (result < 0)
+        goto out;
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    reply = NULL;
+    result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                SYSTEMD_MANAGER, "Reload",
+                                &error, &reply, "");
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    sd_bus_message_unref(message);
+    return result < 0 ? result : 0;
+}
+
+int onekvm_systemd_unit_action(const char *action, const char *unit) {
+    if (!action || !unit || !unit[0])
+        return -EINVAL;
+    if (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0) {
+        sd_bus *bus = NULL;
+        int result = sd_bus_open_system(&bus);
+        if (result >= 0)
+            result = systemd_unit_file_action(bus, action, unit);
+        if (bus)
+            sd_bus_flush_close_unref(bus);
+        return result;
+    }
+
+    const char *method = NULL;
+    const char *signature = "ss";
+    if (strcmp(action, "start") == 0)
+        method = "StartUnit";
+    else if (strcmp(action, "stop") == 0)
+        method = "StopUnit";
+    else if (strcmp(action, "restart") == 0)
+        method = "RestartUnit";
+    else if (strcmp(action, "reset-failed") == 0) {
+        method = "ResetFailedUnit";
+        signature = "s";
+    } else
+        return -EINVAL;
+
+    sd_bus *bus = NULL;
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int result = sd_bus_open_system(&bus);
+    if (result < 0)
+        goto out;
+    if (signature[1])
+        result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                    SYSTEMD_MANAGER, method,
+                                    &error, &reply, signature, unit, "replace");
+    else
+        result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                    SYSTEMD_MANAGER, method,
+                                    &error, &reply, signature, unit);
+    if (systemd_error_is_missing(&error, result) &&
+        (strcmp(action, "stop") == 0 || strcmp(action, "reset-failed") == 0))
+        result = 0;
+    if (result >= 0 &&
+        (strcmp(action, "start") == 0 || strcmp(action, "restart") == 0))
+        result = wait_for_unit_start(bus, unit);
+    else if (result >= 0 && strcmp(action, "stop") == 0)
+        result = wait_for_unit_stop(bus, unit);
+out:
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    if (bus)
+        sd_bus_flush_close_unref(bus);
     return result < 0 ? result : 0;
 }
 
@@ -663,11 +1054,20 @@ static int host_reconcile_all(sd_bus_message *message, void *userdata, sd_bus_er
     if (result < 0)
         return result;
     result = onekvm_host_reconcile_all(userdata, generation, &err);
-    if (result != 0)
+    /* Always mark the Type=notify unit ready after the first reconcile attempt.
+     * A single extension failure (e.g. transient unit start) must not leave the
+     * host activating until TimeoutStartSec and block the rest of the system. */
+    int notify = sd_notify(
+        0,
+        result == 0 ? "READY=1\nSTATUS=Extensions reconciled"
+                    : "READY=1\nSTATUS=Extensions reconcile incomplete");
+    if (result != 0) {
+        if (notify < 0 && err == NULL)
+            err = strdup("notify systemd after extension reconcile failed");
         return fail(error, err);
+    }
     free(err);
-    result = sd_notify(0, "READY=1\nSTATUS=Extensions reconciled");
-    if (result < 0)
+    if (notify < 0)
         return fail(error, strdup("notify systemd after extension reconcile failed"));
     return sd_bus_reply_method_return(message, "");
 }
@@ -711,9 +1111,13 @@ static int on_name_owner(sd_bus_message *message, void *userdata, sd_bus_error *
 static const sd_bus_vtable host_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_METHOD("ApplyConfig", "stsas", "", host_apply_config, 0),
+    SD_BUS_METHOD("CaptureTransaction", "st", "", host_simple, 0),
+    SD_BUS_METHOD("RestoreTransaction", "st", "", host_simple, 0),
+    SD_BUS_METHOD("CheckHealth", "st", "", host_simple, 0),
     SD_BUS_METHOD("Enable", "st", "", host_simple, 0),
     SD_BUS_METHOD("Disable", "st", "", host_simple, 0),
     SD_BUS_METHOD("Reconcile", "st", "", host_simple, 0),
+    SD_BUS_METHOD("LoadNetworkModule", "st", "", host_simple, 0),
     SD_BUS_METHOD("Prewarm", "", "", host_prewarm, 0),
     SD_BUS_METHOD("ReconcileAll", "s", "", host_reconcile_all, 0),
     SD_BUS_METHOD("Invoke", "sss", "s", host_invoke, 0),
@@ -1017,12 +1421,13 @@ int onekvm_helper_client_ping(const char *unique, char **id) {
 }
 
 int onekvm_helper_client_run_controller(const char *unique, const void *payload, size_t size,
-                                        void **output, size_t *out_size) {
+                                        void **output, size_t *out_size, char **err) {
     sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    sd_bus_message *message = NULL, *reply = NULL;
     int result = sd_bus_default_system(&bus);
     if (result < 0)
         return result;
-    sd_bus_message *message = NULL;
     result = sd_bus_message_new_method_call(bus, &message, unique, HELPER_PATH, HELPER_IFACE,
                                             "RunController");
     if (result < 0)
@@ -1030,8 +1435,7 @@ int onekvm_helper_client_run_controller(const char *unique, const void *payload,
     result = sd_bus_message_append_array(message, 'y', payload, size);
     if (result < 0)
         goto out;
-    sd_bus_message *reply = NULL;
-    result = sd_bus_call(bus, message, 35000000, NULL, &reply);
+    result = sd_bus_call(bus, message, 35000000, &error, &reply);
     if (result < 0)
         goto out;
     const void *data = NULL;
@@ -1048,8 +1452,11 @@ int onekvm_helper_client_run_controller(const char *unique, const void *payload,
             result = 0;
         }
     }
-    sd_bus_message_unref(reply);
 out:
+    if (result < 0 && err)
+        *err = strdup(sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
     return result;
@@ -1327,6 +1734,9 @@ int onekvm_cli_dbus_call_s(const char *dest, const char *path, const char *iface
         result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
         goto out;
     }
+    /* sd_bus_call returns a positive byte count on success. Callers treat any
+     * non-zero FFI status as failure, so map success to 0. */
+    result = 0;
     if (want_response && response) {
         const char *value = NULL;
         result = sd_bus_message_read(reply, "s", &value);

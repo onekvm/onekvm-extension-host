@@ -86,6 +86,17 @@ pub unsafe extern "C" fn onekvm_host_simple(
     let result = (|| {
         let host = host_ref(host)?;
         let method = cstr(method)?;
+        if method == "LoadNetworkModule" {
+            if revision != 0 {
+                return Err("network module revision must be zero".into());
+            }
+            return crate::network_modules::load(cstr(id)?);
+        }
+        if matches!(method,"CaptureTransaction" | "RestoreTransaction") {
+            if revision != 0 { return Err("transaction revision must be zero".into()); }
+            return crate::transaction::payload_operation(cstr(id)?,method == "CaptureTransaction");
+        }
+        if method == "CheckHealth" { return host::check_health(cstr(id)?,revision); }
         let (event, reason) = match method {
             "Enable" => ("enable", "enable"),
             "Disable" => ("disable", "disable"),

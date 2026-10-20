@@ -1,3 +1,4 @@
 # Development-only x86 feed. Production MACHINE configurations replace this
 # with their HTTPS release origin.
 http://10.0.2.2:8080/
+https://pkg-dev.onekvm.org/

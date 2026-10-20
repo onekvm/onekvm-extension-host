@@ -3,6 +3,5 @@ Description=OneKVM services
 Before=slices.target
 
 [Slice]
-CPUAccounting=yes
 MemoryAccounting=yes
 TasksAccounting=yes
