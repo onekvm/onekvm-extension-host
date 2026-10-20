@@ -25,7 +25,7 @@ busctl call org.onekvm.Core1 \
 
 The extension ID is intentionally not an argument. Core resolves the D-Bus
 sender PID and attributes the event from its
-`onekvm-extension-<id>.service` or `onekvm-extension-<id>-helper.service`
+`onekvm-extension-<id>.service` or `onekvm-extension-<id>@helper.service`
 cgroup below `system-onekvm-extensions.slice`. Calls from outside an extension
 service are rejected, so an extension cannot impersonate another extension in
 the shared log.

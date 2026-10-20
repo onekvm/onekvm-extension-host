@@ -21,14 +21,16 @@ The root package is a normal OneKVM extension IPK. Private userspace dependency
 package names must start with the root package name plus `-` and may only
 install files below the same `/data/onekvm/apps/<id>/<version>` directory.
 
-A bundle may also carry ABI-specific NanoKVM kernel support packages named
+A bundle may also carry ABI-specific kernel support packages named
 `onekvm-kernel-module-*` and, where required by a platform transition,
-`onekvm-kernel-modules-base`. Their payload is restricted to regular `.ko`
-files, optional declarative `modules-load.d` entries, and the kernel's
-dependency metadata below `/usr/lib/modules/<release>`. The host rebuilds
-module dependency metadata after installation and loads declared modules only
-when the extension starts. Kernel modules remain separate IPKs; they are never
-folded into a userspace runtime IPK or the base image.
+`onekvm-kernel-modules-base`. Multi-module packages such as
+`onekvm-kernel-module-ip-tunnels` and `onekvm-kernel-module-wireguard` are
+allowed; their payload is restricted to regular `.ko` files, optional
+declarative `modules-load.d` entries (single-module packages only), and the
+kernel's dependency metadata below `/usr/lib/modules/<release>`. The host
+rebuilds module dependency metadata after installation and loads declared
+modules only when the extension starts. Kernel modules remain separate IPKs;
+they are never folded into a userspace runtime IPK or the base image.
 
 Every package must be reachable from the root package's `Depends` closure.
 Package maintenance scripts, absolute paths, escaping links, unknown

@@ -47,6 +47,22 @@ service is placed directly in `system-onekvm-extensions.slice`, carries the
 extension's aggregate resource limits, and is bound to `onekvm.service`.
 Dispatches after helper startup do not create transient systemd units.
 
+Extensions declaring the explicit `host-root` permission run that helper as
+`root` instead of `onekvm-extension`. The normal filesystem, device,
+namespace, syscall, and resource restrictions remain in force. This permission
+is intended only for narrowly scoped administrative extensions whose own
+runtime drops child processes to a less privileged identity when configured.
+The helper retains `CAP_SETUID` and `CAP_SETGID` for that transition; both are
+cleared from a child after it switches to the unprivileged identity, while
+`RestrictSUIDSGID` continues to prevent creation of SUID/SGID files.
+
+`host-unrestricted` is a separate, high-risk opt-in for a host administration
+surface that must behave exactly like a root login on the device. It runs as
+`root` without the extension filesystem, device, network, namespace,
+capability, syscall, or resource restrictions. The helper remains tied to the
+OneKVM service lifecycle, but its processes otherwise receive the host's normal
+root environment. Existing `host-root` extensions remain sandboxed.
+
 The system D-Bus service `org.onekvm.ExtensionHost1` exports:
 
 - `ApplyConfig(id, revision, settings_json, changed_keys)`
