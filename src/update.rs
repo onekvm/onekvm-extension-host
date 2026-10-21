@@ -1092,8 +1092,11 @@ fn boot() -> Result<Value, String> {
             )?;
         }
         // Overlay the target image's built-in plugins on the copied user plugins.
-        let immutable = Path::new("/rofs/data/onekvm/apps");
-        if immutable.is_dir() {
+        if let Some(immutable) = ["/mnt/.rofs/data/onekvm/apps", "/rofs/data/onekvm/apps"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_dir())
+        {
             copy_tree(immutable, &directory.join("apps"))?;
         }
         write_json(
