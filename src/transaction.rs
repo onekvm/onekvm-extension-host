@@ -411,8 +411,13 @@ pub fn payload_operation(id: &str, capture: bool) -> Result<(), String> {
 }
 
 pub fn failed(snapshot: &Snapshot, error: String) -> Result<(), String> {
+    crate::install::log_install_message(&format!("Installation failed: {error}"));
+    crate::install::log_install_message("Restoring previous extension");
     match snapshot.rollback(true) {
-        Ok(()) => Err(format!("{error}; previous extension restored")),
+        Ok(()) => {
+            crate::install::log_install_message("Previous extension restored");
+            Err(format!("{error}; previous extension restored"))
+        }
         Err(recovery) => Err(format!(
             "{error}; rollback failed: {recovery}; snapshot retained at {}",
             snapshot.directory().display()

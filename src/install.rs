@@ -206,6 +206,8 @@ struct InstallProgress {
     total_bytes: u64,
     message: String,
     error: String,
+    log: String,
+    log_truncated: bool,
 }
 
 impl InstallProgress {
@@ -219,6 +221,8 @@ impl InstallProgress {
             total_bytes: 0,
             message: String::new(),
             error: String::new(),
+            log: String::new(),
+            log_truncated: false,
         }
     }
 }
@@ -239,6 +243,31 @@ fn lock_progress() -> std::sync::MutexGuard<'static, InstallProgress> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+const MAX_INSTALL_LOG_BYTES: usize = 64 * 1024;
+
+fn append_log(progress: &mut InstallProgress, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    progress.log.push_str(text.trim_end_matches(['\r', '\n']));
+    progress.log.push('\n');
+    if progress.log.len() > MAX_INSTALL_LOG_BYTES {
+        let mut start = progress.log.len() - MAX_INSTALL_LOG_BYTES;
+        while !progress.log.is_char_boundary(start) {
+            start += 1;
+        }
+        progress.log.drain(..start);
+        progress.log_truncated = true;
+    }
+}
+
+pub(crate) fn log_install_message(text: &str) {
+    let mut progress = lock_progress();
+    if progress.active {
+        append_log(&mut progress, text);
+    }
+}
+
 fn set_progress(
     phase: &str,
     percent: Option<u8>,
@@ -247,13 +276,17 @@ fn set_progress(
     message: impl Into<String>,
 ) {
     let mut progress = lock_progress();
+    let message = message.into();
+    if !message.is_empty() && (progress.phase != phase || progress.message != message) {
+        append_log(&mut progress, &format!("[{phase}] {message}"));
+    }
     progress.phase = phase.to_owned();
     progress.percent = percent;
     progress.bytes = bytes;
     if total_bytes > 0 {
         progress.total_bytes = total_bytes;
     }
-    progress.message = message.into();
+    progress.message = message;
 }
 
 fn download_percent(bytes: u64, total: u64) -> Option<u8> {
@@ -339,6 +372,8 @@ pub fn install_progress() -> Value {
         "total_bytes": progress.total_bytes,
         "message": progress.message,
         "error": progress.error,
+        "log": progress.log,
+        "log_truncated": progress.log_truncated,
         "status": if progress.phase == "done" {
             "ok"
         } else if progress.phase == "error" {
@@ -390,6 +425,8 @@ fn start_install_job(package_name: &str, size_bytes: u64) -> Result<(), String> 
             total_bytes: size_bytes,
             message: "Refreshing package lists".into(),
             error: String::new(),
+            log: "[prepare] Refreshing package lists\n".into(),
+            log_truncated: false,
         };
     }
     let package = package_name.to_owned();
@@ -399,12 +436,14 @@ fn start_install_job(package_name: &str, size_bytes: u64) -> Result<(), String> 
         progress.active = false;
         match &result {
             Ok(()) => {
+                append_log(&mut progress, "[done] Installation complete");
                 progress.phase = "done".into();
                 progress.percent = Some(100);
                 progress.message.clear();
                 progress.error.clear();
             }
             Err(err) => {
+                append_log(&mut progress, &format!("[error] {err}"));
                 progress.phase = "error".into();
                 progress.error = err.clone();
             }
@@ -456,7 +495,9 @@ fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String
                 size_bytes.max(downloaded),
                 "Download complete",
             );
+            log_install_message("Verifying downloaded package and manifest");
             let info = inspect_cached_extension(&cache, package_name)?;
+            log_install_message("Saving previous extension state");
             let prep = prepare_installed_upgrade(&info)?;
             set_progress(
                 "install",
@@ -468,7 +509,7 @@ fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String
             if let Err(err) =
                 run_opkg_progress(&tmp, &cache, &["install", package_name], "install", 0)
             {
-                return crate::transaction::failed(&prep.snapshot,err);
+                return crate::transaction::failed(&prep.snapshot, err);
             }
             commit_installed_package(&info, prep)
         })();
@@ -498,7 +539,7 @@ fn inspect_cached_extension(cache: &Path, package_name: &str) -> Result<PackageI
     Err(format!("reject extension package: {last_err}"))
 }
 
-fn run_opkg_progress(
+pub(crate) fn run_opkg_progress(
     tmp: &Path,
     cache: &Path,
     args: &[&str],
@@ -565,8 +606,13 @@ fn run_opkg_progress(
     }
     drop(tx);
     let mut installed = 0u32;
+    let mut last_output = String::new();
     let packages = count_ipks(cache).max(1);
     for line in rx {
+        if !line.trim().is_empty() {
+            last_output = line.trim().to_owned();
+        }
+        log_install_message(&line);
         apply_opkg_line(phase, &line, &mut installed, packages, total_bytes);
     }
     for reader in readers {
@@ -580,7 +626,7 @@ fn run_opkg_progress(
     if status.success() {
         Ok(())
     } else {
-        let detail = lock_progress().message.clone();
+        let detail = last_output;
         if detail.is_empty() {
             Err(format!("opkg failed with {}", status.code().unwrap_or(-1)))
         } else {
@@ -645,13 +691,8 @@ fn apply_opkg_line(phase: &str, line: &str, installed: &mut u32, packages: u32, 
                 format!("Downloading {file}"),
             );
         } else {
-            set_progress(
-                "install",
-                lock_progress().percent,
-                bytes,
-                0,
-                format!("Downloading {file}"),
-            );
+            let percent = lock_progress().percent;
+            set_progress(phase, percent, bytes, 0, format!("Downloading {file}"));
         }
         return;
     }
@@ -729,12 +770,16 @@ fn prepare_installed_upgrade(info: &PackageInfo) -> Result<UpgradePrep, String> 
         || crate::sandbox::is_active(&paths::helper_unit(&info.manifest.id));
     let mut snapshot = crate::transaction::Snapshot::begin(&info.manifest.id)?;
     let preparation = (|| {
-        if was_running { lifecycle::disable_unlocked(&info.manifest.id)?; }
+        if was_running {
+            lifecycle::disable_unlocked(&info.manifest.id)?;
+        }
         host::stop_declared_service_units(&info.manifest, false)?;
         host::stop_extension_runtime(&info.manifest.id)?;
         snapshot.capture()
     })();
-    if let Err(error) = preparation { crate::transaction::failed(&snapshot, format!("prepare extension upgrade: {error}"))?; }
+    if let Err(error) = preparation {
+        crate::transaction::failed(&snapshot, format!("prepare extension upgrade: {error}"))?;
+    }
 
     Ok(UpgradePrep {
         snapshot,
@@ -745,22 +790,33 @@ fn prepare_installed_upgrade(info: &PackageInfo) -> Result<UpgradePrep, String> 
 
 fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(), String> {
     let result = (|| {
-        load_installed(&info.manifest.id, &info.manifest.version).map_err(|e| format!("installed extension failed validation: {e}"))?;
-        if !info.manifest.kernel_modules.is_empty() { sys::run(paths::DEPMOD, &["-a".into()])?; }
+        log_install_message("Validating installed extension");
+        load_installed(&info.manifest.id, &info.manifest.version)
+            .map_err(|e| format!("installed extension failed validation: {e}"))?;
+        if !info.manifest.kernel_modules.is_empty() {
+            sys::run(paths::DEPMOD, &["-a".into()])?;
+        }
         let mut state = prep.state.clone();
-        if state.active_version != info.manifest.version { state.active_version = info.manifest.version.clone(); state.revision += 1; }
-        if !prep.state_exists && crate::state::starts_enabled(&info.manifest) { state.enabled = true; }
+        if state.active_version != info.manifest.version {
+            state.active_version = info.manifest.version.clone();
+            state.revision += 1;
+        }
+        if !prep.state_exists && crate::state::starts_enabled(&info.manifest) {
+            state.enabled = true;
+        }
         crate::state::normalize_environment(&info.manifest, &mut state);
         write_state(&info.manifest.id, &state)?;
         if state.enabled {
+            log_install_message("Activating extension");
             lifecycle::enable_unlocked(&info.manifest.id)?;
+            log_install_message("Checking extension startup");
             lifecycle::check_started(&info.manifest.id)?;
         }
         Ok(())
     })();
     match result {
         Ok(()) => prep.snapshot.commit(),
-        Err(error) => crate::transaction::failed(&prep.snapshot,error),
+        Err(error) => crate::transaction::failed(&prep.snapshot, error),
     }
 }
 
@@ -771,7 +827,7 @@ fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf]) -> Resu
         arguments.push(filename.to_string_lossy().into_owned());
     }
     if let Err(err) = sys::opkg(&arguments.iter().map(String::as_str).collect::<Vec<_>>()) {
-        return crate::transaction::failed(&prep.snapshot,err);
+        return crate::transaction::failed(&prep.snapshot, err);
     }
     commit_installed_package(info, prep)
 }
@@ -943,6 +999,25 @@ mod tests {
     use super::{
         download_percent, parse_content_length, parse_output_percent, validate_local_upload_path,
     };
+
+    #[test]
+    fn installation_log_keeps_a_bounded_utf8_tail_and_final_failure() {
+        let mut progress = super::InstallProgress::idle();
+        super::append_log(&mut progress, &"正在下载\n".repeat(10000));
+        super::append_log(
+            &mut progress,
+            "health check failed; previous extension restored",
+        );
+        assert!(progress.log_truncated);
+        assert!(progress.log.len() <= super::MAX_INSTALL_LOG_BYTES);
+        assert!(progress
+            .log
+            .ends_with("health check failed; previous extension restored\n"));
+        assert!(progress.log.contains("正在下载"));
+        let reset = super::InstallProgress::idle();
+        assert!(reset.log.is_empty());
+        assert!(!reset.log_truncated);
+    }
 
     #[test]
     fn purge_cleans_private_directories_without_following_symlinks() {

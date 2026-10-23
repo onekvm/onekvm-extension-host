@@ -92,11 +92,18 @@ pub unsafe extern "C" fn onekvm_host_simple(
             }
             return crate::network_modules::load(cstr(id)?);
         }
-        if matches!(method,"CaptureTransaction" | "RestoreTransaction") {
-            if revision != 0 { return Err("transaction revision must be zero".into()); }
-            return crate::transaction::payload_operation(cstr(id)?,method == "CaptureTransaction");
+        if matches!(method, "CaptureTransaction" | "RestoreTransaction") {
+            if revision != 0 {
+                return Err("transaction revision must be zero".into());
+            }
+            return crate::transaction::payload_operation(
+                cstr(id)?,
+                method == "CaptureTransaction",
+            );
         }
-        if method == "CheckHealth" { return host::check_health(cstr(id)?,revision); }
+        if method == "CheckHealth" {
+            return host::check_health(cstr(id)?, revision);
+        }
         let (event, reason) = match method {
             "Enable" => ("enable", "enable"),
             "Disable" => ("disable", "disable"),

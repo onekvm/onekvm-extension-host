@@ -4,6 +4,7 @@ mod contributions;
 mod control;
 mod dbus_client;
 mod feed;
+mod feed_keys;
 mod ffi;
 mod helper;
 mod helper_client;
@@ -23,8 +24,8 @@ mod settings;
 mod state;
 mod sys;
 mod system_plugin;
-mod update;
 mod transaction;
+mod update;
 
 fn main() {
     let mut arguments = std::env::args();

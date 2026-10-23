@@ -1535,8 +1535,9 @@ int onekvm_helper_client_exec_capture(const char *unique, char **command,
                                       size_t ncommand, char **environment,
                                       size_t nenv, const void *payload,
                                       size_t size, uint32_t timeout,
-                                      void **output, size_t *out_size) {
+                                      void **output, size_t *out_size, char **err) {
     sd_bus *bus = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *message = NULL, *reply = NULL;
     int result = sd_bus_default_system(&bus);
     if (result < 0)
@@ -1557,7 +1558,7 @@ int onekvm_helper_client_exec_capture(const char *unique, char **command,
     result = sd_bus_message_append(message, "u", timeout);
     if (result < 0)
         goto out;
-    result = sd_bus_call(bus, message, (timeout + 2) * 1000000ull, NULL, &reply);
+    result = sd_bus_call(bus, message, (timeout + 2) * 1000000ull, &error, &reply);
     if (result < 0)
         goto out;
     const void *data = NULL;
@@ -1575,6 +1576,9 @@ int onekvm_helper_client_exec_capture(const char *unique, char **command,
         }
     }
 out:
+    if (result < 0 && err)
+        *err = strdup(sd_bus_error_is_set(&error) ? error.message : strerror(-result));
+    sd_bus_error_free(&error);
     sd_bus_message_unref(reply);
     sd_bus_message_unref(message);
     sd_bus_unref(bus);

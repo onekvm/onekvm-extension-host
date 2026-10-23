@@ -48,6 +48,7 @@ extern "C" {
         timeout: u32,
         output: *mut *mut c_void,
         out_size: *mut usize,
+        err: *mut *mut c_char,
     ) -> c_int;
 }
 
@@ -222,6 +223,7 @@ pub fn exec_capture(
     let mut environment = CStrings::from_values(environment)?;
     let mut output = std::ptr::null_mut();
     let mut size = 0usize;
+    let mut error = std::ptr::null_mut();
     let status = unsafe {
         onekvm_helper_client_exec_capture(
             unique.as_ptr(),
@@ -234,10 +236,15 @@ pub fn exec_capture(
             timeout,
             &mut output,
             &mut size,
+            &mut error,
         )
     };
     if status != 0 {
-        return Err(fail(status, "ExecCapture"));
+        return Err(if error.is_null() {
+            fail(status, "ExecCapture")
+        } else {
+            unsafe { take_string(error) }
+        });
     }
     let slice = unsafe { std::slice::from_raw_parts(output as *const u8, size) };
     let data = slice.to_vec();

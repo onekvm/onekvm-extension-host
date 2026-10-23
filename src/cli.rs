@@ -76,8 +76,19 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
     if !COMMANDS.contains(&args[0].as_str()) {
         return Err(format!("unknown command {:?}\n{}", args[0], usage(argv0)).into());
     }
-    sys::with_lock(|| { crate::transaction::recover_all(true)?; lifecycle::migrate_legacy_layout() })
+    // The installer holds this lock until completion. Progress only reads the
+    // host's in-memory snapshot and must stay available while that job runs.
+    let progress_query = args.len() == 3
+        && args[0] == "invoke"
+        && args[1] == "plugin-marketplace"
+        && args[2] == "install_progress";
+    if !progress_query {
+        sys::with_lock(|| {
+            crate::transaction::recover_all(true)?;
+            lifecycle::migrate_legacy_layout()
+        })
         .map_err(|err| format!("migrate extension configuration: {err}"))?;
+    }
     match args[0].as_str() {
         "load-network-module" => {
             require_len(args, 2, "load-network-module requires <module>")?;
@@ -98,7 +109,9 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
         "detail" => {
             write_json(&catalog::detail(&one_id(args)?)?)?;
         }
-        "health" => { crate::lifecycle::check_started(&one_id(args)?)?; }
+        "health" => {
+            crate::lifecycle::check_started(&one_id(args)?)?;
+        }
         "status" => {
             write_json(&lifecycle::status(&one_id(args)?)?)?;
         }

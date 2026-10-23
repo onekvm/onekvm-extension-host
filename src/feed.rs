@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::control::parse_control;
+use crate::feed_keys::{self, SourceKey};
 use crate::manifest::{decode_manifest, Manifest};
 use crate::paths;
 use crate::sys;
@@ -21,6 +22,8 @@ pub struct FeedSource {
     pub name: String,
     pub path: String,
     pub feeds_text: String,
+    pub public_key: String,
+    pub key_fingerprint: String,
     pub builtin: bool,
     pub enabled: bool,
 }
@@ -36,6 +39,7 @@ struct ConfiguredUrl {
 struct FeedPolicy {
     metadata_list: String,
     package_lists: Vec<String>,
+    keys: Vec<SourceKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,17 +56,15 @@ pub fn available_extensions() -> BTreeMap<String, AvailableExtension> {
     let Ok(policy) = load_feed_policy(paths::TRUSTED_FEEDS) else {
         return BTreeMap::new();
     };
-    if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now()).is_err()
-    {
+    if validate_policy_freshness(&policy).is_err() {
         let err = crate::sys::with_lock(|| {
-            if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())
-                .is_ok()
-            {
+            if validate_policy_freshness(&policy).is_ok() {
                 return Ok(());
             }
+            feed_keys::prepare_keyring(&policy.keys)?;
             sys::opkg(&["update"])?;
             relax_opkg_list_permissions();
-            validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())
+            validate_policy_freshness(&policy)
         });
         if err.is_err() {
             return BTreeMap::new();
@@ -205,20 +207,54 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn refresh() -> Result<(), String> {
+    refresh_using(|| sys::opkg(&["update"]))
+}
+
+fn refresh_using(update: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
-    sys::opkg(&["update"]).map_err(|err| format!("signed feed update failed: {err}"))?;
+    feed_keys::prepare_keyring(&policy.keys)?;
+    update().map_err(|err| format!("signed feed update failed: {err}"))?;
     relax_opkg_list_permissions();
-    validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())
-        .map_err(|err| format!("reject package feed: {err}"))
+    validate_policy_freshness(&policy).map_err(|err| format!("reject package feed: {err}"))
 }
 
 pub fn refresh_if_stale() -> Result<(), String> {
     let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
-    if validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now()).is_ok()
-    {
+    if validate_policy_freshness(&policy).is_ok() {
         return Ok(());
     }
-    refresh()
+    refresh_using(|| {
+        crate::install::run_opkg_progress(
+            Path::new(paths::OPKG_TMP),
+            Path::new(paths::OPKG_CACHE),
+            &["update"],
+            "prepare",
+            0,
+        )
+    })
+}
+
+fn validate_policy_freshness(policy: &FeedPolicy) -> Result<(), String> {
+    if !policy.metadata_list.is_empty() {
+        validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())?;
+    }
+    // External opkg feeds need not publish OneKVM's expiration package. Refresh
+    // their signed indexes at least every 15 minutes, and reject missing lists.
+    for name in &policy.package_lists {
+        let modified = fs::metadata(Path::new(paths::OPKG_LISTS).join(name))
+            .and_then(|info| info.modified())
+            .map_err(|_| format!("missing feed index {name}"))?;
+        if !policy.keys.is_empty()
+            && modified
+                .elapsed()
+                .map_err(|_| "feed index timestamp is in the future")?
+                .as_secs()
+                >= 900
+        {
+            return Err(format!("feed index {name} needs refreshing"));
+        }
+    }
+    Ok(())
 }
 
 fn relax_opkg_list_permissions() {
@@ -316,46 +352,73 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Result<i64, String> {
 }
 
 fn load_feed_policy(trusted_name: &str) -> Result<FeedPolicy, String> {
+    load_feed_policy_at(trusted_name, &paths::feed_config_paths())
+}
+
+fn load_feed_policy_at(trusted_name: &str, config_paths: &[PathBuf]) -> Result<FeedPolicy, String> {
     let prefixes = read_configured_urls(Path::new(trusted_name), false)?;
-    if prefixes.is_empty() {
-        return Err("no trusted feed prefixes are configured".into());
-    }
-    let feeds = read_feed_config_urls()?;
-    if feeds.is_empty() {
-        return Err("no package feed is configured".into());
-    }
     let mut policy = FeedPolicy {
         metadata_list: String::new(),
         package_lists: Vec::new(),
+        keys: Vec::new(),
     };
-    for feed in feeds {
-        if !prefixes.iter().any(|prefix| same_url_prefix(prefix, &feed)) {
-            return Err(format!(
-                "feed URL {}://{}{} is not trusted",
-                feed.scheme, feed.host, feed.path
-            ));
-        }
-        if feed.name == "onekvm-metadata" {
-            if !policy.metadata_list.is_empty() {
-                return Err("multiple onekvm-metadata feeds are configured".into());
-            }
-            policy.metadata_list = feed.name;
+    let mut names = std::collections::BTreeSet::new();
+    let mut has_distribution_feed = false;
+    for path in config_paths {
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let key = if feed_keys::root_owned_source(&path) {
+            feed_keys::read_headers(&raw)
         } else {
-            policy.package_lists.push(feed.name);
+            SourceKey::default()
+        };
+        let custom_trusted = !key.public_key.is_empty()
+            && !key.fingerprint.is_empty()
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with(paths::FEED_CUSTOM_PREFIX));
+        let feeds = read_configured_urls(&path, true)?;
+        for feed in feeds {
+            let distribution = prefixes.iter().any(|prefix| same_url_prefix(prefix, &feed));
+            validate_source_trust(&feed, distribution, custom_trusted)?;
+            has_distribution_feed |= distribution;
+            if !names.insert(feed.name.clone()) {
+                return Err(format!("duplicate feed name {}", feed.name));
+            }
+            if feed.name == "onekvm-metadata" {
+                policy.metadata_list = feed.name;
+            } else {
+                policy.package_lists.push(feed.name);
+            }
+        }
+        if custom_trusted {
+            policy.keys.push(key);
         }
     }
-    if policy.metadata_list.is_empty() {
+    if names.is_empty() {
+        return Err("no package feed is configured".into());
+    }
+    if has_distribution_feed && policy.metadata_list.is_empty() {
         return Err("signed onekvm-metadata feed is required".into());
     }
     Ok(policy)
 }
 
-fn read_feed_config_urls() -> Result<Vec<ConfiguredUrl>, String> {
-    let mut values = Vec::new();
-    for path in paths::feed_config_paths() {
-        values.extend(read_configured_urls(&path, true)?);
+fn validate_source_trust(
+    feed: &ConfiguredUrl,
+    distribution: bool,
+    custom_trusted: bool,
+) -> Result<(), String> {
+    if !distribution && !custom_trusted {
+        return Err(format!(
+            "feed URL {}://{}{} is not trusted; configure its signing public key",
+            feed.scheme, feed.host, feed.path
+        ));
     }
-    Ok(values)
+    if feed.name == "onekvm-metadata" && !distribution {
+        return Err("onekvm-metadata is reserved for distribution feeds".into());
+    }
+    Ok(())
 }
 
 fn read_configured_urls(filename: &Path, feed_syntax: bool) -> Result<Vec<ConfiguredUrl>, String> {
@@ -378,6 +441,9 @@ fn read_configured_urls(filename: &Path, feed_syntax: bool) -> Result<Vec<Config
         } else {
             (String::new(), line.to_owned())
         };
+        if feed_syntax && !valid_feed_list_name(&name) {
+            return Err("invalid feed name".into());
+        }
         values.push(parse_url(&name, &value)?);
     }
     Ok(values)
@@ -453,6 +519,9 @@ fn parse_source_metadata(text: &str) -> (Option<String>, Option<String>, String)
     let mut rest = String::new();
     let mut in_header = true;
     for line in text.lines() {
+        if feed_keys::is_key_header(line) {
+            continue;
+        }
         if in_header {
             let trimmed = line.trim();
             if let Some(value) = trimmed.strip_prefix(SOURCE_KEY_PREFIX) {
@@ -507,10 +576,17 @@ fn read_source_file(
                     name: String::new(),
                     path: listed_path.to_string_lossy().into_owned(),
                     feeds_text: raw,
+                    public_key: String::new(),
+                    key_fingerprint: String::new(),
                     builtin,
                     enabled,
                 }));
             }
+            let key_info = if feed_keys::root_owned_source(file) {
+                feed_keys::read_headers(&raw)
+            } else {
+                SourceKey::default()
+            };
             let (_, display, feeds_text) = parse_source_metadata(&raw);
             let name = display
                 .filter(|value| valid_feed_source_display_name(value).is_ok())
@@ -520,6 +596,8 @@ fn read_source_file(
                 name,
                 path: listed_path.to_string_lossy().into_owned(),
                 feeds_text,
+                public_key: key_info.public_key,
+                key_fingerprint: key_info.fingerprint,
                 builtin,
                 enabled,
             }))
@@ -625,40 +703,128 @@ fn set_path_enabled(active: &Path, enabled: bool) -> Result<(), String> {
 }
 
 pub fn set_builtin_source_enabled(enabled: bool) -> Result<(), String> {
-    set_path_enabled(Path::new(paths::FEED_CONFIG), enabled)
+    sys::with_lock(|| {
+        invalidate_feed_lists()?;
+        set_path_enabled(Path::new(paths::FEED_CONFIG), enabled)
+    })
 }
 
 pub fn set_custom_source_enabled(name: &str, enabled: bool) -> Result<(), String> {
-    set_path_enabled(&custom_feed_path(name)?, enabled)
+    sys::with_lock(|| {
+        invalidate_feed_lists()?;
+        set_path_enabled(&custom_feed_path(name)?, enabled)
+    })
 }
 
-pub fn set_custom_source(key: &str, name: &str, feeds_text: &str) -> Result<(), String> {
+pub fn set_custom_source(
+    key: &str,
+    name: &str,
+    feeds_text: &str,
+    public_key: Option<&str>,
+) -> Result<(), String> {
     let name = name.trim();
     valid_feed_source_display_name(name)?;
     let path = custom_feed_path(key)?;
     let (_, _, stripped) = parse_source_metadata(feeds_text);
     validate_custom_feed_text(&stripped)?;
-    let encoded = encode_source_file(key, name, &stripped);
-    sys::atomic_write(&path, encoded.as_bytes(), 0o644)?;
-    let disabled = paths::disabled_feed_path(&path);
-    if disabled.is_file() {
-        fs::remove_file(&disabled)
-            .map_err(|err| format!("remove {}: {err}", disabled.display()))?;
+    sys::with_lock(|| {
+        let existing = list_feed_sources()?
+            .into_iter()
+            .find(|source| !source.builtin && source.key == key);
+        let public_key = public_key
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|s| s.public_key.as_str())
+                    .unwrap_or_default()
+            })
+            .trim();
+        let signing_key = if public_key.is_empty() {
+            SourceKey::default()
+        } else {
+            feed_keys::validate(public_key)?
+        };
+        let prefixes = read_configured_urls(Path::new(paths::TRUSTED_FEEDS), false)?;
+        let mut names = std::collections::BTreeSet::new();
+        for line in stripped
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+        {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let feed = parse_url(fields[1], fields[2])?;
+            validate_source_trust(
+                &feed,
+                prefixes.iter().any(|p| same_url_prefix(p, &feed)),
+                !signing_key.public_key.is_empty(),
+            )?;
+            if !names.insert(feed.name.clone()) {
+                return Err(format!("duplicate feed name {}", feed.name));
+            }
+        }
+        for other in list_feed_sources()?
+            .iter()
+            .filter(|s| s.enabled && (s.builtin || s.key != key))
+        {
+            for line in other
+                .feeds_text
+                .lines()
+                .filter(|l| !l.trim().starts_with('#'))
+            {
+                if let Some(name) = line.split_whitespace().nth(1) {
+                    if names.contains(name) {
+                        return Err(format!("feed name {name} is already in use"));
+                    }
+                }
+            }
+        }
+        let encoded = format!(
+            "{}{}",
+            feed_keys::encode_headers(&signing_key),
+            encode_source_file(key, name, &stripped)
+        );
+        // Reject invalid keys/configuration before touching either the source or
+        // indexes. A changed trust anchor must never reuse an old signed list.
+        invalidate_feed_lists()?;
+        if existing.as_ref().is_some_and(|source| !source.enabled) {
+            sys::atomic_write(&paths::disabled_feed_path(&path), encoded.as_bytes(), 0o644)?;
+            remove_if_present(&path)
+        } else {
+            sys::atomic_write(&path, encoded.as_bytes(), 0o644)?;
+            remove_if_present(&paths::disabled_feed_path(&path))
+        }
+    })
+}
+
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("unlink {}: {err}", path.display())),
+    }
+}
+
+fn invalidate_feed_lists() -> Result<(), String> {
+    let entries = match fs::read_dir(paths::OPKG_LISTS) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("read feed indexes: {err}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_file() {
+            remove_if_present(&entry.path())?;
+        }
     }
     Ok(())
 }
 
 pub fn remove_custom_source(name: &str) -> Result<(), String> {
     let path = custom_feed_path(name)?;
-    let disabled = paths::disabled_feed_path(&path);
-    for candidate in [&path, &disabled] {
-        match fs::remove_file(candidate) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("unlink {}: {err}", candidate.display())),
-        }
-    }
-    Ok(())
+    sys::with_lock(|| {
+        invalidate_feed_lists()?;
+        remove_if_present(&path)?;
+        remove_if_present(&paths::disabled_feed_path(&path))
+    })
 }
 
 pub fn validate_custom_feed_text(text: &str) -> Result<(), String> {
@@ -684,7 +850,7 @@ pub fn validate_custom_feed_text(text: &str) -> Result<(), String> {
             return Err("feed kind must be src or src/gz".into());
         }
         let name = fields[1];
-        if name.contains('/') || name.starts_with('.') {
+        if !valid_feed_list_name(name) {
             return Err("invalid feed name".into());
         }
         parse_url(name, fields[2])?;
@@ -694,6 +860,15 @@ pub fn validate_custom_feed_text(text: &str) -> Result<(), String> {
         return Err("source must contain at least one src/gz line".into());
     }
     Ok(())
+}
+
+fn valid_feed_list_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 fn same_url_prefix(prefix: &ConfiguredUrl, feed: &ConfiguredUrl) -> bool {
@@ -717,14 +892,76 @@ fn same_url_prefix(prefix: &ConfiguredUrl, feed: &ConfiguredUrl) -> bool {
 mod tests {
     use super::{
         custom_feed_path, encode_source_file, icon_data_url_from_package_fields,
-        manifest_from_package_fields, parse_source_metadata, set_path_enabled,
-        valid_feed_source_display_name, valid_icon_data_url, validate_custom_feed_text,
+        load_feed_policy_at, manifest_from_package_fields, parse_source_metadata, parse_url,
+        set_path_enabled, valid_feed_source_display_name, valid_icon_data_url,
+        validate_custom_feed_text, validate_source_trust, SourceKey,
     };
-    use crate::paths;
+    use crate::{feed_keys, paths};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn external_sources_require_explicit_trust_and_cannot_replace_metadata() {
+        let external = parse_url("thirdparty", "https://external.invalid/feed").unwrap();
+        assert!(validate_source_trust(&external, false, false).is_err());
+        assert!(validate_source_trust(&external, false, true).is_ok());
+        assert!(validate_source_trust(&external, true, false).is_ok());
+        let metadata = parse_url("onekvm-metadata", "https://external.invalid/meta").unwrap();
+        assert!(validate_source_trust(&metadata, false, true).is_err());
+        assert!(validate_source_trust(&metadata, true, false).is_ok());
+    }
+
+    #[test]
+    fn distribution_feeds_keep_metadata_requirement_and_reject_duplicate_names() {
+        let root = unique_temp_dir();
+        let trusted = root.join("prefixes");
+        let config = root.join("onekvm-ext-mirror.conf");
+        fs::write(&trusted, "https://official.invalid/feeds\n").unwrap();
+        let prefix = trusted.to_str().unwrap();
+        fs::write(
+            &config,
+            "src packages https://official.invalid/feeds/main\n",
+        )
+        .unwrap();
+        assert!(load_feed_policy_at(prefix, &[config.clone()])
+            .err()
+            .unwrap()
+            .contains("metadata"));
+        fs::write(&config, "src onekvm-metadata https://official.invalid/feeds/meta\nsrc packages https://official.invalid/feeds/main\n").unwrap();
+        assert!(load_feed_policy_at(prefix, &[config.clone()]).is_ok());
+        assert!(
+            load_feed_policy_at(prefix, &[config.clone(), config.clone()])
+                .err()
+                .unwrap()
+                .contains("duplicate")
+        );
+        fs::write(
+            &config,
+            "src ../escape https://official.invalid/feeds/main\n",
+        )
+        .unwrap();
+        assert!(load_feed_policy_at(prefix, &[config]).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn public_key_headers_never_leak_into_editable_feed_text() {
+        let key = SourceKey { public_key: "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nexample\n-----END PGP PUBLIC KEY BLOCK-----\n".into(), fingerprint: "A".repeat(40) };
+        let raw = format!(
+            "{}{}",
+            feed_keys::encode_headers(&key),
+            encode_source_file("mirror", "Mirror", "src feed https://example.org/feed")
+        );
+        let (id, name, feeds) = parse_source_metadata(&raw);
+        assert_eq!(id.as_deref(), Some("mirror"));
+        assert_eq!(name.as_deref(), Some("Mirror"));
+        assert_eq!(feeds, "src feed https://example.org/feed\n");
+        assert_eq!(feed_keys::read_headers(&raw), key);
+        // Pasting an old config cannot smuggle a different trust anchor into a save.
+        assert!(!encode_source_file("mirror", "Mirror", &raw).contains("Public-Key"));
+    }
 
     #[test]
     fn feed_manifest_must_match_package_identity() {

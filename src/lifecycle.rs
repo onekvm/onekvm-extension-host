@@ -164,17 +164,23 @@ pub fn validate(id: &str, version: &str) -> Result<String, String> {
 pub fn check_started(id: &str) -> Result<(), String> {
     let state = read_state(id)?;
     let extension = load_installed(id, &state.active_version)?;
-    if !state.enabled || extension.manifest.is_environment() { return Ok(()); }
+    if !state.enabled || extension.manifest.is_environment() {
+        return Ok(());
+    }
     std::thread::sleep(std::time::Duration::from_millis(300));
-    if !extension_running(id, &extension.manifest, state.enabled) { return Err(format!("extension {id} failed its startup health check")); }
-    crate::dbus_client::health(id,state.revision)
+    if !extension_running(id, &extension.manifest, state.enabled) {
+        return Err(format!("extension {id} failed its startup health check"));
+    }
+    crate::dbus_client::health(id, state.revision)
 }
 
 pub fn activate(id: &str, version: &str) -> Result<(), String> {
     sys::with_lock(|| {
-        let extension = load_installed(id,version)?;
+        let extension = load_installed(id, version)?;
         let mut state = read_state(id)?;
-        if state.active_version == extension.manifest.version { return Ok(()); }
+        if state.active_version == extension.manifest.version {
+            return Ok(());
+        }
         let mut snapshot = crate::transaction::Snapshot::begin(id)?;
         let result = (|| {
             disable_unlocked(id)?;
@@ -183,13 +189,16 @@ pub fn activate(id: &str, version: &str) -> Result<(), String> {
             state.active_version = extension.manifest.version.clone();
             state.revision += 1;
             crate::state::normalize_environment(&extension.manifest, &mut state);
-            write_state(id,&state)?;
-            if state.enabled { enable_unlocked(id)?; check_started(id)?; }
+            write_state(id, &state)?;
+            if state.enabled {
+                enable_unlocked(id)?;
+                check_started(id)?;
+            }
             Ok(())
         })();
         match result {
             Ok(()) => snapshot.commit(),
-            Err(error) => crate::transaction::failed(&snapshot,error),
+            Err(error) => crate::transaction::failed(&snapshot, error),
         }
     })
 }
@@ -233,8 +242,12 @@ pub fn enable_unlocked(id: &str) -> Result<(), String> {
             let stop = host::stop_extension_runtime(id);
             let mut restored = original;
             restored.revision = state.revision.saturating_add(1);
-            write_state(id,&restored)?;
-            if let Err(stop_error) = stop { return Err(format!("{error}; cleanup after failed enable: {stop_error}")); }
+            write_state(id, &restored)?;
+            if let Err(stop_error) = stop {
+                return Err(format!(
+                    "{error}; cleanup after failed enable: {stop_error}"
+                ));
+            }
         }
         return Err(error);
     }
@@ -257,7 +270,7 @@ pub fn disable_unlocked(id: &str) -> Result<(), String> {
     if let Err(error) = result {
         state.enabled = true;
         state.revision = state.revision.saturating_add(1);
-        write_state(id,&state)?;
+        write_state(id, &state)?;
         return Err(error);
     }
     crate::contributions::changed()

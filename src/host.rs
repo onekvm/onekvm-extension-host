@@ -170,6 +170,15 @@ fn apply_command_method(
             "list_sources" => {
                 return Ok(marketplace_list_sources()?);
             }
+            "inspect_source_key" => {
+                let public_key = request
+                    .as_ref()
+                    .and_then(|v| v.get("public_key"))
+                    .and_then(Value::as_str)
+                    .ok_or("public_key is required")?;
+                let key = crate::feed_keys::validate(public_key)?;
+                return Ok(json!({"fingerprint": key.fingerprint}));
+            }
             "set_source" => {
                 marketplace_set_source(request.as_ref())?;
                 return Ok(json!({"status": "ok"}));
@@ -254,21 +263,38 @@ fn apply_command_method(
 
 pub fn check_health(id: &str, revision: u64) -> Result<(), String> {
     let state = read_state(id)?;
-    if state.revision != revision { return Err("extension changed during health check".into()); }
-    let extension = load_installed(id,&state.active_version)?;
+    if state.revision != revision {
+        return Err("extension changed during health check".into());
+    }
+    let extension = load_installed(id, &state.active_version)?;
     let health = &extension.manifest.healthcheck;
-    if health.type_name.is_empty() { return Ok(()); }
-    if health.type_name != "exec" || health.command.is_empty() { return Err("unsupported extension health check".into()); }
-    if !state.enabled { return Err("health check requires an enabled extension".into()); }
-    validate_command(&extension,&health.command)?;
+    if health.type_name.is_empty() {
+        return Ok(());
+    }
+    if health.type_name != "exec" || health.command.is_empty() {
+        return Err("unsupported extension health check".into());
+    }
+    if !state.enabled {
+        return Err("health check requires an enabled extension".into());
+    }
+    validate_command(&extension, &health.command)?;
     prepare_runtime_dirs(id)?;
-    write_runtime_settings(id,&settings_for_state(&extension,&state)?)?;
-    let timeout = health.timeout_seconds.clamp(1,30);
-    let temporary = ensure_helper(&extension,Some((&health.command,timeout)))?;
+    write_runtime_settings(id, &settings_for_state(&extension, &state)?)?;
+    let timeout = health.timeout_seconds.clamp(1, 30);
+    let temporary = ensure_helper(&extension, Some((&health.command, timeout)))?;
     let mut command = health.command.clone();
-    command[0] = extension.root.join(&command[0]).to_string_lossy().into_owned();
-    let result = crate::helper_client::exec_capture(id,&command,&[],b"",timeout as u32).map(|_| ());
-    let cleanup = if temporary && extension.manifest.controller.is_none() { stop_helper(id) } else { Ok(()) };
+    command[0] = extension
+        .root
+        .join(&command[0])
+        .to_string_lossy()
+        .into_owned();
+    let result =
+        crate::helper_client::exec_capture(id, &command, &[], b"", timeout as u32).map(|_| ());
+    let cleanup = if temporary && extension.manifest.controller.is_none() {
+        stop_helper(id)
+    } else {
+        Ok(())
+    };
     result.and(cleanup)
 }
 
@@ -281,6 +307,8 @@ fn marketplace_list_sources() -> Result<Value, String> {
                 "name": source.name,
                 "path": source.path,
                 "feeds_text": source.feeds_text,
+                "public_key": source.public_key,
+                "key_fingerprint": source.key_fingerprint,
                 "builtin": source.builtin,
                 "enabled": source.enabled,
             })
@@ -331,7 +359,15 @@ fn marketplace_set_source(request: Option<&Value>) -> Result<(), String> {
         .get("feeds_text")
         .and_then(Value::as_str)
         .ok_or_else(|| "key, name, and feeds_text are required".to_string())?;
-    crate::feed::set_custom_source(key, name, feeds_text)
+    let public_key = object
+        .get("public_key")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "public_key must be a string".to_string())
+        })
+        .transpose()?;
+    crate::feed::set_custom_source(key, name, feeds_text, public_key)
 }
 
 fn marketplace_set_source_enabled(request: Option<&Value>) -> Result<(), String> {

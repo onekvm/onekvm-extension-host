@@ -74,10 +74,13 @@ pub fn load_network_module(module: &str) -> Result<(), String> {
     host_simple("LoadNetworkModule", module, 0)
 }
 
+pub fn health(id: &str, revision: u64) -> Result<(), String> {
+    host_simple("CheckHealth", id, revision)
+}
 
-pub fn health(id: &str, revision: u64) -> Result<(),String> { host_simple("CheckHealth",id,revision) }
-
-pub fn transaction(operation: &str,id: &str) -> Result<(),String> { host_simple(operation,id,0) }
+pub fn transaction(operation: &str, id: &str) -> Result<(), String> {
+    host_simple(operation, id, 0)
+}
 
 fn host_simple(method: &str, id: &str, revision: u64) -> Result<(), String> {
     let method = c_string(method)?;

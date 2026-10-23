@@ -752,12 +752,7 @@ fn fingerprint_path(hash: &mut Sha256, path: &Path) -> Result<(), String> {
 fn read_cache(path: &Path, fingerprint: &str) -> Option<Vec<CatalogSummary>> {
     // Service readiness can change without modifying a manifest or settings.
     // Expire on demand; an idle system does not need a polling task.
-    let age = fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .elapsed()
-        .ok()?;
+    let age = fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()?;
     if age >= CATALOG_RUNTIME_TTL {
         return None;
     }
@@ -793,20 +788,28 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "onekvm-catalog-cache-{}-{}.json",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let payload = serde_json::to_vec(&CatalogDiskCache {
             version: CATALOG_CACHE_VERSION,
             fingerprint: "installed".into(),
             entries: Vec::new(),
-        }).unwrap();
+        })
+        .unwrap();
         fs::write(&path, payload).unwrap();
         assert!(read_cache(&path, "installed").is_some());
         assert!(read_cache(&path, "changed").is_none());
         let file = fs::File::options().write(true).open(&path).unwrap();
-        file.set_modified(std::time::SystemTime::now() - CATALOG_RUNTIME_TTL - Duration::from_secs(1)).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now() - CATALOG_RUNTIME_TTL - Duration::from_secs(1),
+        )
+        .unwrap();
         assert!(read_cache(&path, "installed").is_none());
-        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(30)).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(30))
+            .unwrap();
         assert!(read_cache(&path, "installed").is_none());
         fs::remove_file(path).unwrap();
     }

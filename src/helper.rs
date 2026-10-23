@@ -1130,6 +1130,22 @@ mod tests {
     }
 
     #[test]
+    fn capture_preserves_the_failed_command_diagnostic() {
+        let spec = CommandSpec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'health probe failed' >&2; exit 7".into(),
+            ],
+            environment: Vec::new(),
+        };
+        assert_eq!(
+            run_capture(&spec, b"", Duration::from_secs(1)).unwrap_err(),
+            "health probe failed"
+        );
+    }
+
+    #[test]
     fn helper_supervises_process_inside_its_own_tree() {
         let instance_root = std::env::temp_dir().join(format!(
             "onekvm-extension-helper-test-{}-{}",

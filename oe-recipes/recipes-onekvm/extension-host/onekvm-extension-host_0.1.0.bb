@@ -75,7 +75,7 @@ do_install() {
 SYSTEMD_SERVICE:${PN} = "onekvm-extension-host.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
-RDEPENDS:${PN} += "opkg systemd"
+RDEPENDS:${PN} += "opkg systemd gnupg-gpg"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"

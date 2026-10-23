@@ -659,9 +659,15 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
             "environment packages cannot declare a resident service or default_enabled".into(),
         );
     }
-    if !value.healthcheck.type_name.is_empty() && (value.healthcheck.type_name != "exec"
-        || value.healthcheck.command.first().is_none_or(|command| !paths::safe_relative(command))
-        || value.healthcheck.timeout_seconds > 30) {
+    if !value.healthcheck.type_name.is_empty()
+        && (value.healthcheck.type_name != "exec"
+            || value
+                .healthcheck
+                .command
+                .first()
+                .is_none_or(|command| !paths::safe_relative(command))
+            || value.healthcheck.timeout_seconds > 30)
+    {
         return Err("healthcheck requires an extension-relative exec command and a timeout up to 30 seconds".into());
     }
     validate_services(value)?;
