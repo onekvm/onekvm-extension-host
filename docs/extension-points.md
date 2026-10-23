@@ -63,7 +63,7 @@ The contribution data uses a safe package-relative `bundle` directory:
     "version": 1,
     "data": {
       "title": "WireGuard",
-      "glyph": "W",
+      "icon": "icon.bin",
       "bundle": "screen-app",
       "controls": ["touch", "rotary"],
       "order": 40
@@ -73,6 +73,9 @@ The contribution data uses a safe package-relative `bundle` directory:
 ```
 
 The directory must contain `main.vue-vapor.js` and `main.vue-vapor.pak`.
+Package-owned artwork also includes the declared ICO1 image (`icon.bin` above).
+Screen App metadata requires an image `icon`; `glyph` fields and letter
+fallbacks are prohibited.
 The screen launcher uses the namespaced ID `<source>/<id>` and loads the
 bundle from the resolved `package_root`.
 
