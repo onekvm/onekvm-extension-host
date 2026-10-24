@@ -19,6 +19,7 @@ mod network_modules;
 mod package_sizes;
 mod paths;
 mod ports;
+mod proxy;
 mod sandbox;
 mod settings;
 mod state;

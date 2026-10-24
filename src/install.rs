@@ -549,6 +549,7 @@ pub(crate) fn run_opkg_progress(
     fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
     fs::create_dir_all(cache).map_err(|e| e.to_string())?;
     let mut command = Command::new(paths::OPKG);
+    crate::proxy::apply(&mut command)?;
     command
         .arg(if phase == "download" { "-V2" } else { "-V1" })
         .arg("--tmp-dir")

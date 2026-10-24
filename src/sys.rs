@@ -104,7 +104,9 @@ fn tempfile_in(dir: &Path) -> Result<Temp, String> {
 }
 
 pub fn run(command: &str, args: &[String]) -> Result<(), String> {
-    let status = std::process::Command::new(command)
+    let mut child = std::process::Command::new(command);
+    crate::proxy::apply(&mut child)?;
+    let status = child
         .args(args)
         .status()
         .map_err(|e| format!("{command}: {e}"))?;
@@ -127,7 +129,9 @@ pub fn quiet(command: &str, args: &[&str]) -> bool {
 }
 
 pub fn output(command: &str, args: &[String]) -> Result<Vec<u8>, String> {
-    let result = std::process::Command::new(command)
+    let mut child = std::process::Command::new(command);
+    crate::proxy::apply(&mut child)?;
+    let result = child
         .args(args)
         .output()
         .map_err(|e| format!("{command}: {e}"))?;
@@ -167,7 +171,9 @@ pub fn opkg_in(dir: &Path, args: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("prepare opkg temporary directory: {e}"))?;
     let mut owned = vec!["--tmp-dir".to_owned(), paths::OPKG_TMP.to_owned()];
     owned.extend(args.iter().map(|value| (*value).to_owned()));
-    let status = std::process::Command::new(paths::OPKG)
+    let mut child = std::process::Command::new(paths::OPKG);
+    crate::proxy::apply(&mut child)?;
+    let status = child
         .args(&owned)
         .current_dir(dir)
         .status()

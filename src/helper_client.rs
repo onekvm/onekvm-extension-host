@@ -131,7 +131,7 @@ pub fn call(id: &str, method: &str, args: &[Value]) -> Result<Vec<Value>, String
                 .and_then(Value::as_str)
                 .ok_or_else(|| "ensure name is required".to_string())?;
             let command = string_list(args.get(1))?;
-            let environment = string_list(args.get(2))?;
+            let environment = crate::proxy::environment(&string_list(args.get(2))?)?;
             let restart = args.get(3).and_then(Value::as_str).unwrap_or("on-failure");
             let name = c_string(name)?;
             let restart = c_string(restart)?;
@@ -155,7 +155,7 @@ pub fn call(id: &str, method: &str, args: &[Value]) -> Result<Vec<Value>, String
         }
         "Exec" => {
             let command = string_list(args.first())?;
-            let environment = string_list(args.get(1))?;
+            let environment = crate::proxy::environment(&string_list(args.get(1))?)?;
             let timeout = args.get(2).and_then(Value::as_u64).unwrap_or(10) as u32;
             let mut command = CStrings::from_values(&command)?;
             let mut environment = CStrings::from_values(&environment)?;
@@ -220,7 +220,8 @@ pub fn exec_capture(
 ) -> Result<Vec<u8>, String> {
     let unique = unique_name(id)?;
     let mut command = CStrings::from_values(command)?;
-    let mut environment = CStrings::from_values(environment)?;
+    let environment = crate::proxy::environment(environment)?;
+    let mut environment = CStrings::from_values(&environment)?;
     let mut output = std::ptr::null_mut();
     let mut size = 0usize;
     let mut error = std::ptr::null_mut();
