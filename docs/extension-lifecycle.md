@@ -6,8 +6,12 @@ hooks. Registration follows the enabled state; stopping a service can leave its
 management UI available.
 
 All state changes publish the atomic generic change token
-`/run/onekvm/contributions-generation`. Consumers can watch the parent directory
-or poll the token, and should retain periodic discovery as a restart fallback.
+`/run/onekvm/contributions-generation`. Consumers subscribe to the parent
+directory with inotify before initial
+discovery, so first creation and atomic replacement are observed. Reconcile on
+startup, watcher reattachment and queue overflow; periodic discovery is not
+required. Observe service lifecycle notifications when discovery depends on
+runtime readiness.
 Resolved entries include `generation`, an extension lifecycle revision. It
 changes with enable/disable and active-version changes, including a quick
 disable/enable between consumer refreshes. Settings updates keep that revision.

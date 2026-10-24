@@ -156,8 +156,8 @@ fn valid_point(value: &str) -> bool {
 }
 
 /// Generic change token for every contribution consumer, atomically published
-/// after state mutations. Consumers may watch its parent with inotify; polling
-/// also works across host restarts. Never contains extension settings.
+/// after state mutations. Consumers watch its parent with inotify and reconcile on
+/// startup/reattachment, including after host restarts. Never contains extension settings.
 pub fn changed() -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
