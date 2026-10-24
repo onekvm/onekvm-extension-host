@@ -39,6 +39,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 ReadWritePaths=/etc/onekvm /etc/opkg /data /run/onekvm /run/systemd/system
-# Signed extension dependencies may install optional kernel modules and their
-# boot loading configuration and units. Keep the rest of /usr read-only.
-ReadWritePaths=/usr/lib/modules /usr/lib/modules-load.d /usr/lib/systemd/system
+# The privileged package manager installs signed runtime dependencies in /usr,
+# including client executables and libraries. Individual extension services
+# retain their own read-only system mounts.
+ReadWritePaths=/usr

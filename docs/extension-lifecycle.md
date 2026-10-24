@@ -33,6 +33,14 @@ original mutation revision, so a concurrent invalidation is not lost.
 
 ## Upgrade and activation transactions
 
+The privileged package-manager host must be able to write signed runtime
+dependencies to `/usr`, including `/usr/bin`, `/usr/sbin` and libraries.
+`ProtectSystem=strict` stays enabled with `/usr` explicitly writable for that
+host; individual extension services keep their own read-only system mounts.
+Controller health checks must validate required runtime executables as well as
+settings. A missing runtime returns configuration exit status 78 from the
+service, which suppresses automatic restart until the installation is repaired.
+
 Before stopping a plugin, the manager records the original configuration and
 enabled state in `/data/pkg-state/extensions/transactions/<id>/journal.json`.
 After quiescing its processes, it snapshots all installed versions, plugin data,

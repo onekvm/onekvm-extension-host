@@ -466,6 +466,16 @@ static int append_transient_property(sd_bus_message *message,
             result = sd_bus_message_append(message, "(sv)(sv)",
                                            "LimitNOFILE", "t", limit,
                                            "LimitNOFILESoft", "t", limit);
+    } else if (strcmp(name, "RestartPreventExitStatus") == 0) {
+        /* The D-Bus property is (exit-status[], signal[]), not a string.
+         * Legacy controllers reserve EX_CONFIG=78 for operator repair. */
+        uint64_t code;
+        result = parse_unsigned(value, 10, &code);
+        if (result >= 0 && code > 255)
+            result = -ERANGE;
+        if (result >= 0)
+            result = sd_bus_message_append(message, "(sv)", name, "(aiai)",
+                                           1, (int32_t)code, 0);
     } else if (strcmp(name, "RestartSec") == 0 ||
                strcmp(name, "TimeoutStopSec") == 0) {
         uint64_t usec;

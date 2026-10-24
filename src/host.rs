@@ -1226,6 +1226,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         format!("--slice={}", paths::EXTENSIONS_SLICE),
         "--property=Restart=on-failure".into(),
         "--property=RestartSec=1s".into(),
+        "--property=RestartPreventExitStatus=78".into(),
     ];
     arguments.extend(legacy_core_lifetime_properties());
     arguments.extend(sandbox_arguments(extension));
