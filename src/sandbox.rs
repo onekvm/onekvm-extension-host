@@ -69,6 +69,9 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     if permissions.contains("device-video") {
         devices.extend(glob_paths("/dev/video*"));
     }
+    if permissions.contains("device-kvm") && Path::new("/dev/kvm").exists() {
+        devices.push("/dev/kvm".into());
+    }
     if permissions.contains("device-crypto") && Path::new("/dev/onekvm-crypto-offload").exists() {
         devices.push("/dev/onekvm-crypto-offload".into());
         supplementary_groups.push("onekvm-crypto");
