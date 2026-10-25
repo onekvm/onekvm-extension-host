@@ -460,6 +460,61 @@ pub fn clean_archive_path(name: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
+/// Read only control metadata for signed dependency IPKs. Runtime packages may
+/// have legitimate maintenance scripts; extension payloads use stricter checks.
+/// Skip the data archive to avoid loading large runtimes into the host's RAM.
+pub fn read_package_control(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)
+        .map_err(|error| error.to_string())?;
+    if &magic != b"!<arch>\n" {
+        return Err("invalid IPK archive".into());
+    }
+    loop {
+        let mut header = [0; 60];
+        file.read_exact(&mut header)
+            .map_err(|_| "IPK control archive is missing")?;
+        if &header[58..] != b"`\n" {
+            return Err("invalid IPK member header".into());
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/');
+        let size: u64 = std::str::from_utf8(&header[48..58])
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .map_err(|_| "invalid IPK member size")?;
+        if size > MAX_IPK_MEMBER {
+            return Err("IPK member is too large".into());
+        }
+        if name == "control.tar.gz" {
+            let mut archive = Archive::new(GzDecoder::new(file.take(size)));
+            for entry in archive.entries().map_err(|error| error.to_string())? {
+                let mut entry = entry.map_err(|error| error.to_string())?;
+                if entry.path().map_err(|error| error.to_string())?.file_name()
+                    == Some(std::ffi::OsStr::new("control"))
+                {
+                    if entry.size() > 64 * 1024 {
+                        return Err("control file is too large".into());
+                    }
+                    let mut text = Vec::new();
+                    entry
+                        .read_to_end(&mut text)
+                        .map_err(|error| error.to_string())?;
+                    return parse_control(&text);
+                }
+            }
+            return Err("IPK control file is missing".into());
+        }
+        file.seek(SeekFrom::Current((size + size % 2) as i64))
+            .map_err(|error| error.to_string())?;
+    }
+}
+
 pub fn read_ar(filename: &str) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut file = std::fs::File::open(filename).map_err(|e| e.to_string())?;
     let mut magic = [0u8; 8];

@@ -497,6 +497,8 @@ fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String
             );
             log_install_message("Verifying downloaded package and manifest");
             let info = inspect_cached_extension(&cache, package_name)?;
+            let arguments =
+                crate::package_policy::offline_install_arguments(&tmp, &cache, &[], false)?;
             log_install_message("Saving previous extension state");
             let prep = prepare_installed_upgrade(&info)?;
             set_progress(
@@ -506,9 +508,13 @@ fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String
                 size_bytes.max(downloaded),
                 "Installing packages",
             );
-            if let Err(err) =
-                run_opkg_progress(&tmp, &cache, &["install", package_name], "install", 0)
-            {
+            if let Err(err) = run_opkg_progress(
+                &tmp,
+                &cache,
+                &arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+                "install",
+                0,
+            ) {
                 return crate::transaction::failed(&prep.snapshot, err);
             }
             commit_installed_package(&info, prep)
@@ -750,6 +756,7 @@ pub fn install_local_path(filename: &str) -> Result<(), String> {
 
 fn install_upload_unlocked(filename: &str) -> Result<(), String> {
     let value = inspect_local_upload(filename)?;
+    crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
     install_validated_unlocked(&value.info, &value.paths)
 }
 
@@ -822,15 +829,31 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
 }
 
 fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf]) -> Result<(), String> {
-    let prep = prepare_installed_upgrade(info)?;
-    let mut arguments = vec!["--force-reinstall".to_owned(), "install".to_owned()];
-    for filename in filenames {
-        arguments.push(filename.to_string_lossy().into_owned());
-    }
-    if let Err(err) = sys::opkg(&arguments.iter().map(String::as_str).collect::<Vec<_>>()) {
-        return crate::transaction::failed(&prep.snapshot, err);
-    }
-    commit_installed_package(info, prep)
+    let cache = unique_temp_dir(paths::OPKG_CACHE, "local-cache-")?;
+    let tmp = unique_temp_dir(paths::OPKG_CACHE, "local-tmp-")?;
+    let result = (|| {
+        let mut download = vec!["--download-only", "--force-reinstall", "install"];
+        for filename in filenames {
+            download.push(filename.to_str().ok_or("invalid local package path")?);
+        }
+        run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+        let arguments =
+            crate::package_policy::offline_install_arguments(&tmp, &cache, filenames, true)?;
+        let prep = prepare_installed_upgrade(info)?;
+        if let Err(err) = run_opkg_progress(
+            &tmp,
+            &cache,
+            &arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+            "install",
+            0,
+        ) {
+            return crate::transaction::failed(&prep.snapshot, err);
+        }
+        commit_installed_package(info, prep)
+    })();
+    let _ = fs::remove_dir_all(&cache);
+    let _ = fs::remove_dir_all(&tmp);
+    result
 }
 
 fn stop_before_removal(id: &str, state: &crate::state::PluginState) -> Result<(), String> {
