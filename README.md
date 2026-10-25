@@ -21,6 +21,16 @@ exposed by `onekvm-extension load-network-module <module>`. This keeps
 `CAP_SYS_MODULE` out of Core. The boot-time CLI can load modules directly before
 Core and the extension host start. Disabled VPN clients request no modules.
 
+## Kernel compatibility
+
+Kernel module packages must carry `X-OneKVM-Kernel-Release` and
+`X-OneKVM-Kernel-Magic` matching the signed image's
+`/usr/share/onekvm/kernel.json`. All downloaded and local dependencies are
+checked before installation or stopping an existing extension. Firmware
+preparation also compares magic, so a same-release kernel rebuild triggers
+the module dependency checks. Legacy images without identity metadata cannot
+install additional modules; target firmware must provide kernel metadata.
+
 ## Marketplace package sizes
 
 Marketplace download sizes include the compatible package candidate and its

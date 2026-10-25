@@ -78,6 +78,7 @@ fn checked_payloads(
                 "dependency {name} belongs to the system image; {UPDATE_HINT}"
             ));
         }
+        crate::kernel_identity::check_current_package(&fields)?;
         let version = &fields["Version"];
         if let Some((previous, _)) = packages.get(name) {
             if previous != version {

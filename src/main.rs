@@ -12,6 +12,7 @@ mod host;
 mod install;
 mod ipk;
 mod ipks;
+mod kernel_identity;
 mod lifecycle;
 mod manifest;
 mod memory;

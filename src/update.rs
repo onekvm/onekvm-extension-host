@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{control, ipk, ipks, manifest, paths, state, sys};
+use crate::{control, ipk, ipks, kernel_identity, manifest, paths, state, sys};
 
 const ROOT: &str = "/data/rauc/plugin-update";
 const SLOTS: &str = "/data/onekvm/plugin-slots";
@@ -53,6 +53,10 @@ struct Plan {
     bundle_sha256: String,
     current_kernel: String,
     target_kernel: String,
+    #[serde(default)]
+    current_kernel_magic: String,
+    #[serde(default)]
+    target_kernel_magic: String,
     source_build: String,
     target_build: String,
     source_slot: String,
@@ -70,6 +74,8 @@ struct Plan {
 struct Slot {
     build: String,
     kernel: String,
+    #[serde(default)]
+    kernel_magic: String,
     directory: String,
     #[serde(default)]
     plugins: Vec<String>,
@@ -233,7 +239,12 @@ fn available<'a>(plan: &'a Plan, name: &str) -> Option<&'a Package> {
         })
 }
 fn missing(plan: &Plan) -> Vec<Value> {
-    if plan.current_kernel == plan.target_kernel {
+    if !kernel_identity::valid_magic(&plan.target_kernel_magic) {
+        return vec![
+            json!({"package": "target-kernel-metadata", "reason": "kernel_metadata_missing"}),
+        ];
+    }
+    if !kernel_changed(plan) {
         return Vec::new();
     }
     let mut missing = BTreeMap::new();
@@ -315,12 +326,22 @@ fn missing(plan: &Plan) -> Vec<Value> {
     }
     missing.into_values().collect()
 }
+fn kernel_changed(plan: &Plan) -> bool {
+    kernel_identity::changed(
+        &plan.current_kernel,
+        &plan.current_kernel_magic,
+        &plan.target_kernel,
+        &plan.target_kernel_magic,
+    )
+}
 fn view(plan: &Plan) -> Value {
     let missing = missing(plan);
     json!({
         "id": plan.id, "phase": plan.phase,
         "current_kernel": plan.current_kernel, "target_kernel": plan.target_kernel,
-        "kernel_changed": plan.current_kernel != plan.target_kernel,
+        "current_kernel_magic": plan.current_kernel_magic,
+        "target_kernel_magic": plan.target_kernel_magic,
+        "kernel_changed": kernel_changed(plan),
         "target_build": plan.target_build, "missing": missing,
         "error": plan.error,
         "ready": missing.is_empty() && plan.phase == "prepared",
@@ -502,15 +523,34 @@ fn prepare(filename: &str) -> Result<Value, String> {
         target_modules.extend(module_names(&builtins).1);
     }
     let current_kernel = kernel()?;
+    let current_kernel_magic = kernel_identity::current_magic()?;
+    let target_identity = kernel_identity::decode(
+        &squash(&image, kernel_identity::METADATA.trim_start_matches('/'))
+            .map_err(|_| "target image is missing kernel magic metadata; use an image with kernel identity support")?,
+        &target_kernel,
+    )?;
+    let target_kernel_magic = target_identity.magic;
+    let changed = kernel_identity::changed(
+        &current_kernel,
+        &current_kernel_magic,
+        &target_kernel,
+        &target_kernel_magic,
+    );
     let target_build = String::from_utf8(squash(&image, "usr/share/onekvm/build-id")?)
         .map_err(|e| e.to_string())?
         .trim()
         .to_owned();
     let machine = squash(&image, "usr/share/onekvm/machine")?;
-    if String::from_utf8_lossy(&machine).trim() != text("/usr/share/onekvm/machine")? {
+    if String::from_utf8_lossy(&machine).trim() != text("/usr/share/onekvm/machine")?
+        || target_identity
+            .machine
+            .strip_prefix("onekvm-")
+            .unwrap_or(&target_identity.machine)
+            != String::from_utf8_lossy(&machine).trim()
+    {
         return Err("target rootfs is for a different machine".into());
     }
-    if target_kernel != current_kernel
+    if changed
         && squash(&image, "usr/share/onekvm/plugin-update-version")
             .ok()
             .as_deref()
@@ -519,13 +559,9 @@ fn prepare(filename: &str) -> Result<Value, String> {
         return Err("target system does not support installing plugin packages before startup; use a bundle with plugin-update support".into());
     }
     let source_slot = slot()?;
-    let plugins = if current_kernel != target_kernel {
-        inventory()?
-    } else {
-        Vec::new()
-    };
+    let plugins = if changed { inventory()? } else { Vec::new() };
     let mut baseline = database(&squash(&image, "usr/share/onekvm/opkg-baseline/status")?)?;
-    if current_kernel != target_kernel {
+    if changed {
         for (name, package) in &mut baseline {
             let Some(id) = name
                 .strip_prefix("onekvm-extension-")
@@ -563,6 +599,8 @@ fn prepare(filename: &str) -> Result<Value, String> {
         bundle: filename.to_string_lossy().into_owned(),
         current_kernel,
         target_kernel,
+        current_kernel_magic,
+        target_kernel_magic,
         source_build: build()?,
         target_build,
         target_slot: if source_slot == "A" { "B" } else { "A" }.into(),
@@ -645,6 +683,11 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
                 .ok_or("package has no gzip payload")?;
             let mut value = package(&fields);
             if is_kernel_package(name) {
+                kernel_identity::check_package(
+                    &fields,
+                    &plan.target_kernel,
+                    &plan.target_kernel_magic,
+                )?;
                 let release = ipks::inspect_kernel_dependency_data(name, data)?;
                 if release != plan.target_kernel {
                     return Err(format!(
@@ -743,7 +786,11 @@ fn arm(id: &str) -> Result<Value, String> {
     if plan.id != id || plan.phase != "prepared" {
         return Err("update preparation changed".into());
     }
+    if !kernel_identity::valid_magic(&plan.target_kernel_magic) {
+        return Err("target kernel magic is missing; prepare an image with kernel metadata".into());
+    }
     if kernel()? != plan.current_kernel
+        || kernel_identity::current_magic()? != plan.current_kernel_magic
         || build()? != plan.source_build
         || slot()? != plan.source_slot
     {
@@ -848,6 +895,8 @@ mod tests {
             bundle_sha256: String::new(),
             current_kernel: "6.18.45-onekvm-preempt".into(),
             target_kernel: "6.18.46-onekvm-preempt".into(),
+            current_kernel_magic: format!("sha256:{}", "a".repeat(64)),
+            target_kernel_magic: format!("sha256:{}", "b".repeat(64)),
             source_build: "same-system-version".into(),
             target_build: "same-system-version".into(),
             source_slot: "A".into(),
@@ -874,12 +923,26 @@ mod tests {
         }
     }
     #[test]
-    fn identical_full_kernel_release_skips_plugin_requirements() {
+    fn identical_kernel_identity_skips_plugin_requirements() {
         let mut p = plan();
         p.target_kernel = p.current_kernel.clone();
+        p.target_kernel_magic = p.current_kernel_magic.clone();
         p.plugins[0].depends = None;
         assert!(missing(&p).is_empty());
         assert_eq!(view(&p)["kernel_changed"], false);
+    }
+    #[test]
+    fn same_release_with_new_magic_or_legacy_metadata_checks_modules() {
+        let mut p = plan();
+        p.target_kernel = p.current_kernel.clone();
+        assert_eq!(view(&p)["kernel_changed"], true);
+        assert!(!missing(&p).is_empty());
+        p.current_kernel_magic.clear();
+        p.target_kernel_magic.clear();
+        assert_eq!(view(&p)["kernel_changed"], true);
+        assert!(!missing(&p).is_empty());
+        p.plugins.clear();
+        assert_eq!(view(&p)["ready"], false);
     }
     #[test]
     fn system_version_does_not_control_the_kernel_gate() {
@@ -1016,9 +1079,13 @@ fn boot() -> Result<Value, String> {
     };
     let current_kernel = kernel()?;
     let current_build = build()?;
+    let current_kernel_magic = kernel_identity::current_magic()?;
     let mapping = Path::new(SLOTS).join(&current_slot).join("current.json");
     if let Ok(value) = read_json::<Slot>(&mapping) {
-        if value.build == current_build && value.kernel == current_kernel {
+        if value.build == current_build
+            && value.kernel == current_kernel
+            && value.kernel_magic == current_kernel_magic
+        {
             mount_slot(&value)?;
             // Extensions can load modules before onekvm-ready.target on every
             // boot, so restore this bind before returning a completed plan too.
@@ -1030,19 +1097,29 @@ fn boot() -> Result<Value, String> {
         Err(_) if !root().join("plan.json").exists() => return Ok(json!({"phase":"idle"})),
         Err(e) => return Err(e),
     };
+    if matches!(plan.phase.as_str(), "armed" | "installing")
+        && !kernel_identity::valid_magic(&plan.target_kernel_magic)
+    {
+        return Err(
+            "pending update has no target kernel magic; prepare it again before installing modules"
+                .into(),
+        );
+    }
     if plan.target_slot == current_slot
         && plan.target_build == current_build
         && matches!(plan.phase.as_str(), "armed" | "installing")
-        && plan.target_kernel != current_kernel
+        && (plan.target_kernel != current_kernel
+            || plan.target_kernel_magic != current_kernel_magic)
     {
         return Err(format!(
-            "booted kernel {current_kernel} does not match prepared target {}",
+            "booted kernel {current_kernel} or its magic does not match prepared target {}",
             plan.target_kernel
         ));
     }
     if plan.target_slot != current_slot
         || plan.target_build != current_build
         || plan.target_kernel != current_kernel
+        || plan.target_kernel_magic != current_kernel_magic
         || !matches!(plan.phase.as_str(), "armed" | "installing")
     {
         return Ok(view(&plan));
@@ -1075,6 +1152,11 @@ fn boot() -> Result<Value, String> {
             format!("{current_build}\n").as_bytes(),
             0o644,
         )?;
+        sys::atomic_write(
+            &opkg.join(".baseline-kernel-magic"),
+            format!("{current_kernel_magic}\n").as_bytes(),
+            0o644,
+        )?;
         copy_tree(&root().join("source/apps"), &directory.join("apps"))?;
         copy_tree(&root().join("source/config"), &directory.join("config"))?;
         let data_archive = root().join("source/app-data.tar");
@@ -1104,6 +1186,7 @@ fn boot() -> Result<Value, String> {
             &Slot {
                 build: current_build,
                 kernel: current_kernel,
+                kernel_magic: current_kernel_magic,
                 directory: directory.to_string_lossy().into_owned(),
                 plugins: plan.plugins.iter().map(|p| p.id.clone()).collect(),
             },

@@ -302,6 +302,8 @@ pub(crate) fn inspect_kernel_dependency_data(
         "modules.symbols",
         "modules.symbols.bin",
         "onekvm-build-id",
+        "onekvm-kernel.json",
+        "onekvm-kernel-magic",
     ];
     for (count, entry) in archive.entries().map_err(|e| e.to_string())?.enumerate() {
         if count > 10000 {
