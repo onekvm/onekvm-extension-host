@@ -1,7 +1,7 @@
 SUMMARY = "OneKVM extension host, lifecycle policy, and manager CLI"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=8a5a0a588995e3e2c2bfa68f5413df57"
-PR = "r37"
+PR = "r38"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 ONEKVM_TRUSTED_FEED_PREFIXES ?= ""
