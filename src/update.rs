@@ -438,6 +438,23 @@ fn module_names(list: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
     }
     (releases, modules)
 }
+fn extraction_error(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+    let (code, message) = if lower.contains("bundle payload is corrupted")
+        || lower.contains("verification of data area failed")
+    {
+        ("update_payload_corrupted", "Update file data verification failed. Download the firmware again, compare its SHA-256 with the published checksum, then upload it again.")
+    } else if lower.contains("signature verification failed")
+        || lower.contains("failed to verify signature")
+        || lower.contains("no matching key found")
+    {
+        ("update_signature_invalid", "Update signature verification failed. Use firmware signed for this device and check the device date and time.")
+    } else {
+        ("update_extract_failed", "Could not verify or extract the update file. Check available storage and upload a complete firmware file again.")
+    };
+    format!("[{code}] {message}\nTechnical details: {}", stderr.trim())
+}
+
 fn prepare(filename: &str) -> Result<Value, String> {
     if load().is_ok_and(|p| p.phase == "armed" || p.phase == "installing") {
         return Err("a kernel upgrade is already pending; reboot or finish it first".into());
@@ -478,10 +495,9 @@ fn prepare(filename: &str) -> Result<Value, String> {
         .output()
         .map_err(|e| e.to_string())?;
     if !extraction.status.success() {
-        return Err(format!(
-            "extract verified update bundle: {}",
-            String::from_utf8_lossy(&extraction.stderr).trim()
-        ));
+        return Err(extraction_error(&String::from_utf8_lossy(
+            &extraction.stderr,
+        )));
     }
     remove_tree(&tools)?;
     let manifest = text(unpack.join("manifest.raucm"))?;
@@ -888,6 +904,22 @@ fn arm(id: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extraction_errors_distinguish_verified_signature_from_corrupt_payload() {
+        let raw = "Verified inline signature by 'CN = OneKVM'\nVerification of data area failed.\nFailed to extract bundle: bundle payload is corrupted";
+        let error = super::extraction_error(raw);
+        assert!(error.starts_with("[update_payload_corrupted]"));
+        assert!(error.contains(raw));
+        assert!(super::extraction_error("signature verification failed")
+            .starts_with("[update_signature_invalid]"));
+        assert!(
+            super::extraction_error("unsquashfs: no space left on device")
+                .starts_with("[update_extract_failed]")
+        );
+    }
+
+    use super::*;
+
     use super::*;
 
     pub(super) fn plan() -> Plan {

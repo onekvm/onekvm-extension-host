@@ -119,3 +119,13 @@ Extension enable flags, settings and data are preserved without modification.
 If optional payload validation fails on this identical-kernel path, the update
 plan records the failure while allowing other extensions to start. Kernel-change
 installation failures still block startup as before.
+
+## System update diagnostics
+
+RAUC extraction errors retain their full stderr after a concise summary and a
+stable code: `update_payload_corrupted`, `update_signature_invalid`, or
+`update_extract_failed`. Payload corruption takes precedence over successful
+signature messages in the same log. The web interface localizes the summary
+and keeps the original diagnostic in expandable technical details. Missing
+target kernel metadata is a blocked preflight condition, not an installable
+package; the package upload action is hidden until a valid plan is prepared.
