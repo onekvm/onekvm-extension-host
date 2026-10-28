@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::control::parse_control;
 use crate::feed_keys::{self, SourceKey};
 use crate::manifest::{decode_manifest, Manifest};
@@ -15,6 +17,29 @@ const MAX_CUSTOM_FEED_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_DISPLAY_NAME: usize = 64;
 const SOURCE_KEY_PREFIX: &str = "# OneKVM-Source-Key:";
 const SOURCE_NAME_PREFIX: &str = "# OneKVM-Source-Name:";
+const FEED_UPDATE_RETRY_COOLDOWN_SECS: u64 = 60;
+const FEED_UPDATE_STALE_RUNNING_SECS: u64 = 120;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedUpdateStatus {
+    pub state: String,
+    pub pid: Option<u32>,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
+    pub error: String,
+}
+
+impl Default for FeedUpdateStatus {
+    fn default() -> Self {
+        Self {
+            state: "idle".into(),
+            pid: None,
+            started_at: None,
+            finished_at: None,
+            error: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedSource {
@@ -57,16 +82,7 @@ pub fn available_extensions() -> BTreeMap<String, AvailableExtension> {
         return BTreeMap::new();
     };
     if validate_policy_freshness(&policy).is_err() {
-        let err = crate::sys::with_lock(|| {
-            if validate_policy_freshness(&policy).is_ok() {
-                return Ok(());
-            }
-            feed_keys::prepare_keyring(&policy.keys)?;
-            sys::opkg(&["update"])?;
-            relax_opkg_list_permissions();
-            validate_policy_freshness(&policy)
-        });
-        if err.is_err() {
+        if refresh_if_stale().is_err() {
             return BTreeMap::new();
         }
     }
@@ -207,31 +223,126 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn refresh() -> Result<(), String> {
-    refresh_using(|| sys::opkg(&["update"]))
-}
-
-fn refresh_using(update: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-    let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
-    feed_keys::prepare_keyring(&policy.keys)?;
-    update().map_err(|err| format!("signed feed update failed: {err}"))?;
-    relax_opkg_list_permissions();
-    validate_policy_freshness(&policy).map_err(|err| format!("reject package feed: {err}"))
+    refresh_with_policy(true)
 }
 
 pub fn refresh_if_stale() -> Result<(), String> {
+    refresh_with_policy(false)
+}
+
+pub fn update_status() -> serde_json::Value {
+    serde_json::to_value(read_update_status()).unwrap_or_else(|_| {
+        serde_json::json!({
+            "state": "unknown",
+            "pid": null,
+            "started_at": null,
+            "finished_at": null,
+            "error": "read update status failed"
+        })
+    })
+}
+
+fn refresh_with_policy(force: bool) -> Result<(), String> {
     let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
-    if validate_policy_freshness(&policy).is_ok() {
+    if !force && validate_policy_freshness(&policy).is_ok() {
         return Ok(());
     }
-    refresh_using(|| {
-        crate::install::run_opkg_progress(
-            Path::new(paths::OPKG_TMP),
-            Path::new(paths::OPKG_CACHE),
-            &["update"],
-            "prepare",
-            0,
-        )
+    let status = read_update_status();
+    if status_is_running(&status) {
+        return Err("package feed update already running".into());
+    }
+    if !force && status_is_recent_failure(&status) {
+        return Err(format!(
+            "package feed update suppressed after recent failure: {}",
+            status.error
+        ));
+    }
+
+    sys::try_with_lock(|| {
+        // Recheck after claiming the global lock. Another caller may have
+        // refreshed the indexes between the initial freshness check and here.
+        if !force && validate_policy_freshness(&policy).is_ok() {
+            return Ok(());
+        }
+        let status = read_update_status();
+        if status_is_running(&status) {
+            return Err("package feed update already running".into());
+        }
+        if !force && status_is_recent_failure(&status) {
+            return Err(format!(
+                "package feed update suppressed after recent failure: {}",
+                status.error
+            ));
+        }
+        let started_at = now_secs();
+        write_update_status(FeedUpdateStatus {
+            state: "running".into(),
+            pid: Some(std::process::id()),
+            started_at: Some(started_at),
+            finished_at: None,
+            error: String::new(),
+        });
+
+        let result = (|| {
+            feed_keys::prepare_keyring(&policy.keys)?;
+            crate::feed_mirrors::refresh(|| {
+                // Recheck the selected URL against the image's distribution trust policy.
+                let selected = load_feed_policy(paths::TRUSTED_FEEDS)?;
+                sys::opkg_update().map_err(|err| format!("signed feed update failed: {err}"))?;
+                relax_opkg_list_permissions();
+                validate_policy_freshness(&selected)
+                    .map_err(|err| format!("reject package feed: {err}"))
+            })
+        })();
+        let finished = FeedUpdateStatus {
+            state: if result.is_ok() {
+                "succeeded".into()
+            } else {
+                "failed".into()
+            },
+            pid: None,
+            started_at: Some(started_at),
+            finished_at: Some(now_secs()),
+            error: result.clone().err().unwrap_or_default(),
+        };
+        write_update_status(finished);
+        result
     })
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_update_status() -> FeedUpdateStatus {
+    let Ok(data) = fs::read(paths::OPKG_UPDATE_STATUS) else {
+        return FeedUpdateStatus::default();
+    };
+    serde_json::from_slice(&data).unwrap_or_default()
+}
+
+fn write_update_status(status: FeedUpdateStatus) {
+    let Ok(data) = serde_json::to_vec(&status) else {
+        return;
+    };
+    let _ = sys::atomic_write(Path::new(paths::OPKG_UPDATE_STATUS), &data, 0o644);
+}
+
+fn status_is_running(status: &FeedUpdateStatus) -> bool {
+    status.state == "running"
+        && status.started_at.is_some_and(|started| {
+            now_secs().saturating_sub(started) <= FEED_UPDATE_STALE_RUNNING_SECS
+        })
+}
+
+fn status_is_recent_failure(status: &FeedUpdateStatus) -> bool {
+    status.state == "failed"
+        && status.finished_at.is_some_and(|finished| {
+            now_secs().saturating_sub(finished) < FEED_UPDATE_RETRY_COOLDOWN_SECS
+        })
 }
 
 fn validate_policy_freshness(policy: &FeedPolicy) -> Result<(), String> {

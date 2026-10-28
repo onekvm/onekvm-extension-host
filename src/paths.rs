@@ -7,6 +7,7 @@ pub const CONFIG_ROOT: &str = "/etc/onekvm/extensions";
 pub const RUNTIME_ROOT: &str = "/run/onekvm/extensions";
 pub const AUTH_ROOT: &str = "/run/onekvm/extension-auth";
 pub const LOCK_PATH: &str = "/run/onekvm/extension-manager.lock";
+pub const OPKG_UPDATE_STATUS: &str = "/run/onekvm/opkg-update.json";
 pub const CONTRIBUTIONS_GENERATION: &str = "/run/onekvm/contributions-generation";
 pub const GENERATION_PATH: &str = "/run/onekvm/extension-host-generation";
 pub const MACHINE_PROFILE: &str = "/usr/share/onekvm/machine.json";
@@ -15,6 +16,9 @@ pub const SYSTEM_PLUGINS: &str = "/usr/share/onekvm/system-plugins";
 pub const OPKG_CONF_DIR: &str = "/etc/opkg";
 /// System/default feed(s). Marketplace custom sources use `onekvm-ext-{key}.conf`.
 pub const FEED_CONFIG: &str = "/etc/opkg/onekvm-feed.conf";
+pub const FEED_DEFAULT: &str = "/usr/share/onekvm/defaults/opkg/feeds.conf";
+pub const FEED_MIRRORS: &str = "/usr/share/onekvm/feed-mirrors";
+pub const FEED_PROFILES: &str = "/data/pkg-state/opkg/feeds";
 pub const FEED_CUSTOM_PREFIX: &str = "onekvm-ext-";
 pub const FEED_CUSTOM_SUFFIX: &str = ".conf";
 pub const FEED_DISABLED_SUFFIX: &str = ".disabled";

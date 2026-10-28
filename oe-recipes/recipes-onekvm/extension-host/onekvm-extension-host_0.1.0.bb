@@ -5,6 +5,7 @@ PR = "r40"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 ONEKVM_TRUSTED_FEED_PREFIXES ?= ""
+ONEKVM_FEED_MIRROR_ORIGINS ?= ""
 
 ONEKVM_COMPONENT_GIT_URI ??= "git://github.com/onekvm/onekvm-extension-host.git;protocol=https;branch=main"
 ONEKVM_COMPONENT_SRCREV ??= ""
@@ -70,12 +71,17 @@ do_install() {
         install -m0644 ${S}/packaging/trusted-feed-prefixes \
             ${D}${datadir}/onekvm/trusted-feed-prefixes
     fi
+    : >${D}${datadir}/onekvm/feed-mirrors
+    for origin in ${ONEKVM_FEED_MIRROR_ORIGINS}; do
+        printf '%s\n' "$origin" >>${D}${datadir}/onekvm/feed-mirrors
+    done
+    chmod 0644 ${D}${datadir}/onekvm/feed-mirrors
 }
 
 SYSTEMD_SERVICE:${PN} = "onekvm-extension-host.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
-RDEPENDS:${PN} += "opkg systemd gnupg-gpg"
+RDEPENDS:${PN} += "opkg systemd gnupg-gpg wget"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"

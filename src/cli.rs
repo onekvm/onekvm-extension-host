@@ -28,6 +28,7 @@ commands:
   service-action <id> <service> <start|stop|restart|enable|disable>
   configure <id>  (JSON request on stdin)
   refresh
+  feed-status
   install <onekvm-extension-name>
   install-local  (IPK or IPKS on stdin)
   inspect-local-path <staged-path>
@@ -64,6 +65,7 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
         "configure",
         "install",
         "refresh",
+        "feed-status",
         "install-local",
         "inspect-local-path",
         "install-local-path",
@@ -76,13 +78,22 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
     if !COMMANDS.contains(&args[0].as_str()) {
         return Err(format!("unknown command {:?}\n{}", args[0], usage(argv0)).into());
     }
+    if args[0] == "feed-status" {
+        require_len(args, 1, "feed-status takes no arguments")?;
+        write_json(&feed::update_status())?;
+        return Ok(());
+    }
     // The installer holds this lock until completion. Progress only reads the
     // host's in-memory snapshot and must stay available while that job runs.
     let progress_query = args.len() == 3
         && args[0] == "invoke"
         && args[1] == "plugin-marketplace"
         && args[2] == "install_progress";
-    if !progress_query {
+    let read_only_query = matches!(
+        args[0].as_str(),
+        "list" | "catalog" | "contributions" | "detail" | "status" | "feed-status"
+    );
+    if !progress_query && args[0] != "refresh" && !read_only_query {
         sys::with_lock(|| {
             crate::transaction::recover_all(true)?;
             lifecycle::migrate_legacy_layout()

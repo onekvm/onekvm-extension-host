@@ -25,6 +25,24 @@
 安装大小来自软件源中解压后的载荷大小，已安装插件仍显示自身占用。缓存同时跟踪
 opkg 安装状态、软件源和架构配置。
 
+## 软件源镜像
+
+仅在宿主实际刷新源时（插件市场刷新或 `onekvm-extension refresh`）选源。
+`/etc/opkg/onekvm-feed.conf` 原子切换为软链接，指向镜像内默认配置，或
+`/data/pkg-state/opkg/feeds/` 中的镜像配置。命令行 `opkg update` 和下载直接
+使用同一活动源，不触发测速；备选配置不放入 `/etc/opkg/*.conf`。
+
+宿主先 HTTPS GET 默认源的 `Packages.asc`；不可达或完整签名更新失败时，
+并行探测镜像，按请求耗时从快到慢尝试。每次探测最多四秒，机型、系统版本、
+源名称和验签策略保留。全部更新失败恢复原配置；下次宿主刷新时默认源恢复可达
+便优先切回。内置源禁用或已被手动定制时不改写，自定义源也不参与自动替换。
+
+镜像列表由 OE 的 `ONEKVM_FEED_MIRROR_ORIGINS` 按通道生成到
+`/usr/share/onekvm/feed-mirrors`，并加入 `trusted-feed-prefixes`。
+预览版使用 `pkg-dev.sgp.onekvm.org` / `pkg-dev.tyo.onekvm.org`，稳定版使用
+`pkg.sgp.onekvm.org` / `pkg.tyo.onekvm.org`。尚未搭建的地址探测失败后跳过，
+稳定版不切到开发源。
+
 ## 编译和测试
 
 ```sh

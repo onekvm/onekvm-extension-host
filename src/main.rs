@@ -5,6 +5,7 @@ mod control;
 mod dbus_client;
 mod feed;
 mod feed_keys;
+mod feed_mirrors;
 mod ffi;
 mod helper;
 mod helper_client;

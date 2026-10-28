@@ -170,7 +170,7 @@ fn apply_command_method(
                             })
                     })
                 {
-                    sys::with_lock(crate::feed::refresh)?;
+                    crate::feed::refresh()?;
                 }
                 return Ok(marketplace_list_packages()?);
             }
@@ -428,6 +428,7 @@ fn marketplace_list_packages() -> Result<Value, String> {
     };
     if let Some(object) = result.as_object_mut() {
         object.insert("storage".into(), marketplace_storage());
+        object.insert("feed_update".into(), crate::feed::update_status());
     }
     Ok(result)
 }

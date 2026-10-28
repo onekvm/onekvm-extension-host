@@ -42,6 +42,28 @@ or storage cost. Required upgrades are included. Installed size uses the feed's
 unpacked payload sizes; the plugin's own footprint remains visible when installed.
 The cache tracks opkg status as well as feed and architecture configuration.
 
+## Distribution feed mirrors
+
+Only an actual host feed refresh (`onekvm-extension refresh` or a marketplace
+refresh) selects a mirror. `/etc/opkg/onekvm-feed.conf` becomes an atomic symlink
+to the image's default feed or a generated profile in `/data/pkg-state/opkg/feeds/`.
+Native `opkg update` and package downloads use that same selected configuration;
+they do not trigger selection themselves. Profiles stay outside `/etc/opkg/*.conf`.
+
+The host first checks the default feed with an HTTPS GET of `Packages.asc`.
+If unavailable, or if the signed update fails, it probes the configured mirrors
+concurrently and tries them in response-time order. Each probe has a four-second
+deadline. Selection preserves the product, system version, feed names and signature
+checks. Failed updates restore the previous configuration; a healthy default is
+preferred again on the next host refresh. Disabled or locally customized built-in
+sources and third-party sources are not rewritten.
+
+The image supplies mirror origins in `/usr/share/onekvm/feed-mirrors` and permits
+them in `trusted-feed-prefixes`. OE sets `ONEKVM_FEED_MIRROR_ORIGINS` per release
+channel. Preview uses `pkg-dev.sgp.onekvm.org` / `pkg-dev.tyo.onekvm.org`; stable
+uses `pkg.sgp.onekvm.org` / `pkg.tyo.onekvm.org`. Endpoints not yet deployed fail
+the probe and are skipped. No stable-to-preview fallback is performed.
+
 ## Build and test
 
 ```sh

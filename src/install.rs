@@ -465,10 +465,10 @@ fn join_install_job() -> Result<(), String> {
 }
 
 fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String> {
+    set_progress("prepare", None, 0, size_bytes, "Refreshing package lists");
+    crate::feed::refresh_if_stale()?;
     sys::with_lock(|| {
         crate::transaction::recover_all(true)?;
-        set_progress("prepare", None, 0, size_bytes, "Refreshing package lists");
-        crate::feed::refresh_if_stale()?;
         fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
         let cache = unique_temp_dir(paths::OPKG_CACHE, "ext-cache-")?;
         let tmp = unique_temp_dir(paths::OPKG_CACHE, "ext-tmp-")?;
