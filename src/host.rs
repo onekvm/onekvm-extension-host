@@ -89,6 +89,13 @@ pub fn apply(
             state.revision
         ));
     }
+    if method.is_empty()
+        && event == "disable"
+        && crate::manifest::load_installed_optional(id, &state.active_version)?.is_none()
+    {
+        cleanup_disabled_controller(id)?;
+        return Ok(Value::Null);
+    }
     let extension = load_installed(id, &state.active_version)?;
     if !method.is_empty() {
         let spec = extension
@@ -1076,6 +1083,11 @@ fn prioritize_enabled(candidates: &mut [ReconcileCandidate]) {
 fn reconcile_one(host: &Host, id: &str, state: &PluginState) -> Result<(), String> {
     if state.active_version.is_empty() {
         return Ok(());
+    }
+    if !state.enabled
+        && crate::manifest::load_installed_optional(id, &state.active_version)?.is_none()
+    {
+        return cleanup_disabled_controller(id);
     }
     let extension = load_installed(id, &state.active_version)?;
     if extension.manifest.is_environment() {

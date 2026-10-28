@@ -495,15 +495,22 @@ pub struct Installed {
 }
 
 pub fn load_installed(id: &str, version: &str) -> Result<Installed, String> {
+    load_installed_optional(id, version)?
+        .ok_or_else(|| format!("extension {id} version {version:?} is not installed"))
+}
+
+/// Only absent payloads are optional. Invalid manifests and access errors must
+/// still block recovery rather than silently discarding a usable snapshot.
+pub fn load_installed_optional(id: &str, version: &str) -> Result<Option<Installed>, String> {
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
     let version = if version.is_empty() {
         let versions = installed_versions(id)?;
-        versions
-            .last()
-            .cloned()
-            .ok_or_else(|| format!("extension {id} is not installed"))?
+        let Some(version) = versions.last().cloned() else {
+            return Ok(None);
+        };
+        version
     } else {
         version.to_owned()
     };
@@ -511,12 +518,24 @@ pub fn load_installed(id: &str, version: &str) -> Result<Installed, String> {
         return Err(format!("invalid extension version {version:?}"));
     }
     let root = paths::app_root(id, &version);
-    let data = fs::read(root.join("manifest.json")).map_err(|e| format!("read manifest: {e}"))?;
+    load_installation_root(id, &version, root)
+}
+
+fn load_installation_root(
+    id: &str,
+    version: &str,
+    root: PathBuf,
+) -> Result<Option<Installed>, String> {
+    let data = match fs::read(root.join("manifest.json")) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read manifest {}: {error}", root.display())),
+    };
     let manifest = decode_manifest(&data)?;
     if manifest.id != id || manifest.version != version {
         return Err("manifest identity does not match installation path".into());
     }
-    Ok(Installed { manifest, root })
+    Ok(Some(Installed { manifest, root }))
 }
 
 pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
@@ -1181,6 +1200,24 @@ fn validate_directories(directories: &[ManifestDirectory]) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_installation_only_accepts_missing_payload() {
+        let root =
+            std::env::temp_dir().join(format!("onekvm-missing-manifest-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(load_installation_root("terminal", "0.1.8", root.clone())
+            .unwrap()
+            .is_none());
+        fs::write(root.join("manifest.json"), b"invalid json").unwrap();
+        assert!(load_installation_root("terminal", "0.1.8", root.clone()).is_err());
+        fs::remove_file(root.join("manifest.json")).unwrap();
+        fs::create_dir(root.join("manifest.json")).unwrap();
+        assert!(load_installation_root("terminal", "0.1.8", root.clone()).is_err());
+        fs::remove_dir_all(root).unwrap();
+        assert!(load_installed_optional("../escape", "0.1.8").is_err());
+        assert!(load_installed_optional("terminal", "../escape").is_err());
+    }
 
     #[test]
     fn toolbox_protocol_bounds_and_paths() {

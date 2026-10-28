@@ -64,6 +64,15 @@ The Core HTTP bridge gives package mutations a five-minute deadline so sandbox
 health checks and rollback can finish on slower devices. Older Core versions
 may return an earlier HTTP timeout; the durable journal remains recoverable.
 
+A saved enabled state can outlive its installed payload, for example when
+settings are restored after a full system installation. Disabling that missing
+extension still stops its named runtime units and removes runtime authorization.
+Recovery preserves settings and enabled intent, but skips restarting an absent
+manifest so the pending transaction does not block reinstallation of any plugin.
+Malformed manifests and filesystem errors other than absence still fail recovery
+and retain the snapshot. A successful reinstall activates the new payload using
+the saved settings and enabled state.
+
 The transaction covers the plugin and its private userspace packages. Shared
 platform dependencies and kernel packages retain their own opkg records and
 are not downgraded by plugin rollback; platform rollback belongs to the system

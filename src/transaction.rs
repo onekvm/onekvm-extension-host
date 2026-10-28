@@ -227,7 +227,11 @@ impl Snapshot {
         if !self.state_exists {
             fs::remove_file(paths::state_path(&self.id)).map_err(|e| e.to_string())?;
         }
-        if restart && restored.enabled {
+        if restart
+            && restored.enabled
+            && crate::manifest::load_installed_optional(&self.id, &restored.active_version)?
+                .is_some()
+        {
             crate::lifecycle::enable_unlocked(&self.id)?;
         }
         crate::contributions::changed()?;
