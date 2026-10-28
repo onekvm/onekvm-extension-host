@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{control, ipk, ipks, kernel_identity, manifest, paths, state, sys};
 
+#[path = "update_retained.rs"]
+mod retained;
+
 const ROOT: &str = "/data/rauc/plugin-update";
 const SLOTS: &str = "/data/onekvm/plugin-slots";
 const MAX_PACKAGES: usize = 128;
@@ -887,7 +890,7 @@ fn arm(id: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
 
-    fn plan() -> Plan {
+    pub(super) fn plan() -> Plan {
         Plan {
             id: "test".into(),
             phase: "prepared".into(),
@@ -1097,6 +1100,29 @@ fn boot() -> Result<Value, String> {
         Err(_) if !root().join("plan.json").exists() => return Ok(json!({"phase":"idle"})),
         Err(e) => return Err(e),
     };
+    // Older upload clients leave same-kernel updates in `prepared`: no package
+    // approval or plugin snapshot is needed, but the new slot's opkg baseline
+    // and optional-module bind still need the installed plugins' dependencies.
+    if plan.phase == "prepared"
+        && !kernel_changed(&plan)
+        && plan.target_slot == current_slot
+        && plan.target_build == current_build
+        && plan.target_kernel == current_kernel
+        && plan.target_kernel_magic == current_kernel_magic
+    {
+        match retained::restore(&plan) {
+            Ok(()) => plan.phase = "complete".into(),
+            Err(error) => {
+                // One damaged optional plugin must not prevent every other
+                // extension from starting on an otherwise compatible kernel.
+                eprintln!("same-kernel plugin dependency restore failed: {error}");
+                plan.phase = "failed".into();
+                plan.error = error;
+            }
+        }
+        save(&plan)?;
+        return Ok(view(&plan));
+    }
     if matches!(plan.phase.as_str(), "armed" | "installing")
         && !kernel_identity::valid_magic(&plan.target_kernel_magic)
     {

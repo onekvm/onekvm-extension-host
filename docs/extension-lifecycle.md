@@ -94,3 +94,19 @@ It verifies install/reinstall, a failed upgrade with data rollback, registry
 enable/disable, data-retaining removal and purge, then removes the fixture.
 Its screen bundle includes previously unknown Chinese title glyphs and an icon
 for independent screen-host acceptance without rebuilding the host.
+
+## Same-kernel system updates
+
+For an identical kernel release and kernel magic, the first target-slot boot
+also restores installed plugins' optional package records and dependency closure.
+The source slot's build and magic must match the prepared update; target-image
+packages take precedence and incompatible dependency versions are rejected.
+Optional modules are copied from that source slot's matching `updates` tree,
+with package identity and vermagic checked before registration. Package scripts
+are not run. Records are published after payload validation, so retrying an
+interrupted copy does not duplicate installed records. This also handles older
+Web upload clients that leave same-kernel updates in the `prepared` phase.
+Extension enable flags, settings and data are preserved without modification.
+If optional payload validation fails on this identical-kernel path, the update
+plan records the failure while allowing other extensions to start. Kernel-change
+installation failures still block startup as before.
