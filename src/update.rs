@@ -2,7 +2,7 @@
 //! Never resolve target-kernel dependencies against the running kernel's packages.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +54,10 @@ struct Plan {
     phase: String,
     bundle: String,
     bundle_sha256: String,
+    #[serde(default)]
+    allow_untrusted: bool,
+    #[serde(default)]
+    signer_sha256: String,
     current_kernel: String,
     target_kernel: String,
     #[serde(default)]
@@ -341,6 +345,8 @@ fn view(plan: &Plan) -> Value {
     let missing = missing(plan);
     json!({
         "id": plan.id, "phase": plan.phase,
+        "allow_untrusted": plan.allow_untrusted,
+        "verification_keyring": if plan.allow_untrusted { Some(root().join("firmware-signer.pem").to_string_lossy().into_owned()) } else { None },
         "current_kernel": plan.current_kernel, "target_kernel": plan.target_kernel,
         "current_kernel_magic": plan.current_kernel_magic,
         "target_kernel_magic": plan.target_kernel_magic,
@@ -455,7 +461,36 @@ fn extraction_error(stderr: &str) -> String {
     format!("[{code}] {message}\nTechnical details: {}", stderr.trim())
 }
 
-fn prepare(filename: &str) -> Result<Value, String> {
+fn bundle_signature(reader: &mut (impl Read + Seek)) -> Result<Vec<u8>, String> {
+    let invalid = || "invalid fwup format: expected a signed RAUC SquashFS bundle".to_string();
+    let size = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    if size < 4096 + 9 {
+        return Err(invalid());
+    }
+    reader.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut magic = [0; 4];
+    reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != b"hsqs" {
+        return Err(invalid());
+    }
+    reader.seek(SeekFrom::End(-8)).map_err(|e| e.to_string())?;
+    let mut trailer = [0; 8];
+    reader.read_exact(&mut trailer).map_err(|e| e.to_string())?;
+    let length = u64::from_be_bytes(trailer);
+    if length == 0 || length > 1024 * 1024 || length > size - 8 || (size - 8 - length) % 4096 != 0 {
+        return Err(invalid());
+    }
+    reader
+        .seek(SeekFrom::Start(size - 8 - length))
+        .map_err(|e| e.to_string())?;
+    let mut signature = vec![0; length as usize];
+    reader
+        .read_exact(&mut signature)
+        .map_err(|e| e.to_string())?;
+    Ok(signature)
+}
+
+fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
     if load().is_ok_and(|p| p.phase == "armed" || p.phase == "installing") {
         return Err("a kernel upgrade is already pending; reboot or finish it first".into());
     }
@@ -470,6 +505,41 @@ fn prepare(filename: &str) -> Result<Value, String> {
     }
     fs::create_dir_all(root()).map_err(|e| e.to_string())?;
     fs::set_permissions(root(), fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    let signer = root().join("firmware-signer.pem");
+    let signer_sha256 = if allow_untrusted {
+        // Parse only bounded signature bytes before RAUC verification; never
+        // extract or execute unverified payloads. The opt-in trusts this signer
+        // for this transaction, not for other updates or the system keyring.
+        let signature =
+            bundle_signature(&mut fs::File::open(&filename).map_err(|e| e.to_string())?)?;
+        let signature_path = root().join("firmware-signature.der");
+        sys::atomic_write(&signature_path, &signature, 0o600)?;
+        output(
+            "openssl",
+            &[
+                "cms",
+                "-inform",
+                "DER",
+                "-in",
+                &signature_path.to_string_lossy(),
+                "-cmsout",
+                "-certsout",
+                &signer.to_string_lossy(),
+                "-out",
+                "/dev/null",
+            ],
+        )
+        .map_err(|e| format!("invalid fwup signature structure: {e}"))?;
+        fs::set_permissions(&signer, fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        if !text(&signer)?.contains("-----BEGIN CERTIFICATE-----") {
+            return Err("fwup signature contains no signer certificate".into());
+        }
+        fs::remove_file(signature_path).map_err(|e| e.to_string())?;
+        hash(&signer)?
+    } else {
+        String::new()
+    };
     let unpack = root().join("bundle");
     // RAUC verifies the signature and verity payload before any metadata is trusted.
     // RAUC extract launches unsquashfs with its default 512 MiB cache, which
@@ -482,7 +552,16 @@ fn prepare(filename: &str) -> Result<Value, String> {
         b"#!/bin/sh\nexec /usr/bin/unsquashfs -mem 16M -processors 1 \"$@\"\n",
         0o700,
     )?;
-    let extraction = Command::new("rauc")
+    let mut extractor = Command::new("rauc");
+    if allow_untrusted {
+        extractor.args([
+            "-C",
+            "keyring:allow-partial-chain=true",
+            "--keyring",
+            &signer.to_string_lossy(),
+        ]);
+    }
+    let extraction = extractor
         .args([
             "extract",
             &filename.to_string_lossy(),
@@ -615,6 +694,8 @@ fn prepare(filename: &str) -> Result<Value, String> {
         id: text("/proc/sys/kernel/random/uuid")?,
         phase: "prepared".into(),
         bundle_sha256: hash(&filename)?,
+        allow_untrusted,
+        signer_sha256,
         bundle: filename.to_string_lossy().into_owned(),
         current_kernel,
         target_kernel,
@@ -821,6 +902,9 @@ fn arm(id: &str) -> Result<Value, String> {
         save(&plan)?;
         return Err("required plugin packages are missing".into());
     }
+    if plan.allow_untrusted && hash(&root().join("firmware-signer.pem"))? != plan.signer_sha256 {
+        return Err("staged firmware signer changed; prepare the update again".into());
+    }
     if hash(Path::new(&plan.bundle))? != plan.bundle_sha256 {
         return Err("staged update bundle changed".into());
     }
@@ -920,7 +1004,24 @@ mod tests {
 
     use super::*;
 
-    use super::*;
+    #[test]
+    fn untrusted_option_still_requires_bounded_signed_fwup_structure() {
+        let mut bytes = vec![0; 4096];
+        bytes[..4].copy_from_slice(b"hsqs");
+        bytes.extend_from_slice(b"cms");
+        bytes.extend_from_slice(&3u64.to_be_bytes());
+        assert_eq!(
+            bundle_signature(&mut std::io::Cursor::new(&bytes)).unwrap(),
+            b"cms"
+        );
+        let mut renamed_image = vec![0; 8192];
+        assert!(bundle_signature(&mut std::io::Cursor::new(&renamed_image)).is_err());
+        renamed_image[..4].copy_from_slice(b"hsqs");
+        assert!(bundle_signature(&mut std::io::Cursor::new(&renamed_image)).is_err());
+        bytes.pop();
+        assert!(bundle_signature(&mut std::io::Cursor::new(&bytes)).is_err());
+        assert!(bundle_signature(&mut std::io::Cursor::new(b"bad")).is_err());
+    }
 
     pub(super) fn plan() -> Plan {
         Plan {
@@ -928,6 +1029,8 @@ mod tests {
             phase: "prepared".into(),
             bundle: String::new(),
             bundle_sha256: String::new(),
+            allow_untrusted: false,
+            signer_sha256: String::new(),
             current_kernel: "6.18.45-onekvm-preempt".into(),
             target_kernel: "6.18.46-onekvm-preempt".into(),
             current_kernel_magic: format!("sha256:{}", "a".repeat(64)),
@@ -1406,7 +1509,8 @@ pub fn command(args: &[String], stdin: &mut dyn Read) -> Result<Value, String> {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["update-prepare", file] => prepare(file),
+        ["update-prepare", file] => prepare(file, false),
+        ["update-prepare", file, "--allow-untrusted"] => prepare(file, true),
         ["update-status"] => match load() {
             Ok(p) => Ok(view(&p)),
             Err(_) if !root().join("plan.json").exists() => Ok(json!({"phase":"idle"})),

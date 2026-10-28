@@ -129,3 +129,25 @@ signature messages in the same log. The web interface localizes the summary
 and keeps the original diagnostic in expandable technical details. Missing
 target kernel metadata is a blocked preflight condition, not an installable
 package; the package upload action is hidden until a valid plan is prepared.
+
+## Per-update firmware signer trust
+
+Manual update sources and uploads offer an unchecked, nonpersistent option to
+accept firmware signed outside the built-in trust store. The authenticated
+request uses `X-OneKVM-Allow-Untrusted: true`; absent or false retains normal
+trust verification. Official online updates always retain built-in trust.
+
+The helper bounds and parses the signed RAUC SquashFS trailer, extracts its
+embedded certificates with OpenSSL, and supplies them as a transaction-local
+keyring. RAUC still verifies signature mathematics, payload integrity, bundle
+format, image checksums and machine compatibility. Plain images renamed to
+`.fwup`, invalid signatures and corrupted bundles are rejected. No unverified
+payload is extracted or executed. Certificate validity and purpose checks stay
+enabled. Trusting an unknown signer does not authorize incompatible hardware.
+
+A prepared plan binds this choice to its firmware hash and signer-keyring hash.
+The per-request RAUC `verification-keyring` option requires the matching RAUC
+integration; unsupported daemons fail closed. RAUC checks the caller's bus UID
+and rejects this override for non-root callers, even when its default bus
+policy permits ordinary status and signed-install requests. The system keyring
+and persistent trust configuration remain unchanged.
