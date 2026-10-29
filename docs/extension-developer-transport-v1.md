@@ -1,27 +1,21 @@
 # 开发者模式的 D-Bus 与 Unix Socket 契约
 
 状态：设计提案，尚未实现。配合[开发者模式设计](extension-developer-mode.md)阅读。
-现有接口与本提案不能混为一谈；实现前调用下面的 Development 接口会得到未知接口错误。
 
-## 调用链与职责
+## 调用流程
 
-```text
-浏览器 / 电脑工具 ── HTTPS（管理员会话）── Core HTTP
-                                             │
-SSH / 设备 CLI ───────────────────────────────┤
-                                             ↓
-                       system D-Bus / Development 接口
-                                             ↓
-                       Extension Host 的持久任务与事务
-                                             ↓
-                       systemd 沙箱中的开发插件
-                                             ↓
-                       现有 Core D-Bus / Unix Socket
+```mermaid
+flowchart TB
+  Web[浏览器或电脑工具] -->|管理员 HTTPS 会话| Core[Core HTTP]
+  CLI[SSH / 设备 CLI] -->|root| Bus[system D-Bus · Development]
+  Core --> Bus
+  Bus --> Host[Extension Host · 持久任务与事务]
+  Host --> Plugin[受管开发插件]
+  Plugin --> API[Core D-Bus / Unix Socket]
 ```
 
-管理命令统一进入 Extension Host；CLI 不另做一套安装或切换实现。Core 负责管理员
-会话与请求来源校验，Host 负责本地调用者身份、模式、载荷、权限差异及事务状态。
-开发插件访问 Core 时仍按普通插件的身份和 manifest 能力授权。
+Core 校验管理员会话与请求来源。Host 校验本地身份、模式、载荷、权限和事务状态。
+开发插件按 manifest 能力与受管进程身份访问 Core。
 
 ## 拟议 D-Bus 接口
 
@@ -33,9 +27,7 @@ SSH / 设备 CLI ─────────────────────
 | Interface | `org.onekvm.ExtensionHost1.Development` |
 | 调用者 | root；总线 policy 与服务端 sender UID 双重核对 |
 
-现有 `org.onekvm.ExtensionHost1` 生命周期接口及其参数保持原样。新增接口独立
-导出，通过 D-Bus introspection 发现。普通插件用户和 `onekvm-extension` 组无
-开发管理权限；JSON 中自称管理员、传入插件 ID 或会话 ID 均不能证明身份。
+Development 接口通过 D-Bus introspection 发现。普通插件用户和 `onekvm-extension` 组无开发管理权限。
 Core 转交的 Web 用户名只用于审计，其真实性由 Core 的管理员鉴权负责。
 
 | 方法 | 输入签名 | 输出签名 | 参数与结果 |
@@ -58,8 +50,7 @@ u64，`u` 为 u32。JSON 请求必须有 `api_version: 1`，拒绝未知字段�
 JSON 中所有 u64 修订和序号使用十进制字符串，避免 JavaScript 整数精度损失。
 
 `InspectUpload` 只接受只读、可定位的普通文件 FD，不接受设备、目录或 socket。
-HTTP 或 CLI 先完成上传，再打开只读 FD 传递；不通过 D-Bus 字符串或 `ay` 搬运
-整个压缩包，也不接受任意设备路径。Host 将 FD 内容复制到自有暂存对象并计算摘要，
+HTTP 或 CLI 完成上传后，以只读 FD 传递载荷。Host 将 FD 内容复制到自有暂存对象并计算摘要，
 只对该副本验证和激活；源文件后续变化不能改变已预览内容。压缩载荷上限 32 MiB，
 读取有期限且可中止。失败删除未引用副本，不停止原插件。
 
@@ -124,7 +115,7 @@ SSE ID 编码 boot/session/sequence；跨启动或历史已被裁剪返回 `Curs
 
 ## Unix Socket 的角色
 
-第一版不新增开发管理 Unix Socket。管理控制与 FD 传递走上面的 system D-Bus；
+管理控制与 FD 传递使用 system D-Bus，不新增开发管理 Socket。
 开发插件复用现有 Unix Socket，权限不因开发模式放宽：
 
 | Socket | 协议 | 作用 |
@@ -135,18 +126,10 @@ SSE ID 编码 boot/session/sequence；跨启动或历史已被裁剪返回 `Curs
 | `/run/onekvm/extension-web.sock` | 普通 HTTP/WebSocket 路由与原有登录规则 | 云端 Web 中继 |
 | `$ONEKVM_EXTENSION_SOCKET/<manifest socket>` | 由插件监听的 HTTP/1.1/升级连接 | Core 将插件命名空间路由代理到其服务 |
 
-这些接口的“现有”状态以匹配的 Core/Host 版本为准。`helper.bus` 则是保存
-D-Bus unique name 的普通文本文件，不是 Unix Socket；不能把它当作 HTTP 地址。
+接口以匹配的 Core/Host 版本为准。`helper.bus` 是保存 D-Bus unique name 的文本文件。
 
 控制与媒体服务根据 `SO_PEERCRED`、systemd cgroup 和 Host 授权记录确认身份。
 请求中的 ID 和 HTTP header 仅选择身份记录。正式/开发运行来源切换前停止全部
 旧受管进程、撤销旧记录与连接，再发布新身份；开发来源不允许沿用旧媒体或加密
 会话。仅前端资源刷新保留同一个后端和连接。Core 重启后建立新连接，不自动重放
 HID、ATX、配置变更或不确定结果的加密操作。
-
-## 实现前验收
-
-除主设计中的 107 设备用例外，还须检查：总线非 root 拒绝、FD 类型与尺寸限制、
-上传 token 主体/摘要绑定、u64 边界、幂等提交、接受任务后断线、owner 重连、
-过期游标、停用后控制/媒体/加密连接撤销，以及旧版本的未知接口行为。
-本文仅补齐契约，未对设备新增接口或宣称已完成运行验收。
