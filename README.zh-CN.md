@@ -54,6 +54,10 @@ cargo test --locked
 和 D-Bus 策略。旧 `onekvm-plugin-manager` 包由本包替换并提供升级兼容，其命令名仍
 是指向这个 Rust 二进制的符号链接。
 
+开发目录同步、页面刷新和恢复正式插件的拟议流程见
+[插件开发者模式设计](docs/extension-developer-mode.md)。当前仅为设计草案，
+其中的开发者模式命令与 API 尚未实现。
+
 ## 直接方法与动态目录
 
 `detail <id>` 命令（Core 的 `GET /api/extensions/{id}` 也使用该接口）返回插件声明的

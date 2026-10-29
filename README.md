@@ -189,6 +189,11 @@ MIT. See [LICENSE](LICENSE).
 Lifecycle transaction, recovery, generic contribution notifications and device
 acceptance are described in [extension-lifecycle.md](docs/extension-lifecycle.md).
 
+A proposed developer workflow for staged-directory sync, resource refresh and
+restoring the installed plugin is documented in
+[extension-developer-mode.md](docs/extension-developer-mode.md) (Chinese).
+This is a design draft; developer-mode commands and APIs are not implemented.
+
 Extension installs (feed downloads and local IPK/IPKS uploads) protect non-extension
 packages from `/usr/share/onekvm/opkg-baseline/status`, plus Core, CLI, UI and the
 extension host. The installed versions can satisfy dependencies, but extension
