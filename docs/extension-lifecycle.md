@@ -23,6 +23,12 @@ an explicit user disable survives subsequent boots and upgrades. Environment
 packages stay available without a resident enabled runtime. Compatibility
 declarations must include every machine on which a plugin is preinstalled.
 
+At startup and on `restore`, a saved active version whose manifest is absent is
+replaced with the latest installed version, preserving settings and enabled
+intent. A still-installed selection is retained. Invalid or unreadable manifests
+do not trigger fallback; missing payloads with no installed replacement remain
+unresolved. This also repairs disabled plugins without starting them.
+
 Catalog snapshots include live enabled and service readiness state. Core checks
 the generic contribution token before reusing its snapshot, including when the
 host initializes defaults after Core's initial catalog warmup. Runtime snapshots

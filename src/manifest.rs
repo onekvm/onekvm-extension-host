@@ -502,11 +502,33 @@ pub fn load_installed(id: &str, version: &str) -> Result<Installed, String> {
 /// Only absent payloads are optional. Invalid manifests and access errors must
 /// still block recovery rather than silently discarding a usable snapshot.
 pub fn load_installed_optional(id: &str, version: &str) -> Result<Option<Installed>, String> {
+    load_installed_at(Path::new(paths::APPS_ROOT), id, version)
+}
+
+/// Restore a version removed by a system image upgrade. A corrupt or unreadable
+/// active manifest must still fail instead of silently selecting another version.
+pub fn load_installed_or_latest(id: &str, version: &str) -> Result<Option<Installed>, String> {
+    load_installed_or_latest_at(Path::new(paths::APPS_ROOT), id, version)
+}
+
+fn load_installed_or_latest_at(
+    apps: &Path,
+    id: &str,
+    version: &str,
+) -> Result<Option<Installed>, String> {
+    match load_installed_at(apps, id, version)? {
+        Some(installed) => Ok(Some(installed)),
+        None if !version.is_empty() => load_installed_at(apps, id, ""),
+        None => Ok(None),
+    }
+}
+
+fn load_installed_at(apps: &Path, id: &str, version: &str) -> Result<Option<Installed>, String> {
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
     let version = if version.is_empty() {
-        let versions = installed_versions(id)?;
+        let versions = installed_versions_at(apps, id)?;
         let Some(version) = versions.last().cloned() else {
             return Ok(None);
         };
@@ -517,7 +539,7 @@ pub fn load_installed_optional(id: &str, version: &str) -> Result<Option<Install
     if !paths::valid_version(&version) {
         return Err(format!("invalid extension version {version:?}"));
     }
-    let root = paths::app_root(id, &version);
+    let root = apps.join(id).join(&version);
     load_installation_root(id, &version, root)
 }
 
@@ -539,7 +561,11 @@ fn load_installation_root(
 }
 
 pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
-    let entries = match fs::read_dir(Path::new(paths::APPS_ROOT).join(id)) {
+    installed_versions_at(Path::new(paths::APPS_ROOT), id)
+}
+
+fn installed_versions_at(apps: &Path, id: &str) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(apps.join(id)) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.to_string()),
@@ -556,6 +582,67 @@ pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
     }
     versions.sort();
     Ok(versions)
+}
+
+#[cfg(test)]
+mod installed_restore_tests {
+    use super::*;
+
+    fn install(apps: &Path, version: &str) -> PathBuf {
+        let root = apps.join("nanokvm-oled").join(version);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("manifest.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "nanokvm-oled", "version": version, "api_version": 2,
+                "name": "OLED", "kind": "service", "entrypoint": "bin/oled"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn image_upgrade_recovers_absent_version_but_keeps_an_installed_selection() {
+        let apps = std::env::temp_dir().join(format!("onekvm-restore-{}", std::process::id()));
+        fs::create_dir_all(&apps).unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+            .unwrap()
+            .is_none());
+        install(&apps, "1.9.24");
+        let recovered = load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.manifest.version, "1.9.24");
+        assert_eq!(recovered.root, apps.join("nanokvm-oled/1.9.24"));
+        install(&apps, "0.1.0");
+        assert_eq!(
+            load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+                .unwrap()
+                .unwrap()
+                .manifest
+                .version,
+            "0.1.0"
+        );
+        fs::remove_dir_all(apps).unwrap();
+    }
+
+    #[test]
+    fn restore_does_not_hide_a_corrupt_or_unreadable_active_manifest() {
+        let apps =
+            std::env::temp_dir().join(format!("onekvm-restore-invalid-{}", std::process::id()));
+        install(&apps, "1.9.24");
+        let active = install(&apps, "0.1.0");
+        fs::write(&active, b"invalid json").unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0").is_err());
+        fs::remove_file(&active).unwrap();
+        fs::create_dir(&active).unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0").is_err());
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "../invalid").is_err());
+        fs::remove_dir_all(apps).unwrap();
+    }
 }
 
 pub fn decode_manifest(data: &[u8]) -> Result<Manifest, String> {
