@@ -144,6 +144,10 @@ UI 的页面、shell 注册缓存，以及 Core 路由、目录和屏幕消费�
 
 ## 接口与归属
 
+方法签名、FD 上传、异步任务、事件与 Unix Socket 关系见
+[开发者模式传输契约](extension-developer-transport-v1.md)。以下 HTTP 表与该契约
+描述同一套宿主操作。
+
 开发 API 使用 `/api/development/extensions`，避免占用现有插件 ID 命名空间。
 所有接口显式校验管理员身份，即使设备允许未登录访问常规功能也不开放开发接口；
 变更请求沿用会话来源检查。SSH/root CLI 走相同宿主校验，不绕过模式状态和事务锁。
@@ -159,6 +163,7 @@ UI 的页面、shell 注册缓存，以及 Core 路由、目录和屏幕消费�
 | `POST /api/development/extensions/sessions/{session}/restart` | 重启本插件并检查健康状态 |
 | `GET /api/development/extensions/sessions/{session}/events` | 有界 SSE 日志、修订及部署结果 |
 | `DELETE /api/development/extensions/sessions/{session}` | 结束调试并恢复正式来源 |
+| `GET /api/development/extensions/jobs/{job}` | 查询异步任务阶段、最终结果及恢复状态 |
 
 上传 token 单次消费、短期有效并绑定请求者；SSH 本地暂存也由宿主管理。请求携带
 会话与预期修订，冲突返回 409。模式关闭、权限不足、无效载荷、缺少依赖、
