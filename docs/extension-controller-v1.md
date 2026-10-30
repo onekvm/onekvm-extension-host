@@ -102,11 +102,10 @@ Routes accept three authentication modes:
 
 - `session` is served below `/api/plugins/<extension-id>/` and requires a
   valid OneKVM device session.
-- `passthrough` is served below `/plugins/<extension-id>/`. A `unix` or `http`
-  route does not require a device session. Core forwards the client's
-  `Authorization` header, and the extension checks that credential itself.
-  A `file` route still requires a device session: Core serves those files, and
-  there is no extension check.
+- `passthrough` is served below `/plugins/<extension-id>/`. It only forwards
+  the client's `Authorization` header. Core does not check a device session
+  for a `unix` or `http` route; the extension checks that header. A `file`
+  route still requires a device session, because Core serves those files.
 - `public` is served below `/plugins/<extension-id>/` without a OneKVM device
   session. Core forwards the client's `Authorization` header. Use it for an
   identity-provider callback that validates its own one-time state.
