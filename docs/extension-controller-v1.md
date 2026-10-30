@@ -103,10 +103,12 @@ Routes accept three authentication modes:
 - `session` is served below `/api/plugins/<extension-id>/` and requires a
   valid OneKVM device session.
 - `passthrough` is served below `/plugins/<extension-id>/` and also requires a
-  valid OneKVM device session.
+  valid OneKVM device session. Core removes `Authorization` before proxying.
 - `public` is served below `/plugins/<extension-id>/` without a OneKVM device
-  session. It is reserved for narrow external identity-provider callbacks
-  that authenticate their own unguessable, expiring, single-use state.
+  session. Core forwards the client's `Authorization` header, and the
+  extension checks that credential itself. Use it for an identity-provider
+  callback, or for an endpoint that authenticates every request with its own
+  bearer token.
 
 Only the route prefix explicitly marked `public` bypasses device login. Do
 not use `public` for settings, credential reads, disconnect actions, static
