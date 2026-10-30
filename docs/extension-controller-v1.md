@@ -102,14 +102,16 @@ Routes accept three authentication modes:
 
 - `session` is served below `/api/plugins/<extension-id>/` and requires a
   valid OneKVM device session.
-- `passthrough` is served below `/plugins/<extension-id>/` and also requires a
-  valid OneKVM device session. Core removes `Authorization` before proxying.
+- `passthrough` is served below `/plugins/<extension-id>/`. A `unix` or `http`
+  route does not require a device session. Core forwards the client's
+  `Authorization` header, and the extension checks that credential itself.
+  A `file` route still requires a device session: Core serves those files, and
+  there is no extension check.
 - `public` is served below `/plugins/<extension-id>/` without a OneKVM device
-  session. Core forwards the client's `Authorization` header, and the
-  extension checks that credential itself. Use it for an identity-provider
-  callback, or for an endpoint that authenticates every request with its own
-  bearer token.
+  session. Core forwards the client's `Authorization` header. Use it for an
+  identity-provider callback that validates its own one-time state.
 
-Only the route prefix explicitly marked `public` bypasses device login. Do
-not use `public` for settings, credential reads, disconnect actions, static
-pages, or long-lived sockets.
+Device login is skipped only for `public` routes and for `unix` or `http`
+`passthrough` routes. Do not use either mode for settings, credential reads,
+disconnect actions, or static pages. A static page stays behind the device
+session.
