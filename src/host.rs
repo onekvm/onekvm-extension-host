@@ -209,7 +209,11 @@ fn apply_command_method(
                     .and_then(|object| object.get("size_bytes"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                install::install_package_with_options(&package, wait, size_bytes)?;
+                let enable_after_install = object
+                    .and_then(|object| object.get("enable_after_install"))
+                    .map(|value| value.as_bool().ok_or("enable_after_install must be a boolean"))
+                    .transpose()?;
+                install::install_package_with_options(&package, wait, size_bytes, enable_after_install)?;
                 if wait {
                     return Ok(serde_json::json!({"status": "ok", "package": package}));
                 }

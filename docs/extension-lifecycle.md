@@ -58,6 +58,14 @@ activation, a resident-process check, and the declared bounded `exec`
 healthcheck. Health checks run through the plugin sandbox, not as arbitrary root
 commands. A disabled plugin is installed without starting it.
 
+New installations can pass `enable_after_install` to the marketplace method, or
+`--enable-after-install=true|false` to the install CLI commands. The web installer
+defaults this choice to enabled for regular plugins. An explicit false installs
+without starting the plugin or reserving its runtime memory budget. Omitting the
+option retains the manifest's existing default policy. Updates and reinstalling
+an installed plugin preserve saved enabled intent. A fresh install after removal
+honors the new choice; environment packages have no enabled runtime.
+
 On failure, the manager stops the new runtime and restores the previous payload,
 plugin data (including failed configuration/database migrations), package
 records, active version and enabled state. Snapshot I/O is delegated to the

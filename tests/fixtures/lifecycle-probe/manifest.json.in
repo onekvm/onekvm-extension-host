@@ -14,6 +14,8 @@
   "permissions": [],
   "capabilities": [],
   "default_enabled": true,
+  "toolbox": {"items": [{"id": "probe", "title": "Lifecycle probe tool", "subtitle": "Installation acceptance probe",
+    "presentation": "window", "size": {"width": 380, "height": 240}, "view": {"renderer": "vue", "entrypoint": "web/tool.js"}}]},
   "settings_schema": {"type": "object", "additionalProperties": false, "properties": {"service_enabled": {"type": "boolean", "title": "Probe service", "i18n": {"default": "Probe service", "zh": "测试服务", "zh-TW": "測試服務"}, "default": true}}},
   "secret_fields": [],
   "resource_limits": {"memory_max": "8M", "cpu_quota": "5%", "tasks_max": 8, "limit_nofile": 32},

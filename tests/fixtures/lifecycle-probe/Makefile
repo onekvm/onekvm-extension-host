@@ -8,6 +8,7 @@ install:
 	install -d $(DESTDIR)$(PREFIX)/bin
 	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@FAIL_HEALTH@/$(FAIL_HEALTH)/g' probe.sh > $(DESTDIR)$(PREFIX)/bin/probe
 	chmod 0755 $(DESTDIR)$(PREFIX)/bin/probe
+	install -Dm0644 tool.js $(DESTDIR)$(PREFIX)/web/tool.js
 	sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@ARCH@/$(ARCH)/g' manifest.json.in > $(DESTDIR)$(PREFIX)/manifest.json
 	if test -d screen-app; then \
 		install -d $(DESTDIR)$(PREFIX)/screen-app; \

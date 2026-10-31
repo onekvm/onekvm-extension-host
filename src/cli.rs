@@ -29,10 +29,10 @@ commands:
   configure <id>  (JSON request on stdin)
   refresh
   feed-status
-  install <onekvm-extension-name>
-  install-local  (IPK or IPKS on stdin)
+  install <onekvm-extension-name> [--enable-after-install=true|false]
+  install-local [--enable-after-install=true|false]  (IPK or IPKS on stdin)
   inspect-local-path <staged-path>
-  install-local-path <staged-path>
+  install-local-path <staged-path> [--enable-after-install=true|false]
   remove <onekvm-extension-name>
   purge <id>
   restore
@@ -153,19 +153,28 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
             lifecycle::service_action(&args[1], &args[2], &args[3])?;
         }
         "configure" => lifecycle::configure(&one_id(args)?, &mut io::stdin())?,
-        "install" => install::install_package(&one_id(args)?)?,
+        "install" => {
+            let (id, enabled) = install_arguments(args)?;
+            if enabled.is_none() {
+                install::install_package(id)?;
+            } else {
+                install::install_package_with_options(id, true, 0, enabled)?;
+            }
+        }
         "refresh" => {
             require_len(args, 1, "refresh takes no arguments")?;
             feed::refresh()?;
         }
         "install-local" => {
-            require_len(args, 1, "install-local takes no arguments")?;
-            install::install_local(&mut io::stdin())?;
+            install::install_local(&mut io::stdin(), install_option(&args[1..])?)?;
         }
         "inspect-local-path" => {
             write_json(&install::inspect_local_path(&one_id(args)?)?)?;
         }
-        "install-local-path" => install::install_local_path(&one_id(args)?)?,
+        "install-local-path" => {
+            let (path, enabled) = install_arguments(args)?;
+            install::install_local_path(path, enabled)?;
+        }
         "remove" => install::remove_package(&one_id(args)?)?,
         "purge" => install::purge(&one_id(args)?)?,
         "restore" => {
@@ -227,6 +236,20 @@ fn optional(args: &[String], index: usize) -> &str {
     args.get(index).map(String::as_str).unwrap_or_default()
 }
 
+fn install_option(args: &[String]) -> Result<Option<bool>, String> {
+    match args {
+        [] => Ok(None),
+        [value] if value == "--enable-after-install=true" => Ok(Some(true)),
+        [value] if value == "--enable-after-install=false" => Ok(Some(false)),
+        _ => Err("expected --enable-after-install=true|false".into()),
+    }
+}
+
+fn install_arguments(args: &[String]) -> Result<(&str, Option<bool>), String> {
+    let id = args.get(1).filter(|value| !value.is_empty()).ok_or("install requires a package or staged path")?;
+    Ok((id, install_option(&args[2..])?))
+}
+
 fn write_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
     let mut stdout = io::stdout();
     serde_json::to_writer(&mut stdout, value).map_err(|e| e.to_string())?;
@@ -237,6 +260,17 @@ fn write_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::run;
+
+    #[test]
+    fn installation_options_distinguish_omitted_enabled_and_disabled() {
+        assert_eq!(super::install_option(&[]).unwrap(), None);
+        assert_eq!(super::install_option(&["--enable-after-install=true".into()]).unwrap(), Some(true));
+        assert_eq!(super::install_option(&["--enable-after-install=false".into()]).unwrap(), Some(false));
+        assert!(super::install_option(&["--enable-after-install=yes".into()]).is_err());
+        assert!(super::install_arguments(&["install".into()]).is_err());
+        let args = ["install-local-path".into(), "/var/tmp/onekvm/test.upload".into(), "--enable-after-install=false".into()];
+        assert_eq!(super::install_arguments(&args).unwrap(), ("/var/tmp/onekvm/test.upload", Some(false)));
+    }
 
     #[test]
     fn unknown_command_mentions_usage() {
