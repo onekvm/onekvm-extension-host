@@ -93,6 +93,14 @@ are not downgraded by plugin rollback; platform rollback belongs to the system
 update mechanism. A plugin health check cannot certify external network access
 or every device-specific feature.
 
+System-update preflight accepts the generated optional-module `depmod` scripts,
+including the variant that refreshes each installed kernel release. Other
+maintenance commands remain rejected. An empty module group is accepted only
+after its kernel release and magic match the target and every advertised module
+is already present in the authenticated target image. This supports groups such
+as AES when their drivers become built in, without treating a missing driver as
+available.
+
 ## Removal
 
 `remove` stops and disables the extension and removes its package, retaining

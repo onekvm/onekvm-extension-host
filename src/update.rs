@@ -396,7 +396,11 @@ fn module_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
                     .join(" ");
                 let script = script.strip_prefix("#!/bin/sh ").unwrap_or(&script);
                 let script = script.strip_prefix("set -e ").unwrap_or(script);
-                if script != "if [ -z \"$D\" ]; then depmod -a fi" {
+                if !matches!(
+                    script,
+                    "if [ -z \"$D\" ]; then depmod -a fi"
+                        | "if [ -z \"$D\" ]; then for module_dir in /usr/lib/modules/*; do [ -d \"$module_dir\" ] || continue depmod -a \"${module_dir##*/}\" done fi"
+                ) {
                     return Err("kernel package contains an unsupported maintenance script".into());
                 }
             }
@@ -423,6 +427,30 @@ fn verify_module_release(data: &[u8], target: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn empty_target_module_group(
+    data: &[u8],
+    provides: &str,
+    target_modules: &BTreeSet<String>,
+) -> Result<bool, String> {
+    let decoder = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(decoder);
+    if let Some(entry) = archive.entries().map_err(|e| e.to_string())?.next() {
+        entry.map_err(|e| e.to_string())?;
+        return Ok(false);
+    }
+    let mut present = false;
+    for alias in provides.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(module) = alias.strip_prefix("kernel-module-") else {
+            return Ok(false);
+        };
+        if !target_modules.contains(&module.replace('-', "_")) {
+            return Ok(false);
+        }
+        present = true;
+    }
+    Ok(present)
 }
 fn module_names(list: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut releases = BTreeSet::new();
@@ -788,7 +816,15 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
                     &plan.target_kernel,
                     &plan.target_kernel_magic,
                 )?;
-                let release = ipks::inspect_kernel_dependency_data(name, data)?;
+                let release = match ipks::inspect_kernel_dependency_data(name, data) {
+                    Ok(release) => release,
+                    Err(_) if empty_target_module_group(data, &value.provides, &plan.target_modules)? => {
+                        // ALLOW_EMPTY groups still satisfy package dependencies when
+                        // every advertised driver is already in the authenticated image.
+                        plan.target_kernel.clone()
+                    }
+                    Err(err) => return Err(err),
+                };
                 if release != plan.target_kernel {
                     return Err(format!(
                         "{name} targets kernel {release}, expected {}",
@@ -988,6 +1024,60 @@ fn arm(id: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_module_group_requires_every_driver_in_target_image() {
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let archive = tar::Builder::new(gzip);
+        let data = archive.into_inner().unwrap().finish().unwrap();
+        let target = BTreeSet::from(["libaes".into(), "aes_generic".into()]);
+        assert!(empty_target_module_group(&data, "kernel-module-libaes, kernel-module-aes-generic", &target).unwrap());
+        for provides in ["", "unrelated-package", "kernel-module-missing", "kernel-module-libaes, kernel-module-missing"] {
+            assert!(!empty_target_module_group(&data, provides, &target).unwrap());
+        }
+        assert!(!empty_target_module_group(&module_control_archive("postinst", "depmod -a"), "kernel-module-libaes", &target).unwrap());
+        assert!(empty_target_module_group(b"invalid archive", "kernel-module-libaes", &target).is_err());
+    }
+
+    fn module_control_archive(script_name: &str, script: &str) -> Vec<u8> {
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gzip);
+        for (name, content) in [
+            ("control", "Package: onekvm-kernel-module-cifs\nVersion: 1\nArchitecture: all\n"),
+            (script_name, script),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, content.as_bytes()).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn kernel_control_accepts_generated_depmod_scripts_only() {
+        let scripts = [
+            "#!/bin/sh\nset -e\nif [ -z \"$D\" ]; then\n depmod -a\nfi\n",
+            "set -e\nif [ -z \"$D\" ]; then\nfor module_dir in /usr/lib/modules/*; do\n    [ -d \"$module_dir\" ] || continue\n    depmod -a \"${module_dir##*/}\"\ndone\nfi\n",
+        ];
+        for script in scripts {
+            for name in ["postinst", "postrm"] {
+                let fields = super::module_control(&module_control_archive(name, script)).unwrap();
+                assert_eq!(fields["Package"], "onekvm-kernel-module-cifs");
+            }
+            for name in ["preinst", "prerm"] {
+                assert!(super::module_control(&module_control_archive(name, script)).is_err());
+            }
+            for altered in [
+                format!("{script}touch /tmp/unexpected\n"),
+                script.replace("depmod -a", "depmod -a; touch /tmp/unexpected"),
+                script.replace("depmod -a", "echo ignored"),
+            ] {
+                assert!(super::module_control(&module_control_archive("postinst", &altered)).is_err());
+            }
+        }
+    }
+
     #[test]
     fn extraction_errors_distinguish_verified_signature_from_corrupt_payload() {
         let raw = "Verified inline signature by 'CN = OneKVM'\nVerification of data area failed.\nFailed to extract bundle: bundle payload is corrupted";
