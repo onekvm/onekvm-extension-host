@@ -137,6 +137,15 @@ with package identity and vermagic checked before registration. Package scripts
 are not run. Records are published after payload validation, so retrying an
 interrupted copy does not duplicate installed records. This also handles older
 Web upload clients that leave same-kernel updates in the `prepared` phase.
+Shared plugin payloads can remain active after their owning slot-local package
+record has disappeared. In that case, migration uses the version-matched dependency
+metadata retained by the host (or another slot's matching control record) as the
+root of the dependency closure. It restores the real dependency packages and
+matching optional modules without synthesizing a plugin ownership/file record.
+Same-kernel preflight inventories these plugins too and reports missing metadata
+or unsatisfied dependency versions before installation instead of declaring an
+empty migration successful. Target-image packages still take precedence.
+
 Extension enable flags, settings and data are preserved without modification.
 If optional payload validation fails on this identical-kernel path, the update
 plan records the failure while allowing other extensions to start. Kernel-change

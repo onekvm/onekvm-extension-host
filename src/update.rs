@@ -252,7 +252,14 @@ fn missing(plan: &Plan) -> Vec<Value> {
         ];
     }
     if !kernel_changed(plan) {
-        return Vec::new();
+        return match retained::check(plan) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![json!({
+                "package": "installed-plugin-dependencies",
+                "reason": "retained_dependency_missing",
+                "detail": error,
+            })],
+        };
     }
     let mut missing = BTreeMap::new();
     let mut modules = plan.target_modules.clone();
@@ -685,7 +692,7 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
         return Err("target system does not support installing plugin packages before startup; use a bundle with plugin-update support".into());
     }
     let source_slot = slot()?;
-    let plugins = if changed { inventory()? } else { Vec::new() };
+    let plugins = inventory()?;
     let mut baseline = database(&squash(&image, "usr/share/onekvm/opkg-baseline/status")?)?;
     if changed {
         for (name, package) in &mut baseline {
@@ -743,6 +750,11 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
     save(&plan)?;
     // Keep only the authenticated metadata; the staged .fwup is used by RAUC.
     remove_tree(unpack)?;
+    // Older Core upload handlers install identical-kernel bundles immediately,
+    // without consulting ready/missing. Reject here too, before RAUC can write.
+    if !changed {
+        retained::check(&plan)?;
+    }
     Ok(view(&plan))
 }
 
@@ -1151,12 +1163,12 @@ mod tests {
         }
     }
     #[test]
-    fn identical_kernel_identity_skips_plugin_requirements() {
+    fn identical_kernel_identity_requires_plugin_metadata() {
         let mut p = plan();
         p.target_kernel = p.current_kernel.clone();
         p.target_kernel_magic = p.current_kernel_magic.clone();
         p.plugins[0].depends = None;
-        assert!(missing(&p).is_empty());
+        assert!(!missing(&p).is_empty());
         assert_eq!(view(&p)["kernel_changed"], false);
     }
     #[test]
