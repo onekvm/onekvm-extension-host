@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 const MAX_OUTPUT: usize = 1 << 20;
 const SUPERVISOR_STACK_SIZE: usize = 128 * 1024;
 
+fn idle_wait_usec(timeout: Option<Duration>, elapsed: Duration) -> u64 {
+    let Some(timeout) = timeout else { return u64::MAX };
+    let remaining = timeout.saturating_sub(elapsed).as_nanos();
+    ((remaining + 999) / 1000).min(u128::from(u64::MAX - 1)) as u64
+}
+
 #[derive(Clone)]
 struct CommandSpec {
     command: Vec<String>,
@@ -1100,9 +1106,28 @@ pub unsafe extern "C" fn onekvm_helper_should_exit(
     i32::from(state.idle_expired())
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn onekvm_helper_wait_usec(helper: *mut std::os::raw::c_void) -> u64 {
+    let Some(state) = helper_ref(helper) else { return 0 };
+    if state.idle_timeout.is_none() {
+        return u64::MAX;
+    }
+    let Ok(last) = state.last_activity.lock() else { return 1_000_000 };
+    idle_wait_usec(state.idle_timeout, last.elapsed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_waits_for_actual_idle_deadline_or_indefinitely() {
+        assert_eq!(idle_wait_usec(None, Duration::from_secs(600)), u64::MAX);
+        let timeout = Some(Duration::from_secs(60));
+        assert_eq!(idle_wait_usec(timeout, Duration::from_secs(10)), 50_000_000);
+        assert_eq!(idle_wait_usec(timeout, Duration::from_secs(61)), 0);
+        assert_eq!(idle_wait_usec(Some(Duration::from_nanos(1)), Duration::ZERO), 1);
+    }
 
     #[test]
     fn command_rejects_invalid_environment() {

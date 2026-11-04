@@ -32,9 +32,10 @@ unresolved. This also repairs disabled plugins without starting them.
 Catalog snapshots include live enabled and service readiness state. Core checks
 the generic contribution token before reusing its snapshot, including when the
 host initializes defaults after Core's initial catalog warmup. Runtime snapshots
-also expire on demand (Core: five seconds; CLI disk cache: two seconds), so a
-service starting or stopping independently cannot leave a permanent stale
-status. This does not add background polling. In-flight queries retain their
+use lifecycle and systemd service notifications for invalidation (Core: up to
+one hour; CLI disk cache: two seconds). If Core cannot watch service changes,
+it falls back to a five-second on-demand lifetime. This does not add background
+polling. In-flight queries retain their
 original mutation revision, so a concurrent invalidation is not lost.
 
 ## Upgrade and activation transactions
@@ -150,6 +151,13 @@ Extension enable flags, settings and data are preserved without modification.
 If optional payload validation fails on this identical-kernel path, the update
 plan records the failure while allowing other extensions to start. Kernel-change
 installation failures still block startup as before.
+
+## Helper idle waits
+
+Helpers with a persistent controller wait for D-Bus work without a periodic
+idle wakeup. Command-only helpers retain their 60-second idle lease and wait
+for its actual remaining duration; each request renews the lease. Managed
+process supervision and explicit systemd stop remain independent of this wait.
 
 ## System update diagnostics
 

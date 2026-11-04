@@ -59,6 +59,7 @@ int onekvm_helper_exec_capture(void *helper, char **command, size_t ncommand,
 int onekvm_helper_instances(void *helper, char ***names, size_t *count,
                             char **err);
 int onekvm_helper_should_exit(void *helper);
+uint64_t onekvm_helper_wait_usec(void *helper);
 
 static uint64_t now_usec(void) {
     struct timespec ts;
@@ -1620,7 +1621,7 @@ int onekvm_helper_serve(void *helper) {
             continue;
         if (onekvm_helper_should_exit(helper))
             break;
-        result = sd_bus_wait(bus, 1000000ull);
+        result = sd_bus_wait(bus, onekvm_helper_wait_usec(helper));
         if (result < 0)
             goto out;
         if (onekvm_helper_should_exit(helper))
