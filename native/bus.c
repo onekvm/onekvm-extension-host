@@ -915,8 +915,10 @@ static int systemd_unit_file_action(sd_bus *bus, const char *action,
                                     const char *unit) {
     sd_bus_message *message = NULL, *reply = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
-    const char *method = strcmp(action, "enable") == 0
-                             ? "EnableUnitFiles" : "DisableUnitFiles";
+    const char *method = strcmp(action, "enable") == 0 ? "EnableUnitFiles"
+                       : strcmp(action, "disable") == 0 ? "DisableUnitFiles"
+                       : strcmp(action, "mask") == 0 ? "MaskUnitFiles"
+                       : "UnmaskUnitFiles";
     int result = sd_bus_message_new_method_call(bus, &message, SYSTEMD_NAME,
                                                 SYSTEMD_PATH, SYSTEMD_MANAGER,
                                                 method);
@@ -934,7 +936,7 @@ static int systemd_unit_file_action(sd_bus *bus, const char *action,
     result = sd_bus_message_append(message, "b", 0);
     if (result < 0)
         goto out;
-    if (strcmp(action, "enable") == 0) {
+    if (strcmp(action, "enable") == 0 || strcmp(action, "mask") == 0) {
         result = sd_bus_message_append(message, "b", 0);
         if (result < 0)
             goto out;
@@ -958,7 +960,8 @@ out:
 int onekvm_systemd_unit_action(const char *action, const char *unit) {
     if (!action || !unit || !unit[0])
         return -EINVAL;
-    if (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0) {
+    if (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0 ||
+        strcmp(action, "mask") == 0 || strcmp(action, "unmask") == 0) {
         sd_bus *bus = NULL;
         int result = sd_bus_open_system(&bus);
         if (result >= 0)

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
@@ -18,6 +20,10 @@ pub struct SystemPlugin {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub kernel_modules: Vec<String>,
+    #[serde(default = "default_system")]
+    pub system: bool,
+    #[serde(default)]
+    pub settings_command: Vec<String>,
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -56,8 +62,15 @@ pub struct SystemPluginDBus {
     pub methods: BTreeMap<String, String>,
 }
 
+fn default_system() -> bool {
+    true
+}
+
 impl SystemPlugin {
     pub fn invoke(&self, method: &str, payload: &str) -> Result<String, String> {
+        if !self.system && !sandbox::is_enabled(&self.unit) {
+            return Err(format!("plugin {} is disabled", self.id));
+        }
         let endpoint = self
             .dbus
             .as_ref()
@@ -97,7 +110,8 @@ impl SystemPlugin {
             installed: true,
             enabled,
             running,
-            system: true,
+            system: self.system,
+            removable: Some(false),
             error: String::new(),
             icon,
             icon_data_url: String::new(),
@@ -149,7 +163,8 @@ impl SystemPlugin {
             installed: true,
             enabled: summary.enabled,
             running: summary.running,
-            system: true,
+            system: self.system,
+            removable: Some(false),
             error: String::new(),
             capabilities: self.capabilities.clone(),
             video: None,
@@ -174,7 +189,84 @@ impl SystemPlugin {
         })
     }
 
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        if self.system {
+            return Err(format!(
+                "system plugin {} cannot be enabled or disabled",
+                self.id
+            ));
+        }
+        if enabled {
+            let was_enabled = sandbox::is_enabled(&self.unit);
+            sandbox::unit_action("unmask", &self.unit)?;
+            let result = sandbox::unit_action("enable", &self.unit)
+                .and_then(|_| sandbox::unit_action("start", &self.unit));
+            if result.is_err() && !was_enabled {
+                sandbox::unit_action("mask", &self.unit)?;
+                sandbox::unit_action("stop", &self.unit)?;
+            }
+            result?;
+        } else {
+            // D-Bus activation and Core's Wants must not revive a disabled provider.
+            let was_enabled = sandbox::is_enabled(&self.unit);
+            sandbox::unit_action("mask", &self.unit)?;
+            if let Err(error) = sandbox::unit_action("stop", &self.unit) {
+                if was_enabled {
+                    sandbox::unit_action("unmask", &self.unit)?;
+                }
+                return Err(error);
+            }
+        }
+        crate::contributions::changed()
+    }
+
+    fn settings_command(&self, payload: Option<&str>) -> Result<serde_json::Value, String> {
+        let (program, args) = self
+            .settings_command
+            .split_first()
+            .ok_or("plugin has no offline settings command")?;
+        if !Path::new(program).is_absolute() {
+            return Err("plugin settings command must use an absolute executable path".into());
+        }
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(if payload.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("plugin {} settings: {err}", self.id))?;
+        if let Some(payload) = payload {
+            let result = child
+                .stdin
+                .take()
+                .expect("settings stdin")
+                .write_all(payload.as_bytes());
+            if let Err(error) = result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("write plugin settings: {error}"));
+            }
+        }
+        let output = child.wait_with_output().map_err(|err| err.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "plugin {} settings: {}",
+                self.id,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|err| format!("decode plugin {} settings: {err}", self.id))
+    }
+
     pub fn settings(&self) -> Result<serde_json::Value, String> {
+        if !self.settings_command.is_empty() && !sandbox::is_active(&self.unit) {
+            return self.settings_command(None);
+        }
         let Some(endpoint) = &self.dbus else {
             return Ok(serde_json::json!({}));
         };
@@ -208,6 +300,10 @@ impl SystemPlugin {
             settings.insert(name, value);
         }
         let payload = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+        if !self.settings_command.is_empty() && !sandbox::is_active(&self.unit) {
+            self.settings_command(Some(&payload))?;
+            return Ok(());
+        }
         crate::dbus_client::call_string(
             &endpoint.bus_name,
             &endpoint.object_path,
@@ -270,6 +366,45 @@ pub fn load_system_plugins() -> Result<BTreeMap<String, SystemPlugin>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_plugins_keep_system_protection_unless_explicitly_opted_out() {
+        let value = serde_json::json!({"id":"native-test","name":"Native","kind":"device","version":"1.0.0","unit":"onekvm-native-test.service"});
+        let protected: SystemPlugin = serde_json::from_value(value.clone()).unwrap();
+        assert!(protected.system);
+        assert!(protected
+            .set_enabled(false)
+            .unwrap_err()
+            .contains("cannot be enabled or disabled"));
+        let mut value = value;
+        value["system"] = serde_json::json!(false);
+        let optional: SystemPlugin = serde_json::from_value(value).unwrap();
+        let summary = optional.summary();
+        assert!(!summary.system);
+        assert_eq!(summary.removable, Some(false));
+    }
+
+    #[test]
+    fn offline_settings_commands_read_and_update_without_dbus_activation() {
+        let value = serde_json::json!({"id":"native-test","name":"Native","kind":"device","system":false,"version":"1.0.0","unit":"onekvm-native-test.service","settings_command":["/bin/echo","{\"use_default\":true}"]});
+        let mut plugin: SystemPlugin = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            plugin.settings().unwrap(),
+            serde_json::json!({"use_default":true})
+        );
+        plugin.settings_command = vec!["/bin/cat".into()];
+        assert_eq!(
+            plugin
+                .settings_command(Some("{\"use_default\":false}"))
+                .unwrap(),
+            serde_json::json!({"use_default":false})
+        );
+        plugin.settings_command = vec!["relative-binary".into()];
+        assert!(plugin
+            .settings_command(None)
+            .unwrap_err()
+            .contains("absolute"));
+    }
+
     #[test]
     fn system_plugins_publish_session_routes_without_changing_legacy_registrations() {
         let mut value = serde_json::json!({"id":"screen-display", "name":"Screen", "kind":"device", "version":"0.1.0", "unit":"screen.service"});

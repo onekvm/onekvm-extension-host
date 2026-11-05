@@ -891,6 +891,9 @@ fn stop_before_removal(id: &str, state: &crate::state::PluginState) -> Result<()
 }
 
 pub fn remove_package(name: &str) -> Result<(), String> {
+    if crate::system_plugin::load_system_plugins()?.contains_key(name) {
+        return Err("native plugin packages are managed by the system image".into());
+    }
     let package_name = resolve_extension_package(name)
         .map_err(|_| "remove accepts an extension id or onekvm-extension-* package name")?;
     let id = package_name.trim_start_matches("onekvm-extension-");
@@ -908,6 +911,9 @@ pub fn remove_package(name: &str) -> Result<(), String> {
 }
 
 pub fn purge(id: &str) -> Result<(), String> {
+    if crate::system_plugin::load_system_plugins()?.contains_key(id) {
+        return Err("native plugin packages are managed by the system image".into());
+    }
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }

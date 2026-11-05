@@ -53,6 +53,8 @@ pub struct CatalogSummary {
     pub running: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removable: Option<bool>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +116,8 @@ pub struct CatalogEntry {
     pub running: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removable: Option<bool>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -167,7 +171,7 @@ struct CatalogDiskCache {
     entries: Vec<serde_json::Value>,
 }
 
-const CATALOG_CACHE_VERSION: i32 = 8;
+const CATALOG_CACHE_VERSION: i32 = 9;
 const CATALOG_RUNTIME_TTL: Duration = Duration::from_secs(2);
 
 pub fn catalog() -> Result<Vec<CatalogSummary>, String> {
@@ -374,6 +378,7 @@ pub fn summary_from_manifest(
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         icon,
         icon_data_url,
@@ -473,6 +478,7 @@ fn entry_from_manifest(
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         capabilities: extension.capabilities.clone(),
         video: extension.video.clone(),
@@ -611,6 +617,7 @@ fn empty_summary() -> CatalogSummary {
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         icon: None,
         icon_data_url: String::new(),

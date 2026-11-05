@@ -212,6 +212,9 @@ pub fn disable(id: &str) -> Result<(), String> {
 }
 
 pub fn enable_unlocked(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        return plugin.set_enabled(true);
+    }
     let mut state = read_state(id)?;
     let original = state.clone();
     if state.active_version.is_empty() {
@@ -255,6 +258,9 @@ pub fn enable_unlocked(id: &str) -> Result<(), String> {
 }
 
 pub fn disable_unlocked(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        return plugin.set_enabled(false);
+    }
     let mut state = read_state(id)?;
     if !state.enabled {
         let result = crate::dbus_client::disable(id, state.revision);
@@ -277,6 +283,7 @@ pub fn disable_unlocked(id: &str) -> Result<(), String> {
 }
 
 pub fn start(id: &str) -> Result<(), String> {
+    if load_system_plugins()?.contains_key(id) { return enable(id); }
     sys::with_lock(|| {
         let state = read_state(id)?;
         if state.active_version.is_empty() {
@@ -287,6 +294,7 @@ pub fn start(id: &str) -> Result<(), String> {
 }
 
 pub fn stop(id: &str) -> Result<(), String> {
+    if load_system_plugins()?.contains_key(id) { return disable(id); }
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
@@ -297,6 +305,10 @@ pub fn stop(id: &str) -> Result<(), String> {
 }
 
 pub fn restart(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        if !sandbox::is_enabled(&plugin.unit) { return Err(format!("plugin {id} is disabled")); }
+        return sandbox::unit_action("restart", &plugin.unit);
+    }
     sys::with_lock(|| {
         let state = read_state(id)?;
         crate::dbus_client::disable(id, state.revision)?;
@@ -313,6 +325,15 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
     }
     if !matches!(action, "start" | "stop" | "restart" | "enable" | "disable") {
         return Err(format!("unsupported service action {action:?}"));
+    }
+    if load_system_plugins()?.contains_key(id) {
+        if service != "main" { return Err(format!("plugin {id} does not register service {service}")); }
+        return match action {
+            "enable" | "start" => enable(id),
+            "disable" | "stop" => disable(id),
+            "restart" => restart(id),
+            _ => unreachable!(),
+        };
     }
     let (registered_service, controller, enabled) = sys::with_lock(|| {
         let state = read_state(id)?;
@@ -384,13 +405,14 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
     let request = read_configure_request(stdin)?;
     let system_plugins = load_system_plugins()?;
     if let Some(plugin) = system_plugins.get(id) {
-        if request.enabled.is_some() {
+        if plugin.system && request.enabled.is_some() {
             return Err(format!("system plugin {id} cannot be enabled or disabled"));
         }
-        let Some(settings) = request.settings else {
-            return Ok(());
-        };
-        return plugin.update_settings(settings);
+        return sys::with_lock(|| {
+            if let Some(settings) = request.settings { plugin.update_settings(settings)?; }
+            if let Some(enabled) = request.enabled { plugin.set_enabled(enabled)?; }
+            Ok(())
+        });
     }
     sys::with_lock(|| {
         let mut state = read_state(id)?;

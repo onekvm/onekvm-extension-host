@@ -221,3 +221,13 @@ Extensions may declare `console: {entrypoint: "web/console.js"}`. Catalogs expos
 this declaration so the UI can run `onLoad` on console entry and display its
 browser-code risk in plugin details. The host validates the safe JS path; the OE
 class verifies the packaged resource. See the UI console hook v1 contract.
+
+Native provider registrations default to protected system components. Setting
+`system: false` allows the plugin manager and CLI to enable/disable the registered
+unit. Disable persists a systemd mask and stops the unit, so dependency and D-Bus
+activation cannot restart it. Enable removes that mask and starts the unit.
+Native packages publish `removable: false`; disabling does not permit uninstalling
+system-image packages. An optional absolute argv `settings_command` reads settings
+as JSON on stdout, or accepts a complete settings object on stdin to update them
+without starting the disabled service. Existing D-Bus settings remain the path
+for running providers.
