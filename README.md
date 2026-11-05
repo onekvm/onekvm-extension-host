@@ -206,3 +206,11 @@ against the image baseline. Installation uses only those local files with no
 software sources configured, so the solver cannot introduce other system
 candidates. Local uploads containing image packages are rejected. Explicit system
 updates use the target image's separate offline installation path.
+
+## Native browser views
+
+Settings pages and toolbox items accept `renderer: "web-component"` for native
+JavaScript and Lit elements. Their resource paths, method permissions and
+settings schema retain the existing extension contracts. The acceptance fixture
+is in `tests/fixtures/web-component-probe`; run `tests/build-web-component-probe.sh`
+and build `onekvm-extension-web-component-probe` with the distro Make entrypoint.

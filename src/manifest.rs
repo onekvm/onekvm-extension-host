@@ -875,7 +875,7 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
                 ));
             }
         }
-        if item.view.renderer != "vue"
+        if !matches!(item.view.renderer.as_str(), "vue" | "web-component")
             || !paths::safe_relative(&item.view.entrypoint)
             || item
                 .view
@@ -886,7 +886,7 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
             || !item.view.entrypoint.ends_with(".js")
         {
             return Err(format!(
-                "toolbox view must be Vue JavaScript under web/ for {:?}",
+                "toolbox view must be Vue or Web Component JavaScript under web/ for {:?}",
                 item.id
             ));
         }
@@ -1311,6 +1311,12 @@ mod tests {
         let valid = serde_json::json!({"items":[{"id":"inspect","title":"Inspector","subtitle":"Inspect this device","i18n":{"zh":{"title":"检查器","subtitle":"检查这台设备"}},"presentation":"window","layout":"edge-to-edge","size":{"width":4096,"height":1},"view":{"renderer":"vue","entrypoint":"web/inspect.js"}}]});
         let parse = |v| serde_json::from_value::<ExtensionToolbox>(v).unwrap();
         validate_toolbox(&parse(valid.clone())).unwrap();
+        let mut web_component = valid.clone();
+        web_component["items"][0]["view"]["renderer"] = serde_json::json!("web-component");
+        validate_toolbox(&parse(web_component)).unwrap();
+        let mut unsupported = valid.clone();
+        unsupported["items"][0]["view"]["renderer"] = serde_json::json!("html");
+        assert!(validate_toolbox(&parse(unsupported)).is_err());
         for path in [
             "/web/view.js",
             "web/../view.js",
