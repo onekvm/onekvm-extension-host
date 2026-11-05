@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::feed::available_extensions;
 use crate::manifest::{
     installed_versions, load_installed, ActivationConflict, AuthProvider, ExtensionPage,
-    ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, Manifest,
+    ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, ExtensionConsole, Manifest,
     ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
 };
 use crate::memory;
@@ -69,6 +69,8 @@ pub struct CatalogSummary {
     pub has_shell: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -132,6 +134,8 @@ pub struct CatalogEntry {
     pub toolbar: Option<ExtensionToolbar>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -378,6 +382,7 @@ pub fn summary_from_manifest(
         toolbar: extension.toolbar.clone(),
         has_shell: extension.shell.is_some(),
         shell: extension.shell.clone(),
+        console: extension.console.clone(),
         toolbox: extension.toolbox.clone(),
         has_settings: !extension.settings_schema.properties.is_empty(),
         services: catalog_services(extension, &extension.id, installed, false),
@@ -478,6 +483,7 @@ fn entry_from_manifest(
         page: extension.page.clone(),
         toolbar: extension.toolbar.clone(),
         shell: extension.shell.clone(),
+        console: extension.console.clone(),
         toolbox: extension.toolbox.clone(),
         routes: extension.routes.clone(),
         auth_provider: extension.auth_provider.clone(),
@@ -613,6 +619,7 @@ fn empty_summary() -> CatalogSummary {
         toolbar: None,
         has_shell: false,
         shell: None,
+        console: None,
         toolbox: None,
         has_settings: false,
         services: Vec::new(),

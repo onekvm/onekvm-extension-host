@@ -214,3 +214,10 @@ JavaScript and Lit elements. Their resource paths, method permissions and
 settings schema retain the existing extension contracts. The acceptance fixture
 is in `tests/fixtures/web-component-probe`; run `tests/build-web-component-probe.sh`
 and build `onekvm-extension-web-component-probe` with the distro Make entrypoint.
+
+## Console load hooks
+
+Extensions may declare `console: {entrypoint: "web/console.js"}`. Catalogs expose
+this declaration so the UI can run `onLoad` on console entry and display its
+browser-code risk in plugin details. The host validates the safe JS path; the OE
+class verifies the packaged resource. See the UI console hook v1 contract.

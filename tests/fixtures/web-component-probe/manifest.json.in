@@ -9,6 +9,7 @@
   },
   "permissions": [], "capabilities": [], "default_enabled": true,
   "icon": {"source": "lucide", "name": "blocks"},
+  "console": {"entrypoint": "web/console.js"},
   "page": {"title": "Web Components", "renderer": "web-component", "entrypoint": "web/page.js"},
   "toolbox": {"items": [
     {"id": "native", "title": "Native JavaScript", "i18n": {"zh": {"title": "原生 JavaScript"}, "zh-TW": {"title": "原生 JavaScript"}}, "presentation": "window", "size": {"width": 440, "height": 380}, "view": {"renderer": "web-component", "entrypoint": "web/native-tool.js"}},

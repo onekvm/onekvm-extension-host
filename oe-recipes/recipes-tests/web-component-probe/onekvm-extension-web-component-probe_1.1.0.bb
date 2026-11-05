@@ -4,7 +4,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=8a5a0a588995e3e2c2bfa68f5413df57"
 EXCLUDE_FROM_WORLD = "1"
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../tests/fixtures/web-component-probe:${THISDIR}/../../..:"
 # Generate the ignored Lit bundle with tests/build-web-component-probe.sh.
-SRC_URI = "file://Makefile file://manifest.json.in file://probe.sh file://native-view.js file://lit-tool.bundle.js file://LICENSE"
+SRC_URI = "file://Makefile file://manifest.json.in file://probe.sh file://native-view.js file://console.js file://lit-tool.bundle.js file://LICENSE"
 S = "${UNPACKDIR}"
 inherit onekvm-extension
 OPKGBUILDCMD = "opkg-build -Z gzip"

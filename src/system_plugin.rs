@@ -106,6 +106,7 @@ impl SystemPlugin {
             toolbar: None,
             has_shell: false,
             shell: None,
+            console: None,
             toolbox: None,
             has_settings: !self.settings_schema.properties.is_empty(),
             services: vec![CatalogService {
@@ -159,6 +160,7 @@ impl SystemPlugin {
             page: self.page.clone(),
             toolbar: None,
             shell: None,
+            console: None,
             toolbox: None,
             routes: self.routes.clone(),
             auth_provider: None,

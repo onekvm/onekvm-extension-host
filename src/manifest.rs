@@ -66,6 +66,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
@@ -186,6 +188,12 @@ pub struct ExtensionToolbar {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExtensionShell {
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionConsole {
     pub entrypoint: String,
 }
 
@@ -794,6 +802,14 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
                 "unsafe toolbar entrypoint {:?}",
                 toolbar.entrypoint
             ));
+        }
+    }
+    if let Some(console) = &value.console {
+        if !paths::safe_relative(&console.entrypoint)
+            || !console.entrypoint.starts_with("web/")
+            || !console.entrypoint.ends_with(".js")
+        {
+            return Err(format!("unsafe console entrypoint {:?}", console.entrypoint));
         }
     }
     if let Some(shell) = &value.shell {
@@ -1440,6 +1456,25 @@ mod tests {
                 .unwrap_err()
                 .contains("environment packages cannot declare a resident service"));
         }
+    }
+
+    #[test]
+    fn console_entrypoint_is_explicit_safe_web_javascript() {
+        let data = serde_json::json!({
+            "id": "console-example", "name": "Console example", "version": "1.0.0",
+            "api_version": 2, "kind": "service", "entrypoint": "bin/noop",
+            "console": {"entrypoint": "web/console.js"}
+        });
+        let manifest = decode_manifest(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert_eq!(manifest.console.unwrap().entrypoint, "web/console.js");
+        for path in ["../console.js", "/web/console.js", "web/../console.js", "web/console.html", "web\\console.js"] {
+            let mut invalid = data.clone();
+            invalid["console"]["entrypoint"] = serde_json::json!(path);
+            assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let mut invalid = data;
+        invalid["console"]["code"] = serde_json::json!("alert(1)");
+        assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 
     #[test]
