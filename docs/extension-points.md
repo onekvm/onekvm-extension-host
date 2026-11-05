@@ -52,6 +52,14 @@ It returns an empty array if the point provider is absent or disabled. The
 consumer handles refresh, method polling, timeouts, and failures; one
 contributor cannot replace another's namespaced item.
 
+Plugin details (`onekvm-extension detail <id>` and Core's
+`GET /api/extensions/{id}`) include a `contributions` array of declared
+`{id,point,version}` summaries, including while the plugin is disabled or only
+available in the feed. Method names and contribution data are not included in
+this projection. The field is omitted when empty. The settings UI uses
+`mcp.tool` version 1 entries to show that a plugin extends MCP and how many tools
+it provides; access remains controlled by the MCP plugin's saved policy.
+
 For a screen App, the screen provider defines `screen-display.app` version 1.
 The contribution data uses a safe package-relative `bundle` directory:
 

@@ -11,7 +11,7 @@ use crate::feed::available_extensions;
 use crate::manifest::{
     installed_versions, load_installed, ActivationConflict, AuthProvider, ExtensionPage,
     ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, ExtensionConsole, Manifest,
-    ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
+    Contribution, ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
 };
 use crate::memory;
 use crate::paths;
@@ -92,6 +92,23 @@ pub struct CatalogSummary {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct CatalogContribution {
+    pub id: String,
+    pub point: String,
+    pub version: u32,
+}
+
+impl From<&Contribution> for CatalogContribution {
+    fn from(contribution: &Contribution) -> Self {
+        Self {
+            id: contribution.id.clone(),
+            point: contribution.point.clone(),
+            version: contribution.version,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct CatalogEntry {
     pub permissions: Vec<String>,
     pub kernel_modules: Vec<String>,
@@ -122,6 +139,8 @@ pub struct CatalogEntry {
     pub error: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contributions: Vec<CatalogContribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video: Option<ManifestVideo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -481,6 +500,7 @@ fn entry_from_manifest(
         removable: None,
         error: String::new(),
         capabilities: extension.capabilities.clone(),
+        contributions: extension.contributions.iter().map(CatalogContribution::from).collect(),
         video: extension.video.clone(),
         device_variants: extension.device_variants.clone(),
         activation_conflicts: extension.activation_conflicts.clone(),
@@ -796,6 +816,29 @@ fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_projects_declared_contributions_without_execution_payloads() {
+        let manifest = Manifest {
+            contributions: vec![Contribution {
+                id: "read-edid".into(),
+                point: "mcp.tool".into(),
+                version: 1,
+                method: "read".into(),
+                data: serde_json::json!({"inputSchema": {"type": "object"}}),
+            }],
+            ..Manifest::default()
+        };
+        let detail = serde_json::to_value(entry_from_manifest(&manifest, false, Vec::new())).unwrap();
+        assert_eq!(detail["contributions"], serde_json::json!([{
+            "id": "read-edid", "point": "mcp.tool", "version": 1
+        }]));
+        assert_eq!(detail["enabled"], false);
+        let summary = serde_json::to_value(summary_from_manifest(&manifest, false, String::new())).unwrap();
+        assert!(summary.get("contributions").is_none());
+        let empty = serde_json::to_value(entry_from_manifest(&Manifest::default(), false, Vec::new())).unwrap();
+        assert!(empty.get("contributions").is_none());
+    }
 
     #[test]
     fn cached_runtime_status_expires_and_rejects_clock_rollback() {

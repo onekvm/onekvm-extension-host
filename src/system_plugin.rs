@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::catalog::{CatalogEntry, CatalogService, CatalogSummary};
+use crate::catalog::{CatalogContribution, CatalogEntry, CatalogService, CatalogSummary};
 use crate::manifest::{
     Contribution, ExtensionPage, ExtensionPoint, ExtensionRoute, PageIcon, SettingsSchema,
     Translation,
@@ -167,6 +167,7 @@ impl SystemPlugin {
             removable: Some(false),
             error: String::new(),
             capabilities: self.capabilities.clone(),
+            contributions: self.contributions.iter().map(CatalogContribution::from).collect(),
             video: None,
             device_variants: Vec::new(),
             activation_conflicts: Vec::new(),
