@@ -68,6 +68,8 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     let mut supplementary_groups = Vec::new();
     if permissions.contains("device-video") {
         devices.extend(glob_paths("/dev/video*"));
+        // Nodes opened to extensions (e.g. the decoder) are group video.
+        supplementary_groups.push("video");
     }
     if permissions.contains("device-kvm") && Path::new("/dev/kvm").exists() {
         devices.push("/dev/kvm".into());
@@ -99,6 +101,8 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     if permissions.contains("network-admin") {
         devices.push("/dev/net/tun".into());
     }
+    supplementary_groups.sort_unstable();
+    supplementary_groups.dedup();
     if !supplementary_groups.is_empty() {
         arguments.push(format!(
             "--property=SupplementaryGroups={}",
