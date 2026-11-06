@@ -7,6 +7,8 @@ use crate::manifest::Installed;
 use crate::paths;
 use crate::sys;
 
+const NPU_USER_MODELS: &str = "/data/onekvm/npu-models";
+
 pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     let id = &extension.manifest.id;
     let permissions: std::collections::BTreeSet<_> = extension
@@ -78,9 +80,16 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         devices.push("/dev/onekvm-crypto-offload".into());
         supplementary_groups.push("onekvm-crypto");
     }
-    if permissions.contains("npu") && group_exists("onekvm-npu") {
-        // onekvm-npu.socket (/run/onekvm-npu.sock) is mode 0660, group onekvm-npu.
+    if (permissions.contains("npu") || permissions.contains("npu-models"))
+        && group_exists("onekvm-npu")
+    {
+        // onekvm-npu.socket (/run/onekvm-npu.sock) is mode 0660 and the
+        // uploaded model directory 2770, both group onekvm-npu.
         supplementary_groups.push("onekvm-npu");
+    }
+    if permissions.contains("npu-models") && Path::new(NPU_USER_MODELS).is_dir() {
+        // onekvm-npud loads models uploaded here in preference to installed ones.
+        arguments.push(format!("--property=ReadWritePaths={NPU_USER_MODELS}"));
     }
     if permissions.contains("device-hid") {
         devices.extend(glob_paths("/dev/hidg*"));
