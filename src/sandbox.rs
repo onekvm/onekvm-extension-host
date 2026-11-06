@@ -78,6 +78,10 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         devices.push("/dev/onekvm-crypto-offload".into());
         supplementary_groups.push("onekvm-crypto");
     }
+    if permissions.contains("npu") && group_exists("onekvm-npu") {
+        // onekvm-npu.socket (/run/onekvm-npu.sock) is mode 0660, group onekvm-npu.
+        supplementary_groups.push("onekvm-npu");
+    }
     if permissions.contains("device-hid") {
         devices.extend(glob_paths("/dev/hidg*"));
     }
@@ -537,16 +541,39 @@ pub fn is_enabled(unit: &str) -> bool {
         .unwrap_or(false)
 }
 
+// systemd refuses to start a unit whose SupplementaryGroups names a missing
+// group, so optional groups are added only when their package created them.
+fn group_exists(name: &str) -> bool {
+    group_listed(
+        &std::fs::read_to_string("/etc/group").unwrap_or_default(),
+        name,
+    )
+}
+
+fn group_listed(groups: &str, name: &str) -> bool {
+    groups
+        .lines()
+        .any(|line| line.split(':').next() == Some(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        capability_arguments, network_address_families, sandbox_identity,
+        capability_arguments, group_listed, network_address_families, sandbox_identity,
         unrestricted_host_arguments,
     };
     use std::collections::BTreeSet;
 
     fn permissions(values: &[&'static str]) -> BTreeSet<&'static str> {
         values.iter().copied().collect()
+    }
+
+    #[test]
+    fn optional_groups_match_whole_names() {
+        let groups = "root:x:0:\nvideo:x:44:\nonekvm-npu-old:x:990:\nonekvm-npu:x:991:\n";
+        assert!(group_listed(groups, "onekvm-npu"));
+        assert!(!group_listed("onekvm-npu-old:x:990:\n", "onekvm-npu"));
+        assert!(!group_listed("", "onekvm-npu"));
     }
 
     #[test]
