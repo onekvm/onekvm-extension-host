@@ -5,6 +5,12 @@ maintain a list of contributor IDs or run contributor-specific registration
 hooks. Registration follows the enabled state; stopping a service can leave its
 management UI available.
 
+Starting a managed entrypoint service also turns on its writable boolean
+`service_enabled` setting and enables the extension. This uses the normal
+settings validation and port checks, preserving saved credentials and other
+settings. Controller-managed services and services with an explicit systemd unit
+retain their existing action handlers; read-only settings are not rewritten.
+
 All state changes publish the atomic generic change token
 `/run/onekvm/contributions-generation`. Consumers subscribe to the parent
 directory with inotify before initial
