@@ -34,6 +34,9 @@ do_install() {
     ln -s ../onekvm-plugin-update.service \
         ${D}${systemd_system_unitdir}/onekvm-pre.target.requires/onekvm-plugin-update.service
     install -d ${D}${datadir}/onekvm
+    if [ -f ${S}/src/network_policy.rs ]; then
+        printf '1\n' >${D}${datadir}/onekvm/extension-network-policy-v1
+    fi
     printf '1\n' >${D}${datadir}/onekvm/plugin-update-version
     install -Dm0644 ${S}/packaging/30-onekvm-extension-group.conf \
         ${D}${systemd_system_unitdir}/onekvm.service.d/30-onekvm-extension-group.conf

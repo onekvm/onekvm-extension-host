@@ -18,6 +18,7 @@ mod lifecycle;
 mod manifest;
 mod memory;
 mod network_modules;
+mod network_policy;
 mod package_policy;
 mod package_sizes;
 mod paths;

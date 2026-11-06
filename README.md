@@ -231,3 +231,13 @@ system-image packages. An optional absolute argv `settings_command` reads settin
 as JSON on stdout, or accepts a complete settings object on stdin to update them
 without starting the disabled service. Existing D-Bus settings remain the path
 for running providers.
+
+## Installed network opt-outs
+
+`/etc/onekvm/network-policy.json` (v1) can disable `extensions`. The host then
+rejects feed refreshes and online installs. Local IPK/IPKS installation remains
+available but does not download dependencies: provide complete local payloads.
+Missing policy preserves existing behavior; unreadable, malformed, oversized,
+unknown-version or unknown-feature policy refuses network operations. This does
+not disable network access inside already installed extensions. The image-level
+Internet firewall controls their public traffic separately.

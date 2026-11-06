@@ -391,6 +391,7 @@ pub fn install_package(name: &str) -> Result<(), String> {
 }
 
 pub fn install_package_with_options(name: &str, wait: bool, size_bytes: u64, enable_after_install: Option<bool>) -> Result<(), String> {
+    crate::network_policy::require("extensions")?;
     let package_name = resolve_extension_package(name)?;
     start_install_job(&package_name, size_bytes, enable_after_install)?;
     if wait {
@@ -848,7 +849,9 @@ fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf], enable_
         for filename in filenames {
             download.push(filename.to_str().ok_or("invalid local package path")?);
         }
-        run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+        if crate::network_policy::require("extensions").is_ok() {
+            run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+        }
         let arguments =
             crate::package_policy::offline_install_arguments(&tmp, &cache, filenames, true)?;
         let prep = prepare_installed_upgrade(info, enable_after_install)?;
