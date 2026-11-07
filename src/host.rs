@@ -1215,15 +1215,35 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
     let unit = paths::unit_name(&extension.manifest.id);
     let socket_unit = paths::socket_unit(&extension.manifest.id);
     if extension.manifest.socket_activation.is_some() && is_active(&socket_unit) {
-        return Ok(());
-    }
-    if is_active(&unit) {
-        if extension.manifest.socket_activation.is_none() && legacy_unit_has_core_lifetime(&unit) {
+        if !crate::sandbox::runs_elsewhere(&unit, &extension.root) {
             return Ok(());
         }
         eprintln!(
-            "extension {}: replacing legacy PartOf unit with ordered BindsTo unit",
+            "extension {}: replacing the socket service of another version",
             extension.manifest.id
+        );
+        unit_action("stop", &socket_unit)?;
+        unit_action("stop", &unit)?;
+        let _ = unit_action("reset-failed", &unit);
+    }
+    if is_active(&unit) {
+        // A unit left running by another installed version (an upgrade
+        // outside a host transaction) is replaced, not kept.
+        let other_version = crate::sandbox::runs_elsewhere(&unit, &extension.root);
+        if !other_version
+            && extension.manifest.socket_activation.is_none()
+            && legacy_unit_has_core_lifetime(&unit)
+        {
+            return Ok(());
+        }
+        eprintln!(
+            "extension {}: replacing {}",
+            extension.manifest.id,
+            if other_version {
+                "the service of another version"
+            } else {
+                "legacy PartOf unit with ordered BindsTo unit"
+            }
         );
         unit_action("stop", &unit)?;
         let _ = unit_action("reset-failed", &unit);

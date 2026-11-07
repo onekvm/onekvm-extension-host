@@ -371,6 +371,7 @@ extern "C" {
         dependency: *const c_char,
     ) -> c_int;
     fn onekvm_systemd_unit_action(action: *const c_char, unit: *const c_char) -> c_int;
+    fn onekvm_systemd_unit_runs_in(unit: *const c_char, dir: *const c_char) -> c_int;
 }
 
 struct CStrings {
@@ -541,6 +542,16 @@ pub fn unit_has_dependency(unit: &str, property: &str, dependency: &str) -> bool
         onekvm_systemd_unit_has_dependency(unit.as_ptr(), property.as_ptr(), dependency.as_ptr())
             > 0
     }
+}
+
+/// Whether a loaded unit runs in another directory than DIR, i.e. still runs
+/// an older version of its extension. False when it is not loaded.
+pub fn runs_elsewhere(unit: &str, dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(unit), Ok(dir)) = (CString::new(unit), CString::new(dir.as_os_str().as_bytes())) else {
+        return false;
+    };
+    unsafe { onekvm_systemd_unit_runs_in(unit.as_ptr(), dir.as_ptr()) == 0 }
 }
 
 pub fn is_active(unit: &str) -> bool {
