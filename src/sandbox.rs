@@ -72,6 +72,17 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         devices.extend(glob_paths("/dev/video*"));
         // Nodes opened to extensions (e.g. the decoder) are group video.
         supplementary_groups.push("video");
+        // Stateless decoders (AX630C Hantro) are reached through their stable
+        // aliases, video node plus Media Request API node.
+        for alias in ["/dev/onekvm-vdec", "/dev/onekvm-vdec-media"] {
+            if let Ok(target) = std::fs::canonicalize(alias) {
+                let target = target.display().to_string();
+                arguments.push(format!("--property=DeviceAllow={target} rw"));
+                // GStreamer's v4l2codecs finds decoders by their real node.
+                arguments.push(format!("--property=BindPaths={target}"));
+                arguments.push(format!("--property=BindPaths={target}:{alias}"));
+            }
+        }
     }
     if permissions.contains("device-kvm") && Path::new("/dev/kvm").exists() {
         devices.push("/dev/kvm".into());
