@@ -1459,7 +1459,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
     } else {
         "controller"
     };
-    let reuse_key = format!("sandbox-v3:{}:{mode}", extension.manifest.version);
+    let reuse_key = format!("sandbox-v4:{}:{mode}", extension.manifest.version);
     if helper_ready(id, &reuse_key) {
         return Ok(false);
     }

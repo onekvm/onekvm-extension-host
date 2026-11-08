@@ -147,6 +147,12 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
         }
     }
     arguments.extend(capability_arguments(&permissions));
+    if permissions.contains("container-admin") {
+        // importd/machined authorize the caller's UID. Writable image storage
+        // also permits cloning OCI mount stacks (machined cannot clone them).
+        arguments.push("--property=ReadWritePaths=/etc/systemd/nspawn".into());
+        arguments.push("--property=ReadWritePaths=/var/lib/machines".into());
+    }
     if permissions.contains("opkg-admin") {
         // Marketplace writes onekvm-ext-{name}.conf. Sticky bit on the directory
         // keeps root-owned opkg.conf / onekvm-feed.conf from being replaced.
@@ -179,7 +185,10 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
 fn sandbox_identity(
     permissions: &std::collections::BTreeSet<&str>,
 ) -> (&'static str, &'static str) {
-    if permissions.contains("host-root") || permissions.contains("host-unrestricted") {
+    if permissions.contains("host-root")
+        || permissions.contains("host-unrestricted")
+        || permissions.contains("container-admin")
+    {
         ("root", "onekvm-extension")
     } else {
         ("onekvm-extension", "onekvm-extension")
@@ -198,7 +207,9 @@ fn unrestricted_host_arguments() -> Vec<String> {
 }
 
 fn capability_arguments(permissions: &std::collections::BTreeSet<&str>) -> Vec<String> {
-    let host_root = permissions.contains("host-root") || permissions.contains("host-unrestricted");
+    let host_root = permissions.contains("host-root")
+        || permissions.contains("host-unrestricted")
+        || permissions.contains("container-admin");
     let network_admin = permissions.contains("network-admin");
     let mut arguments = Vec::new();
     let mut ambient = Vec::new();
@@ -235,7 +246,10 @@ fn network_address_families(
     if !permissions.contains("network") {
         return None;
     }
-    if permissions.contains("network-info") || permissions.contains("network-admin") {
+    if permissions.contains("network-info")
+        || permissions.contains("network-admin")
+        || permissions.contains("container-admin")
+    {
         return Some("AF_UNIX AF_INET AF_INET6 AF_NETLINK");
     }
     Some("AF_UNIX AF_INET AF_INET6")
@@ -291,6 +305,10 @@ pub fn helper_sandbox_arguments(extension: &Installed) -> Vec<String> {
 pub fn load_kernel_modules(extension: &Installed) -> Result<(), String> {
     if extension.manifest.is_environment() {
         return Ok(());
+    }
+    if extension.manifest.permissions.iter().any(|p| p == "container-admin") {
+        std::fs::create_dir_all("/etc/systemd/nspawn")
+            .map_err(|err| format!("prepare container settings directory: {err}"))?;
     }
     for module in &extension.manifest.kernel_modules {
         sys::run(paths::MODPROBE, &[module.clone()])
@@ -591,12 +609,45 @@ fn group_listed(groups: &str, name: &str) -> bool {
 mod tests {
     use super::{
         capability_arguments, group_listed, network_address_families, sandbox_identity,
-        unrestricted_host_arguments,
+        sandbox_arguments, unrestricted_host_arguments,
     };
     use std::collections::BTreeSet;
 
     fn permissions(values: &[&'static str]) -> BTreeSet<&'static str> {
         values.iter().copied().collect()
+    }
+
+    #[test]
+    fn container_administration_keeps_other_sandbox_boundaries() {
+        let mut extension = crate::manifest::Installed {
+            root: "/data/onekvm/apps/container/1.0.8".into(),
+            manifest: crate::manifest::Manifest {
+                id: "container".into(),
+                permissions: vec!["network".into(), "container-admin".into()],
+                resource_limits: crate::manifest::ResourceLimits {
+                    memory_max: "24M".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let args = sandbox_arguments(&extension);
+        for expected in [
+            "--property=User=root",
+            "--property=ProtectSystem=strict",
+            "--property=PrivateDevices=yes",
+            "--property=NoNewPrivileges=yes",
+            "--property=MemoryMax=24M",
+            "--property=ReadWritePaths=/etc/systemd/nspawn",
+            "--property=ReadWritePaths=/var/lib/machines",
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "{expected}");
+        }
+        extension.manifest.permissions = vec!["network".into()];
+        let ordinary = sandbox_arguments(&extension);
+        assert!(ordinary.iter().any(|arg| arg == "--property=User=onekvm-extension"));
+        assert!(!ordinary.iter().any(|arg| arg == "--property=ReadWritePaths=/var/lib/machines"));
     }
 
     #[test]
@@ -626,6 +677,10 @@ mod tests {
     #[test]
     fn host_root_selects_root_identity_without_changing_other_permissions() {
         assert_eq!(
+            sandbox_identity(&permissions(&["network", "container-admin"])),
+            ("root", "onekvm-extension")
+        );
+        assert_eq!(
             sandbox_identity(&permissions(&["network", "host-root"])),
             ("root", "onekvm-extension")
         );
@@ -653,6 +708,10 @@ mod tests {
 
     #[test]
     fn host_root_retains_only_the_capabilities_needed_to_drop_identity() {
+        assert_eq!(
+            capability_arguments(&permissions(&["container-admin"])),
+            vec!["--property=AmbientCapabilities=CAP_SETGID CAP_SETUID"]
+        );
         assert_eq!(
             capability_arguments(&permissions(&["host-root"])),
             vec!["--property=AmbientCapabilities=CAP_SETGID CAP_SETUID"]

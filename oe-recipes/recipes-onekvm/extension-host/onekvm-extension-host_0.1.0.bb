@@ -19,6 +19,9 @@ inherit cargo cargo-update-recipe-crates pkgconfig systemd useradd
 DEPENDS += "systemd pkgconfig-native"
 
 do_install() {
+    # The container sandbox exposes this existing directory for .nspawn files.
+    # Create it at package installation, before the read-only host service runs.
+    install -d ${D}${sysconfdir}/systemd/nspawn
     install -Dm0755 \
         ${B}/target/${RUST_HOST_SYS}/${BUILD_DIR}/onekvm-extension-host \
         ${D}${bindir}/onekvm-extension-host

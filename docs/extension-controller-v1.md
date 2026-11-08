@@ -56,6 +56,13 @@ The helper retains `CAP_SETUID` and `CAP_SETGID` for that transition; both are
 cleared from a child after it switches to the unprivileged identity, while
 `RestrictSUIDSGID` continues to prevent creation of SUID/SGID files.
 
+`container-admin` runs as `root` so importd and machined can authorize container
+operations without polkit. It adds writable `/etc/systemd/nspawn` and
+`/var/lib/machines` paths for container settings and OCI mount-stack cloning,
+and allows `AF_NETLINK` alongside `network`. Other filesystem, device and
+resource restrictions remain active. Container processes themselves are started
+by the host's `systemd-nspawn@` units, outside the extension's resource limits.
+
 `host-unrestricted` is a separate, high-risk opt-in for a host administration
 surface that must behave exactly like a root login on the device. It runs as
 `root` without the extension filesystem, device, network, namespace,
