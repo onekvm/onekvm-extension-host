@@ -262,6 +262,7 @@ fn authorization_record(manifest: &Manifest) -> Value {
         "unit": paths::unit_name(&manifest.id),
         "units": [paths::unit_name(&manifest.id), paths::helper_unit(&manifest.id)],
         "capabilities": manifest.capabilities,
+        "extension_points": manifest.extension_points,
     })
 }
 

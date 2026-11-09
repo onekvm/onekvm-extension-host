@@ -822,7 +822,7 @@ mod tests {
         let manifest = Manifest {
             contributions: vec![Contribution {
                 id: "read-edid".into(),
-                point: "mcp.tool".into(),
+                point: "extend.mcp".into(),
                 version: 1,
                 method: "read".into(),
                 data: serde_json::json!({"inputSchema": {"type": "object"}}),
@@ -831,7 +831,7 @@ mod tests {
         };
         let detail = serde_json::to_value(entry_from_manifest(&manifest, false, Vec::new())).unwrap();
         assert_eq!(detail["contributions"], serde_json::json!([{
-            "id": "read-edid", "point": "mcp.tool", "version": 1
+            "id": "read-edid", "point": "extend.mcp", "version": 1
         }]));
         assert_eq!(detail["enabled"], false);
         let summary = serde_json::to_value(summary_from_manifest(&manifest, false, String::new())).unwrap();

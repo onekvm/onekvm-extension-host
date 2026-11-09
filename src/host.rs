@@ -1399,6 +1399,7 @@ fn socket_listen_address(manifest: &Manifest, settings: &Value) -> Result<Option
 }
 
 pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
+    crate::contributions::validate_provider(id, &manifest.extension_points)?;
     if manifest.kind == "cloud-provider" {
         validate_cloud_provider_conflict(id)?;
     }

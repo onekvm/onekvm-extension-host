@@ -198,6 +198,7 @@ impl SystemPlugin {
             ));
         }
         if enabled {
+            crate::contributions::validate_provider(&self.id, &self.extension_points)?;
             let was_enabled = sandbox::is_enabled(&self.unit);
             sandbox::unit_action("unmask", &self.unit)?;
             let result = sandbox::unit_action("enable", &self.unit)

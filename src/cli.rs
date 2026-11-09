@@ -14,6 +14,7 @@ usage: onekvm-extension <command> [arguments]
 commands:
   list
   catalog
+  extension-points
   contributions <point>
   detail <id>
   status <id>
@@ -50,6 +51,7 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
     const COMMANDS: &[&str] = &[
         "list",
         "catalog",
+        "extension-points",
         "contributions",
         "detail",
         "status",
@@ -91,7 +93,13 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
         && args[2] == "install_progress";
     let read_only_query = matches!(
         args[0].as_str(),
-        "list" | "catalog" | "contributions" | "detail" | "status" | "feed-status"
+        "list"
+            | "catalog"
+            | "extension-points"
+            | "contributions"
+            | "detail"
+            | "status"
+            | "feed-status"
     );
     if !progress_query && args[0] != "refresh" && !read_only_query {
         sys::with_lock(|| {
@@ -116,6 +124,10 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
         "contributions" => {
             require_len(args, 2, "contributions requires <point>")?;
             write_json(&contributions::list(&args[1])?)?;
+        }
+        "extension-points" => {
+            require_len(args, 1, "extension-points takes no arguments")?;
+            write_json(&contributions::points()?)?;
         }
         "detail" => {
             write_json(&catalog::detail(&one_id(args)?)?)?;

@@ -178,6 +178,9 @@ pub fn activate(id: &str, version: &str) -> Result<(), String> {
     sys::with_lock(|| {
         let extension = load_installed(id, version)?;
         let mut state = read_state(id)?;
+        if state.enabled {
+            host::validate_conflicts(id, &extension.manifest)?;
+        }
         if state.active_version == extension.manifest.version {
             return Ok(());
         }

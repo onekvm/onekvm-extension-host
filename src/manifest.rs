@@ -102,6 +102,8 @@ impl Manifest {
 pub struct ExtensionPoint {
     pub id: String,
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -940,14 +942,18 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
 fn validate_contributions(value: &Manifest) -> Result<(), String> {
     let mut points = std::collections::BTreeSet::new();
     for point in &value.extension_points {
-        if !valid_point_id(&point.id)
-            || !point.id.starts_with(&format!("{}.", value.id))
-            || point.version == 0
-        {
+        if !valid_point_id(&point.id) || point.version == 0 {
             return Err(format!("invalid extension point {:?}", point.id));
         }
         if !points.insert(&point.id) {
             return Err(format!("duplicate extension point {:?}", point.id));
+        }
+        for alias in &point.aliases {
+            if !valid_point_id(alias) || !points.insert(alias) {
+                return Err(format!(
+                    "invalid or duplicate extension point alias {alias:?}"
+                ));
+            }
         }
     }
     let mut entries = std::collections::BTreeSet::new();
@@ -1006,18 +1012,21 @@ mod contribution_tests {
     }
 
     #[test]
-    fn provider_can_only_declare_its_own_points() {
+    fn point_names_are_independent_of_the_provider_identity() {
         let mut manifest = Manifest {
             id: "weather".into(),
             ..Manifest::default()
         };
         manifest.extension_points.push(ExtensionPoint {
-            id: "screen-display.widget".into(),
+            id: "extend.weather".into(),
             version: 1,
+            aliases: vec!["weather.widget".into()],
         });
-        assert!(validate_contributions(&manifest).is_err());
-        manifest.extension_points[0].id = "weather.widget".into();
         assert!(validate_contributions(&manifest).is_ok());
+        manifest.extension_points[0]
+            .aliases
+            .push("extend.weather".into());
+        assert!(validate_contributions(&manifest).is_err());
     }
 }
 
