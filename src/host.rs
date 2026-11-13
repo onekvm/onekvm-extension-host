@@ -209,7 +209,11 @@ fn apply_command_method(
                     .and_then(|object| object.get("size_bytes"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                install::install_package_with_options(&package, wait, size_bytes)?;
+                let enable_after_install = object
+                    .and_then(|object| object.get("enable_after_install"))
+                    .map(|value| value.as_bool().ok_or("enable_after_install must be a boolean"))
+                    .transpose()?;
+                install::install_package_with_options(&package, wait, size_bytes, enable_after_install)?;
                 if wait {
                     return Ok(serde_json::json!({"status": "ok", "package": package}));
                 }
@@ -1211,15 +1215,35 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
     let unit = paths::unit_name(&extension.manifest.id);
     let socket_unit = paths::socket_unit(&extension.manifest.id);
     if extension.manifest.socket_activation.is_some() && is_active(&socket_unit) {
-        return Ok(());
-    }
-    if is_active(&unit) {
-        if extension.manifest.socket_activation.is_none() && legacy_unit_has_core_lifetime(&unit) {
+        if !crate::sandbox::runs_elsewhere(&unit, &extension.root) {
             return Ok(());
         }
         eprintln!(
-            "extension {}: replacing legacy PartOf unit with ordered BindsTo unit",
+            "extension {}: replacing the socket service of another version",
             extension.manifest.id
+        );
+        unit_action("stop", &socket_unit)?;
+        unit_action("stop", &unit)?;
+        let _ = unit_action("reset-failed", &unit);
+    }
+    if is_active(&unit) {
+        // A unit left running by another installed version (an upgrade
+        // outside a host transaction) is replaced, not kept.
+        let other_version = crate::sandbox::runs_elsewhere(&unit, &extension.root);
+        if !other_version
+            && extension.manifest.socket_activation.is_none()
+            && legacy_unit_has_core_lifetime(&unit)
+        {
+            return Ok(());
+        }
+        eprintln!(
+            "extension {}: replacing {}",
+            extension.manifest.id,
+            if other_version {
+                "the service of another version"
+            } else {
+                "legacy PartOf unit with ordered BindsTo unit"
+            }
         );
         unit_action("stop", &unit)?;
         let _ = unit_action("reset-failed", &unit);
@@ -1375,6 +1399,7 @@ fn socket_listen_address(manifest: &Manifest, settings: &Value) -> Result<Option
 }
 
 pub fn validate_conflicts(id: &str, manifest: &Manifest) -> Result<(), String> {
+    crate::contributions::validate_provider(id, &manifest.extension_points)?;
     if manifest.kind == "cloud-provider" {
         validate_cloud_provider_conflict(id)?;
     }
@@ -1435,7 +1460,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
     } else {
         "controller"
     };
-    let reuse_key = format!("sandbox-v3:{}:{mode}", extension.manifest.version);
+    let reuse_key = format!("sandbox-v4:{}:{mode}", extension.manifest.version);
     if helper_ready(id, &reuse_key) {
         return Ok(false);
     }

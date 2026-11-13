@@ -60,6 +60,47 @@ fn closure(
     Ok(needed)
 }
 
+// Shared plugin payloads can outlive their slot-local opkg record. The inventory
+// resolves version-matched package metadata from the active DB, saved metadata,
+// or another slot. Use that dependency list without inventing an installed
+// package record for a payload whose original file manifest is unavailable.
+fn needed(
+    plugins: &[Plugin],
+    target: &BTreeMap<String, Package>,
+    source: &BTreeMap<String, Package>,
+) -> Result<BTreeSet<String>, String> {
+    let mut packages = source.clone();
+    let mut roots = Vec::new();
+    let mut metadata_only = BTreeSet::new();
+    for plugin in plugins {
+        let name = format!("onekvm-extension-{}", plugin.id);
+        if target.contains_key(&name) {
+            continue;
+        }
+        if !packages.contains_key(&name) {
+            let depends = plugin.depends.as_ref().ok_or_else(|| {
+                format!("plugin {} has no matching package metadata; reinstall its package before updating", plugin.id)
+            })?;
+            packages.insert(
+                name.clone(),
+                Package {
+                    depends: depends.clone(),
+                    ..Package::default()
+                },
+            );
+            metadata_only.insert(name.clone());
+        }
+        roots.push(name);
+    }
+    let mut result = closure(&roots, target, &packages)?;
+    result.retain(|name| !metadata_only.contains(name));
+    Ok(result)
+}
+
+pub(super) fn check(plan: &Plan) -> Result<(), String> {
+    needed(&plan.plugins, &plan.baseline, &plan.retained).map(|_| ())
+}
+
 fn module_source(
     path: &Path,
     source_modules: &Path,
@@ -185,10 +226,9 @@ pub(super) fn restore(plan: &Plan) -> Result<(), String> {
         return Err("opkg database does not belong to the booted slot".into());
     }
     let target = database(&fs::read(target_db.join("status")).map_err(|e| e.to_string())?)?;
-    let mut roots = Vec::new();
-    for plugin in inventory()? {
+    let plugins = inventory()?;
+    for plugin in &plugins {
         let name = format!("onekvm-extension-{}", plugin.id);
-        // Unmanaged plugin directories have no package records to carry.
         if !plan.retained.contains_key(&name) || target.contains_key(&name) {
             continue;
         }
@@ -199,9 +239,8 @@ pub(super) fn restore(plan: &Plan) -> Result<(), String> {
         if fields.get("X-OneKVM-Extension-Version") != Some(&plugin.version) {
             return Err(format!("retained plugin {} version changed", plugin.id));
         }
-        roots.push(name);
     }
-    let needed = closure(&roots, &target, &plan.retained)?;
+    let needed = needed(&plugins, &target, &plan.retained)?;
     let hash = plan
         .current_kernel_magic
         .strip_prefix("sha256:")
@@ -237,6 +276,61 @@ mod tests {
             ..Package::default()
         }
     }
+    fn samba() -> Plugin {
+        Plugin {
+            id: "samba".into(),
+            name: "Samba".into(),
+            version: "0.1.0".into(),
+            depends: Some("samba-runtime, cifs".into()),
+            kernel_modules: vec!["cifs".into()],
+        }
+    }
+
+    #[test]
+    fn saved_plugin_metadata_restores_dependencies_without_fabricating_ownership() {
+        let source = BTreeMap::from([
+            ("samba-runtime".into(), pkg("1", "musl")),
+            ("cifs".into(), pkg("1", "aes (= 1)")),
+            ("aes".into(), pkg("1", "kernel-base (= 1)")),
+            ("unrelated".into(), pkg("1", "")),
+        ]);
+        let target = BTreeMap::from([
+            ("musl".into(), pkg("2", "")),
+            ("kernel-base".into(), pkg("1", "")),
+        ]);
+        assert_eq!(
+            needed(&[samba()], &target, &source).unwrap(),
+            BTreeSet::from(["samba-runtime", "cifs", "aes"].map(str::to_owned))
+        );
+    }
+
+    #[test]
+    fn missing_metadata_or_dependency_is_not_silently_skipped() {
+        let mut plugin = samba();
+        let empty = BTreeMap::new();
+        assert!(needed(&[plugin.clone()], &empty, &empty)
+            .unwrap_err()
+            .contains("requires"));
+        plugin.depends = None;
+        assert!(needed(&[plugin.clone()], &empty, &empty)
+            .unwrap_err()
+            .contains("reinstall"));
+        let target = BTreeMap::from([("onekvm-extension-samba".into(), pkg("2", ""))]);
+        assert!(needed(&[plugin], &target, &empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_kernel_preflight_checks_saved_dependencies() {
+        let mut plan = super::super::tests::plan();
+        plan.target_kernel = plan.current_kernel.clone();
+        plan.target_kernel_magic = plan.current_kernel_magic.clone();
+        plan.plugins = vec![samba()];
+        assert!(!super::super::missing(&plan).is_empty());
+        plan.retained.insert("samba-runtime".into(), pkg("1", ""));
+        plan.retained.insert("cifs".into(), pkg("1", ""));
+        assert!(super::super::missing(&plan).is_empty());
+    }
+
     #[test]
     fn carries_plugin_runtime_and_optional_module_transitively() {
         let source = BTreeMap::from([

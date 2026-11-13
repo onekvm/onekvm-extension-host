@@ -189,15 +189,57 @@ MIT. See [LICENSE](LICENSE).
 Lifecycle transaction, recovery, generic contribution notifications and device
 acceptance are described in [extension-lifecycle.md](docs/extension-lifecycle.md).
 
+A proposed developer workflow for staged-directory sync, resource refresh and
+restoring the installed plugin is documented in
+[extension-developer-mode.md](docs/extension-developer-mode.md) (Chinese).
+This is a design draft; developer-mode commands and APIs are not implemented.
+
 Extension installs (feed downloads and local IPK/IPKS uploads) protect non-extension
 packages from `/usr/share/onekvm/opkg-baseline/status`, plus Core, CLI, UI and the
 extension host. The installed versions can satisfy dependencies, but extension
 transactions cannot replace image packages or shared libraries. Optional runtimes
 outside the image and extension packages can still be installed or updated. A
 missing/invalid baseline fails closed; newer system dependencies require a signed
-sqfs system update. Dependencies are downloaded using the original signed
+system update. Dependencies are downloaded using the original signed
 indexes and package checksum validation, then every selected payload is checked
 against the image baseline. Installation uses only those local files with no
 software sources configured, so the solver cannot introduce other system
 candidates. Local uploads containing image packages are rejected. Explicit system
-updates use the target image's separate offline installation path.
+updates use the target image's separate offline installation path. The system update
+precheck reads the target root from SquashFS or EROFS images (`unsquashfs` or
+`dump.erofs`); the RAUC bundle around it is always SquashFS.
+
+## Native browser views
+
+Settings pages and toolbox items accept `renderer: "web-component"` for native
+JavaScript and Lit elements. Their resource paths, method permissions and
+settings schema retain the existing extension contracts. The acceptance fixture
+is in `tests/fixtures/web-component-probe`; run `tests/build-web-component-probe.sh`
+and build `onekvm-extension-web-component-probe` with the distro Make entrypoint.
+
+## Console load hooks
+
+Extensions may declare `console: {entrypoint: "web/console.js"}`. Catalogs expose
+this declaration so the UI can run `onLoad` on console entry and display its
+browser-code risk in plugin details. The host validates the safe JS path; the OE
+class verifies the packaged resource. See the UI console hook v1 contract.
+
+Native provider registrations default to protected system components. Setting
+`system: false` allows the plugin manager and CLI to enable/disable the registered
+unit. Disable persists a systemd mask and stops the unit, so dependency and D-Bus
+activation cannot restart it. Enable removes that mask and starts the unit.
+Native packages publish `removable: false`; disabling does not permit uninstalling
+system-image packages. An optional absolute argv `settings_command` reads settings
+as JSON on stdout, or accepts a complete settings object on stdin to update them
+without starting the disabled service. Existing D-Bus settings remain the path
+for running providers.
+
+## Installed network opt-outs
+
+`/etc/onekvm/network-policy.json` (v1) can disable `extensions`. The host then
+rejects feed refreshes and online installs. Local IPK/IPKS installation remains
+available but does not download dependencies: provide complete local payloads.
+Missing policy preserves existing behavior; unreadable, malformed, oversized,
+unknown-version or unknown-feature policy refuses network operations. This does
+not disable network access inside already installed extensions. The image-level
+Internet firewall controls their public traffic separately.

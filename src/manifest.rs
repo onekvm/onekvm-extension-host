@@ -66,6 +66,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<ExtensionRoute>,
@@ -100,6 +102,8 @@ impl Manifest {
 pub struct ExtensionPoint {
     pub id: String,
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -186,6 +190,12 @@ pub struct ExtensionToolbar {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ExtensionShell {
+    pub entrypoint: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionConsole {
     pub entrypoint: String,
 }
 
@@ -502,11 +512,33 @@ pub fn load_installed(id: &str, version: &str) -> Result<Installed, String> {
 /// Only absent payloads are optional. Invalid manifests and access errors must
 /// still block recovery rather than silently discarding a usable snapshot.
 pub fn load_installed_optional(id: &str, version: &str) -> Result<Option<Installed>, String> {
+    load_installed_at(Path::new(paths::APPS_ROOT), id, version)
+}
+
+/// Restore a version removed by a system image upgrade. A corrupt or unreadable
+/// active manifest must still fail instead of silently selecting another version.
+pub fn load_installed_or_latest(id: &str, version: &str) -> Result<Option<Installed>, String> {
+    load_installed_or_latest_at(Path::new(paths::APPS_ROOT), id, version)
+}
+
+fn load_installed_or_latest_at(
+    apps: &Path,
+    id: &str,
+    version: &str,
+) -> Result<Option<Installed>, String> {
+    match load_installed_at(apps, id, version)? {
+        Some(installed) => Ok(Some(installed)),
+        None if !version.is_empty() => load_installed_at(apps, id, ""),
+        None => Ok(None),
+    }
+}
+
+fn load_installed_at(apps: &Path, id: &str, version: &str) -> Result<Option<Installed>, String> {
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
     let version = if version.is_empty() {
-        let versions = installed_versions(id)?;
+        let versions = installed_versions_at(apps, id)?;
         let Some(version) = versions.last().cloned() else {
             return Ok(None);
         };
@@ -517,7 +549,7 @@ pub fn load_installed_optional(id: &str, version: &str) -> Result<Option<Install
     if !paths::valid_version(&version) {
         return Err(format!("invalid extension version {version:?}"));
     }
-    let root = paths::app_root(id, &version);
+    let root = apps.join(id).join(&version);
     load_installation_root(id, &version, root)
 }
 
@@ -539,7 +571,11 @@ fn load_installation_root(
 }
 
 pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
-    let entries = match fs::read_dir(Path::new(paths::APPS_ROOT).join(id)) {
+    installed_versions_at(Path::new(paths::APPS_ROOT), id)
+}
+
+fn installed_versions_at(apps: &Path, id: &str) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(apps.join(id)) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.to_string()),
@@ -556,6 +592,67 @@ pub fn installed_versions(id: &str) -> Result<Vec<String>, String> {
     }
     versions.sort();
     Ok(versions)
+}
+
+#[cfg(test)]
+mod installed_restore_tests {
+    use super::*;
+
+    fn install(apps: &Path, version: &str) -> PathBuf {
+        let root = apps.join("nanokvm-oled").join(version);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("manifest.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "nanokvm-oled", "version": version, "api_version": 2,
+                "name": "OLED", "kind": "service", "entrypoint": "bin/oled"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn image_upgrade_recovers_absent_version_but_keeps_an_installed_selection() {
+        let apps = std::env::temp_dir().join(format!("onekvm-restore-{}", std::process::id()));
+        fs::create_dir_all(&apps).unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+            .unwrap()
+            .is_none());
+        install(&apps, "1.9.24");
+        let recovered = load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.manifest.version, "1.9.24");
+        assert_eq!(recovered.root, apps.join("nanokvm-oled/1.9.24"));
+        install(&apps, "0.1.0");
+        assert_eq!(
+            load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0")
+                .unwrap()
+                .unwrap()
+                .manifest
+                .version,
+            "0.1.0"
+        );
+        fs::remove_dir_all(apps).unwrap();
+    }
+
+    #[test]
+    fn restore_does_not_hide_a_corrupt_or_unreadable_active_manifest() {
+        let apps =
+            std::env::temp_dir().join(format!("onekvm-restore-invalid-{}", std::process::id()));
+        install(&apps, "1.9.24");
+        let active = install(&apps, "0.1.0");
+        fs::write(&active, b"invalid json").unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0").is_err());
+        fs::remove_file(&active).unwrap();
+        fs::create_dir(&active).unwrap();
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "0.1.0").is_err());
+        assert!(load_installed_or_latest_at(&apps, "nanokvm-oled", "../invalid").is_err());
+        fs::remove_dir_all(apps).unwrap();
+    }
 }
 
 pub fn decode_manifest(data: &[u8]) -> Result<Manifest, String> {
@@ -709,6 +806,14 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
             ));
         }
     }
+    if let Some(console) = &value.console {
+        if !paths::safe_relative(&console.entrypoint)
+            || !console.entrypoint.starts_with("web/")
+            || !console.entrypoint.ends_with(".js")
+        {
+            return Err(format!("unsafe console entrypoint {:?}", console.entrypoint));
+        }
+    }
     if let Some(shell) = &value.shell {
         if !paths::safe_relative(&shell.entrypoint)
             || !shell.entrypoint.starts_with("web/")
@@ -788,7 +893,7 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
                 ));
             }
         }
-        if item.view.renderer != "vue"
+        if !matches!(item.view.renderer.as_str(), "vue" | "web-component")
             || !paths::safe_relative(&item.view.entrypoint)
             || item
                 .view
@@ -799,7 +904,7 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
             || !item.view.entrypoint.ends_with(".js")
         {
             return Err(format!(
-                "toolbox view must be Vue JavaScript under web/ for {:?}",
+                "toolbox view must be Vue or Web Component JavaScript under web/ for {:?}",
                 item.id
             ));
         }
@@ -837,14 +942,18 @@ fn validate_toolbox(toolbox: &ExtensionToolbox) -> Result<(), String> {
 fn validate_contributions(value: &Manifest) -> Result<(), String> {
     let mut points = std::collections::BTreeSet::new();
     for point in &value.extension_points {
-        if !valid_point_id(&point.id)
-            || !point.id.starts_with(&format!("{}.", value.id))
-            || point.version == 0
-        {
+        if !valid_point_id(&point.id) || point.version == 0 {
             return Err(format!("invalid extension point {:?}", point.id));
         }
         if !points.insert(&point.id) {
             return Err(format!("duplicate extension point {:?}", point.id));
+        }
+        for alias in &point.aliases {
+            if !valid_point_id(alias) || !points.insert(alias) {
+                return Err(format!(
+                    "invalid or duplicate extension point alias {alias:?}"
+                ));
+            }
         }
     }
     let mut entries = std::collections::BTreeSet::new();
@@ -903,18 +1012,21 @@ mod contribution_tests {
     }
 
     #[test]
-    fn provider_can_only_declare_its_own_points() {
+    fn point_names_are_independent_of_the_provider_identity() {
         let mut manifest = Manifest {
             id: "weather".into(),
             ..Manifest::default()
         };
         manifest.extension_points.push(ExtensionPoint {
-            id: "screen-display.widget".into(),
+            id: "extend.weather".into(),
             version: 1,
+            aliases: vec!["weather.widget".into()],
         });
-        assert!(validate_contributions(&manifest).is_err());
-        manifest.extension_points[0].id = "weather.widget".into();
         assert!(validate_contributions(&manifest).is_ok());
+        manifest.extension_points[0]
+            .aliases
+            .push("extend.weather".into());
+        assert!(validate_contributions(&manifest).is_err());
     }
 }
 
@@ -1224,6 +1336,12 @@ mod tests {
         let valid = serde_json::json!({"items":[{"id":"inspect","title":"Inspector","subtitle":"Inspect this device","i18n":{"zh":{"title":"检查器","subtitle":"检查这台设备"}},"presentation":"window","layout":"edge-to-edge","size":{"width":4096,"height":1},"view":{"renderer":"vue","entrypoint":"web/inspect.js"}}]});
         let parse = |v| serde_json::from_value::<ExtensionToolbox>(v).unwrap();
         validate_toolbox(&parse(valid.clone())).unwrap();
+        let mut web_component = valid.clone();
+        web_component["items"][0]["view"]["renderer"] = serde_json::json!("web-component");
+        validate_toolbox(&parse(web_component)).unwrap();
+        let mut unsupported = valid.clone();
+        unsupported["items"][0]["view"]["renderer"] = serde_json::json!("html");
+        assert!(validate_toolbox(&parse(unsupported)).is_err());
         for path in [
             "/web/view.js",
             "web/../view.js",
@@ -1347,6 +1465,25 @@ mod tests {
                 .unwrap_err()
                 .contains("environment packages cannot declare a resident service"));
         }
+    }
+
+    #[test]
+    fn console_entrypoint_is_explicit_safe_web_javascript() {
+        let data = serde_json::json!({
+            "id": "console-example", "name": "Console example", "version": "1.0.0",
+            "api_version": 2, "kind": "service", "entrypoint": "bin/noop",
+            "console": {"entrypoint": "web/console.js"}
+        });
+        let manifest = decode_manifest(&serde_json::to_vec(&data).unwrap()).unwrap();
+        assert_eq!(manifest.console.unwrap().entrypoint, "web/console.js");
+        for path in ["../console.js", "/web/console.js", "web/../console.js", "web/console.html", "web\\console.js"] {
+            let mut invalid = data.clone();
+            invalid["console"]["entrypoint"] = serde_json::json!(path);
+            assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let mut invalid = data;
+        invalid["console"]["code"] = serde_json::json!("alert(1)");
+        assert!(decode_manifest(&serde_json::to_vec(&invalid).unwrap()).is_err());
     }
 
     #[test]

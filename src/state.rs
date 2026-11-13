@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::manifest::{load_installed, Manifest};
+use crate::manifest::{load_installed, load_installed_or_latest, Manifest};
 use crate::paths;
 use crate::sys;
 
@@ -87,8 +87,27 @@ pub fn initialize_default_enabled_states() -> Result<(), String> {
         }
         if paths::state_path(&id).exists() {
             let mut state = read_state(&id)?;
-            if let Ok(extension) = load_installed(&id, &state.active_version) {
-                if normalize_environment(&extension.manifest, &mut state) {
+            let extension = match load_installed_or_latest(&id, &state.active_version) {
+                Ok(extension) => extension,
+                Err(err) => {
+                    eprintln!("initialize extension {id}: {err}");
+                    continue;
+                }
+            };
+            if let Some(extension) = extension {
+                let changed_version = state.active_version != extension.manifest.version;
+                if changed_version {
+                    if crate::host::validate_device_variant(&extension.manifest).is_err() {
+                        continue;
+                    }
+                    eprintln!(
+                        "extension {id}: active version {:?} is absent; restoring installed version {}",
+                        state.active_version, extension.manifest.version
+                    );
+                    state.active_version = extension.manifest.version.clone();
+                    state.revision = state.revision.saturating_add(1);
+                }
+                if normalize_environment(&extension.manifest, &mut state) || changed_version {
                     write_state(&id, &state)?;
                 }
             }
@@ -243,6 +262,7 @@ fn authorization_record(manifest: &Manifest) -> Value {
         "unit": paths::unit_name(&manifest.id),
         "units": [paths::unit_name(&manifest.id), paths::helper_unit(&manifest.id)],
         "capabilities": manifest.capabilities,
+        "extension_points": manifest.extension_points,
     })
 }
 

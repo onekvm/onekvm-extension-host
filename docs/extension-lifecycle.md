@@ -5,6 +5,12 @@ maintain a list of contributor IDs or run contributor-specific registration
 hooks. Registration follows the enabled state; stopping a service can leave its
 management UI available.
 
+Starting a managed entrypoint service also turns on its writable boolean
+`service_enabled` setting and enables the extension. This uses the normal
+settings validation and port checks, preserving saved credentials and other
+settings. Controller-managed services and services with an explicit systemd unit
+retain their existing action handlers; read-only settings are not rewritten.
+
 All state changes publish the atomic generic change token
 `/run/onekvm/contributions-generation`. Consumers subscribe to the parent
 directory with inotify before initial
@@ -23,12 +29,19 @@ an explicit user disable survives subsequent boots and upgrades. Environment
 packages stay available without a resident enabled runtime. Compatibility
 declarations must include every machine on which a plugin is preinstalled.
 
+At startup and on `restore`, a saved active version whose manifest is absent is
+replaced with the latest installed version, preserving settings and enabled
+intent. A still-installed selection is retained. Invalid or unreadable manifests
+do not trigger fallback; missing payloads with no installed replacement remain
+unresolved. This also repairs disabled plugins without starting them.
+
 Catalog snapshots include live enabled and service readiness state. Core checks
 the generic contribution token before reusing its snapshot, including when the
 host initializes defaults after Core's initial catalog warmup. Runtime snapshots
-also expire on demand (Core: five seconds; CLI disk cache: two seconds), so a
-service starting or stopping independently cannot leave a permanent stale
-status. This does not add background polling. In-flight queries retain their
+use lifecycle and systemd service notifications for invalidation (Core: up to
+one hour; CLI disk cache: two seconds). If Core cannot watch service changes,
+it falls back to a five-second on-demand lifetime. This does not add background
+polling. In-flight queries retain their
 original mutation revision, so a concurrent invalidation is not lost.
 
 ## Upgrade and activation transactions
@@ -51,6 +64,14 @@ The new version is committed after installed-manifest validation, successful
 activation, a resident-process check, and the declared bounded `exec`
 healthcheck. Health checks run through the plugin sandbox, not as arbitrary root
 commands. A disabled plugin is installed without starting it.
+
+New installations can pass `enable_after_install` to the marketplace method, or
+`--enable-after-install=true|false` to the install CLI commands. The web installer
+defaults this choice to enabled for regular plugins. An explicit false installs
+without starting the plugin or reserving its runtime memory budget. Omitting the
+option retains the manifest's existing default policy. Updates and reinstalling
+an installed plugin preserve saved enabled intent. A fresh install after removal
+honors the new choice; environment packages have no enabled runtime.
 
 On failure, the manager stops the new runtime and restores the previous payload,
 plugin data (including failed configuration/database migrations), package
@@ -78,6 +99,14 @@ platform dependencies and kernel packages retain their own opkg records and
 are not downgraded by plugin rollback; platform rollback belongs to the system
 update mechanism. A plugin health check cannot certify external network access
 or every device-specific feature.
+
+System-update preflight accepts the generated optional-module `depmod` scripts,
+including the variant that refreshes each installed kernel release. Other
+maintenance commands remain rejected. An empty module group is accepted only
+after its kernel release and magic match the target and every advertised module
+is already present in the authenticated target image. This supports groups such
+as AES when their drivers become built in, without treating a missing driver as
+available.
 
 ## Removal
 
@@ -115,10 +144,26 @@ with package identity and vermagic checked before registration. Package scripts
 are not run. Records are published after payload validation, so retrying an
 interrupted copy does not duplicate installed records. This also handles older
 Web upload clients that leave same-kernel updates in the `prepared` phase.
+Shared plugin payloads can remain active after their owning slot-local package
+record has disappeared. In that case, migration uses the version-matched dependency
+metadata retained by the host (or another slot's matching control record) as the
+root of the dependency closure. It restores the real dependency packages and
+matching optional modules without synthesizing a plugin ownership/file record.
+Same-kernel preflight inventories these plugins too and reports missing metadata
+or unsatisfied dependency versions before installation instead of declaring an
+empty migration successful. Target-image packages still take precedence.
+
 Extension enable flags, settings and data are preserved without modification.
 If optional payload validation fails on this identical-kernel path, the update
 plan records the failure while allowing other extensions to start. Kernel-change
 installation failures still block startup as before.
+
+## Helper idle waits
+
+Helpers with a persistent controller wait for D-Bus work without a periodic
+idle wakeup. Command-only helpers retain their 60-second idle lease and wait
+for its actual remaining duration; each request renews the lease. Managed
+process supervision and explicit systemd stop remain independent of this wait.
 
 ## System update diagnostics
 

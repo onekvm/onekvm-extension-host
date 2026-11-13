@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::catalog::extension_running;
 use crate::host;
-use crate::manifest::{installed_versions, load_installed};
+use crate::manifest::{installed_versions, load_installed, Manifest};
 use crate::memory;
 use crate::paths;
 use crate::ports;
@@ -178,6 +178,9 @@ pub fn activate(id: &str, version: &str) -> Result<(), String> {
     sys::with_lock(|| {
         let extension = load_installed(id, version)?;
         let mut state = read_state(id)?;
+        if state.enabled {
+            host::validate_conflicts(id, &extension.manifest)?;
+        }
         if state.active_version == extension.manifest.version {
             return Ok(());
         }
@@ -212,6 +215,9 @@ pub fn disable(id: &str) -> Result<(), String> {
 }
 
 pub fn enable_unlocked(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        return plugin.set_enabled(true);
+    }
     let mut state = read_state(id)?;
     let original = state.clone();
     if state.active_version.is_empty() {
@@ -255,6 +261,9 @@ pub fn enable_unlocked(id: &str) -> Result<(), String> {
 }
 
 pub fn disable_unlocked(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        return plugin.set_enabled(false);
+    }
     let mut state = read_state(id)?;
     if !state.enabled {
         let result = crate::dbus_client::disable(id, state.revision);
@@ -277,6 +286,7 @@ pub fn disable_unlocked(id: &str) -> Result<(), String> {
 }
 
 pub fn start(id: &str) -> Result<(), String> {
+    if load_system_plugins()?.contains_key(id) { return enable(id); }
     sys::with_lock(|| {
         let state = read_state(id)?;
         if state.active_version.is_empty() {
@@ -287,6 +297,7 @@ pub fn start(id: &str) -> Result<(), String> {
 }
 
 pub fn stop(id: &str) -> Result<(), String> {
+    if load_system_plugins()?.contains_key(id) { return disable(id); }
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
@@ -297,6 +308,10 @@ pub fn stop(id: &str) -> Result<(), String> {
 }
 
 pub fn restart(id: &str) -> Result<(), String> {
+    if let Some(plugin) = load_system_plugins()?.get(id) {
+        if !sandbox::is_enabled(&plugin.unit) { return Err(format!("plugin {id} is disabled")); }
+        return sandbox::unit_action("restart", &plugin.unit);
+    }
     sys::with_lock(|| {
         let state = read_state(id)?;
         crate::dbus_client::disable(id, state.revision)?;
@@ -314,7 +329,16 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
     if !matches!(action, "start" | "stop" | "restart" | "enable" | "disable") {
         return Err(format!("unsupported service action {action:?}"));
     }
-    let (registered_service, controller, enabled) = sys::with_lock(|| {
+    if load_system_plugins()?.contains_key(id) {
+        if service != "main" { return Err(format!("plugin {id} does not register service {service}")); }
+        return match action {
+            "enable" | "start" => enable(id),
+            "disable" | "stop" => disable(id),
+            "restart" => restart(id),
+            _ => unreachable!(),
+        };
+    }
+    let (registered_service, controller, enabled, start_settings) = sys::with_lock(|| {
         let state = read_state(id)?;
         if state.active_version.is_empty() {
             return Err(format!("extension {id} is not active"));
@@ -331,6 +355,7 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
             registered_service,
             extension.manifest.controller.is_some(),
             state.enabled,
+            service_start_settings(&extension.manifest),
         ))
     })?;
     if !registered_service.unit.is_empty() {
@@ -340,7 +365,13 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
         "enable" => enable(id),
         "disable" => disable(id),
         "start" => {
-            if !enabled {
+            if let Some(settings) = start_settings {
+                configure_request(id, ConfigureRequest {
+                    enabled: Some(true),
+                    settings: Some(settings),
+                })?;
+                start(id)
+            } else if !enabled {
                 enable(id)
             } else {
                 start(id)
@@ -369,6 +400,19 @@ pub fn service_action(id: &str, service: &str, action: &str) -> Result<(), Strin
     }
 }
 
+fn service_start_settings(manifest: &Manifest) -> Option<serde_json::Map<String, Value>> {
+    if manifest.controller.is_some() {
+        return None;
+    }
+    let property = manifest.settings_schema.properties.get("service_enabled")?;
+    if property.type_name != "boolean" || property.read_only {
+        return None;
+    }
+    Some(serde_json::Map::from_iter([
+        ("service_enabled".into(), Value::Bool(true)),
+    ]))
+}
+
 fn read_configure_request(stdin: &mut dyn Read) -> Result<ConfigureRequest, String> {
     let mut payload = Vec::new();
     stdin
@@ -382,15 +426,20 @@ pub fn configure(id: &str, stdin: &mut dyn Read) -> Result<(), String> {
         return Err(format!("invalid extension id {id:?}"));
     }
     let request = read_configure_request(stdin)?;
+    configure_request(id, request)
+}
+
+fn configure_request(id: &str, request: ConfigureRequest) -> Result<(), String> {
     let system_plugins = load_system_plugins()?;
     if let Some(plugin) = system_plugins.get(id) {
-        if request.enabled.is_some() {
+        if plugin.system && request.enabled.is_some() {
             return Err(format!("system plugin {id} cannot be enabled or disabled"));
         }
-        let Some(settings) = request.settings else {
-            return Ok(());
-        };
-        return plugin.update_settings(settings);
+        return sys::with_lock(|| {
+            if let Some(settings) = request.settings { plugin.update_settings(settings)?; }
+            if let Some(enabled) = request.enabled { plugin.set_enabled(enabled)?; }
+            Ok(())
+        });
     }
     sys::with_lock(|| {
         let mut state = read_state(id)?;
@@ -567,7 +616,60 @@ pub fn restore() -> Result<(), String> {
 
 #[cfg(test)]
 mod configure_input_tests {
-    use super::read_configure_request;
+    use super::{read_configure_request, service_start_settings};
+    use serde_json::Value;
+
+    #[test]
+    fn starting_entrypoint_service_preserves_saved_credentials_and_endpoint() {
+        let manifest = serde_json::from_value(serde_json::json!({
+            "id": "rdp", "version": "0.1.0", "entrypoint": "bin/server",
+            "settings_schema": {"properties": {
+                "service_enabled": {"type": "boolean", "default": false},
+                "username": {"type": "string"},
+                "password": {"type": "string", "format": "password"},
+                "port": {"type": "integer"}
+            }},
+            "secret_fields": ["/password"]
+        })).unwrap();
+        let extension = crate::manifest::Installed {
+            manifest,
+            root: std::path::PathBuf::new(),
+        };
+        let current = serde_json::json!({
+            "service_enabled": false,
+            "username": "saved-user",
+            "password": "saved-password",
+            "port": 3390
+        });
+        let update = service_start_settings(&extension.manifest).unwrap();
+        let actual = crate::settings::apply_update(&extension, &current, &update).unwrap();
+        let mut expected = current;
+        expected["service_enabled"] = Value::Bool(true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn service_start_does_not_rewrite_controller_or_read_only_settings() {
+        let mut manifest = crate::manifest::Manifest::default();
+        assert!(service_start_settings(&manifest).is_none());
+        manifest.settings_schema.properties.insert(
+            "service_enabled".into(),
+            crate::manifest::SettingProperty {
+                type_name: "boolean".into(),
+                read_only: true,
+                ..Default::default()
+            },
+        );
+        assert!(service_start_settings(&manifest).is_none());
+        manifest.settings_schema.properties.get_mut("service_enabled").unwrap().read_only = false;
+        manifest.controller = Some(crate::manifest::ControllerSpec {
+            runtime: "native".into(),
+            entrypoint: "bin/controller".into(),
+            arguments: Vec::new(),
+            timeout_seconds: 5,
+        });
+        assert!(service_start_settings(&manifest).is_none());
+    }
 
     #[test]
     fn reads_media_settings_larger_than_one_mib_without_truncating() {

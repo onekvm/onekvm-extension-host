@@ -59,6 +59,7 @@ int onekvm_helper_exec_capture(void *helper, char **command, size_t ncommand,
 int onekvm_helper_instances(void *helper, char ***names, size_t *count,
                             char **err);
 int onekvm_helper_should_exit(void *helper);
+uint64_t onekvm_helper_wait_usec(void *helper);
 
 static uint64_t now_usec(void) {
     struct timespec ts;
@@ -684,6 +685,79 @@ static int append_service_properties(sd_bus_message *message, const char *unit,
     return 0;
 }
 
+/* 1: UNIT is loaded and its service runs in DIR; 0: loaded with another
+ * working directory (an older extension version); -ENOENT: not loaded. */
+static int unit_runs_in(sd_bus *bus, const char *unit, const char *dir) {
+    sd_bus_message *reply = NULL;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    const char *path = NULL;
+    char *current = NULL;
+    int result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH,
+                                    SYSTEMD_MANAGER, "GetUnit",
+                                    &error, &reply, "s", unit);
+    if (systemd_error_is_missing(&error, result)) {
+        result = -ENOENT;
+        goto out;
+    }
+    if (result >= 0)
+        result = sd_bus_message_read(reply, "o", &path);
+    if (result >= 0)
+        result = sd_bus_get_property_string(bus, SYSTEMD_NAME, path,
+                                            "org.freedesktop.systemd1.Service",
+                                            "WorkingDirectory", &error, &current);
+    if (result >= 0)
+        result = strcmp(current, dir) == 0 ? 1 : 0;
+out:
+    free(current);
+    sd_bus_error_free(&error);
+    sd_bus_message_unref(reply);
+    return result;
+}
+
+int onekvm_systemd_unit_runs_in(const char *unit, const char *dir) {
+    if (!unit || !unit[0] || !dir || !dir[0])
+        return -EINVAL;
+    sd_bus *bus = NULL;
+    int result = sd_bus_open_system(&bus);
+    if (result >= 0)
+        result = unit_runs_in(bus, unit, dir);
+    if (bus)
+        sd_bus_flush_close_unref(bus);
+    return result;
+}
+
+/* Stops a loaded unit of another extension version and waits until systemd
+ * has unloaded it (CollectMode=inactive-or-failed). Otherwise
+ * StartTransientUnit reports EEXIST and restarts the old unit, old command
+ * and all, which the warm-restart path below would accept. */
+static int retire_other_version(sd_bus *bus, const char *unit, const char *dir) {
+    if (!dir || !dir[0] || unit_runs_in(bus, unit, dir) != 0)
+        return 0;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
+                                    "StopUnit", &error, NULL, "ss", unit, "replace");
+    if (result < 0 && !systemd_error_is_missing(&error, result)) {
+        sd_bus_error_free(&error);
+        return result;
+    }
+    sd_bus_error_free(&error);
+    result = wait_for_unit_stop(bus, unit);
+    if (result < 0)
+        return result;
+    sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
+                       "ResetFailedUnit", &error, NULL, "s", unit);
+    sd_bus_error_free(&error);
+    const uint64_t deadline = now_usec() + 5000000ull;
+    while (unit_runs_in(bus, unit, dir) != -ENOENT) {
+        if (now_usec() >= deadline)
+            return -EBUSY;
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 25000000 };
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+            ;
+    }
+    return 0;
+}
+
 int onekvm_start_transient_service(const char *unit, const char *slice,
                                    const char *working_directory,
                                    char **properties, size_t nproperties,
@@ -702,6 +776,9 @@ int onekvm_start_transient_service(const char *unit, const char *slice,
      * sd_bus_default_system(). Sharing that bus from another thread returns
      * ENXIO and leaves Type=notify stuck until TimeoutStartSec. */
     int result = sd_bus_open_system(&bus);
+    if (result < 0)
+        goto out;
+    result = retire_other_version(bus, unit, working_directory);
     if (result < 0)
         goto out;
     result = sd_bus_message_new_method_call(bus, &message, "org.freedesktop.systemd1",
@@ -914,8 +991,10 @@ static int systemd_unit_file_action(sd_bus *bus, const char *action,
                                     const char *unit) {
     sd_bus_message *message = NULL, *reply = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
-    const char *method = strcmp(action, "enable") == 0
-                             ? "EnableUnitFiles" : "DisableUnitFiles";
+    const char *method = strcmp(action, "enable") == 0 ? "EnableUnitFiles"
+                       : strcmp(action, "disable") == 0 ? "DisableUnitFiles"
+                       : strcmp(action, "mask") == 0 ? "MaskUnitFiles"
+                       : "UnmaskUnitFiles";
     int result = sd_bus_message_new_method_call(bus, &message, SYSTEMD_NAME,
                                                 SYSTEMD_PATH, SYSTEMD_MANAGER,
                                                 method);
@@ -933,7 +1012,7 @@ static int systemd_unit_file_action(sd_bus *bus, const char *action,
     result = sd_bus_message_append(message, "b", 0);
     if (result < 0)
         goto out;
-    if (strcmp(action, "enable") == 0) {
+    if (strcmp(action, "enable") == 0 || strcmp(action, "mask") == 0) {
         result = sd_bus_message_append(message, "b", 0);
         if (result < 0)
             goto out;
@@ -957,7 +1036,8 @@ out:
 int onekvm_systemd_unit_action(const char *action, const char *unit) {
     if (!action || !unit || !unit[0])
         return -EINVAL;
-    if (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0) {
+    if (strcmp(action, "enable") == 0 || strcmp(action, "disable") == 0 ||
+        strcmp(action, "mask") == 0 || strcmp(action, "unmask") == 0) {
         sd_bus *bus = NULL;
         int result = sd_bus_open_system(&bus);
         if (result >= 0)
@@ -1121,6 +1201,7 @@ static int on_name_owner(sd_bus_message *message, void *userdata, sd_bus_error *
 static const sd_bus_vtable host_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_METHOD("ApplyConfig", "stsas", "", host_apply_config, 0),
+    SD_BUS_METHOD("ArchiveUpdateData", "st", "", host_simple, 0),
     SD_BUS_METHOD("CaptureTransaction", "st", "", host_simple, 0),
     SD_BUS_METHOD("RestoreTransaction", "st", "", host_simple, 0),
     SD_BUS_METHOD("CheckHealth", "st", "", host_simple, 0),
@@ -1620,7 +1701,7 @@ int onekvm_helper_serve(void *helper) {
             continue;
         if (onekvm_helper_should_exit(helper))
             break;
-        result = sd_bus_wait(bus, 1000000ull);
+        result = sd_bus_wait(bus, onekvm_helper_wait_usec(helper));
         if (result < 0)
             goto out;
         if (onekvm_helper_should_exit(helper))
@@ -1639,7 +1720,8 @@ static int cli_set_error(char **err, const char *text) {
     return *err ? -EIO : -ENOMEM;
 }
 
-int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision, char **err) {
+int onekvm_cli_host_simple_timeout(const char *method, const char *id, uint64_t revision,
+                                   uint64_t timeout_usec, char **err) {
     sd_bus *bus = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *message = NULL;
@@ -1652,7 +1734,7 @@ int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision
     result = sd_bus_message_append(message, "st", id, revision);
     if (result < 0)
         goto out;
-    result = sd_bus_call(bus, message, 35000000, &error, NULL);
+    result = sd_bus_call(bus, message, timeout_usec, &error, NULL);
     if (result < 0)
         result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
 out:
@@ -1660,6 +1742,10 @@ out:
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
     return result < 0 ? result : 0;
+}
+
+int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision, char **err) {
+    return onekvm_cli_host_simple_timeout(method, id, revision, 35000000, err);
 }
 
 int onekvm_cli_host_invoke(const char *id, const char *method, const char *request, char **response,

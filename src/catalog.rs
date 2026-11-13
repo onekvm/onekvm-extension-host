@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::feed::available_extensions;
 use crate::manifest::{
     installed_versions, load_installed, ActivationConflict, AuthProvider, ExtensionPage,
-    ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, Manifest,
-    ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
+    ExtensionRoute, ExtensionShell, ExtensionToolbar, ExtensionToolbox, ExtensionConsole, Manifest,
+    Contribution, ManifestDirectory, ManifestVideo, PageIcon, SettingsSchema, Translation,
 };
 use crate::memory;
 use crate::paths;
@@ -53,6 +53,8 @@ pub struct CatalogSummary {
     pub running: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removable: Option<bool>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +72,8 @@ pub struct CatalogSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_settings: bool,
@@ -85,6 +89,23 @@ pub struct CatalogSummary {
     pub directories: Vec<ManifestDirectory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_provider: Option<AuthProvider>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CatalogContribution {
+    pub id: String,
+    pub point: String,
+    pub version: u32,
+}
+
+impl From<&Contribution> for CatalogContribution {
+    fn from(contribution: &Contribution) -> Self {
+        Self {
+            id: contribution.id.clone(),
+            point: contribution.point.clone(),
+            version: contribution.version,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,10 +133,14 @@ pub struct CatalogEntry {
     pub running: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub system: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removable: Option<bool>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub error: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contributions: Vec<CatalogContribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video: Option<ManifestVideo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -132,6 +157,8 @@ pub struct CatalogEntry {
     pub toolbar: Option<ExtensionToolbar>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<ExtensionShell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<ExtensionConsole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbox: Option<ExtensionToolbox>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -163,7 +190,7 @@ struct CatalogDiskCache {
     entries: Vec<serde_json::Value>,
 }
 
-const CATALOG_CACHE_VERSION: i32 = 8;
+const CATALOG_CACHE_VERSION: i32 = 9;
 const CATALOG_RUNTIME_TTL: Duration = Duration::from_secs(2);
 
 pub fn catalog() -> Result<Vec<CatalogSummary>, String> {
@@ -370,6 +397,7 @@ pub fn summary_from_manifest(
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         icon,
         icon_data_url,
@@ -378,6 +406,7 @@ pub fn summary_from_manifest(
         toolbar: extension.toolbar.clone(),
         has_shell: extension.shell.is_some(),
         shell: extension.shell.clone(),
+        console: extension.console.clone(),
         toolbox: extension.toolbox.clone(),
         has_settings: !extension.settings_schema.properties.is_empty(),
         services: catalog_services(extension, &extension.id, installed, false),
@@ -468,8 +497,10 @@ fn entry_from_manifest(
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         capabilities: extension.capabilities.clone(),
+        contributions: extension.contributions.iter().map(CatalogContribution::from).collect(),
         video: extension.video.clone(),
         device_variants: extension.device_variants.clone(),
         activation_conflicts: extension.activation_conflicts.clone(),
@@ -478,6 +509,7 @@ fn entry_from_manifest(
         page: extension.page.clone(),
         toolbar: extension.toolbar.clone(),
         shell: extension.shell.clone(),
+        console: extension.console.clone(),
         toolbox: extension.toolbox.clone(),
         routes: extension.routes.clone(),
         auth_provider: extension.auth_provider.clone(),
@@ -605,6 +637,7 @@ fn empty_summary() -> CatalogSummary {
         enabled: false,
         running: false,
         system: false,
+        removable: None,
         error: String::new(),
         icon: None,
         icon_data_url: String::new(),
@@ -613,6 +646,7 @@ fn empty_summary() -> CatalogSummary {
         toolbar: None,
         has_shell: false,
         shell: None,
+        console: None,
         toolbox: None,
         has_settings: false,
         services: Vec::new(),
@@ -782,6 +816,29 @@ fn write_cache(fingerprint: &str, entries: &[CatalogSummary]) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_projects_declared_contributions_without_execution_payloads() {
+        let manifest = Manifest {
+            contributions: vec![Contribution {
+                id: "read-edid".into(),
+                point: "extend.mcp".into(),
+                version: 1,
+                method: "read".into(),
+                data: serde_json::json!({"inputSchema": {"type": "object"}}),
+            }],
+            ..Manifest::default()
+        };
+        let detail = serde_json::to_value(entry_from_manifest(&manifest, false, Vec::new())).unwrap();
+        assert_eq!(detail["contributions"], serde_json::json!([{
+            "id": "read-edid", "point": "extend.mcp", "version": 1
+        }]));
+        assert_eq!(detail["enabled"], false);
+        let summary = serde_json::to_value(summary_from_manifest(&manifest, false, String::new())).unwrap();
+        assert!(summary.get("contributions").is_none());
+        let empty = serde_json::to_value(entry_from_manifest(&Manifest::default(), false, Vec::new())).unwrap();
+        assert!(empty.get("contributions").is_none());
+    }
 
     #[test]
     fn cached_runtime_status_expires_and_rejects_clock_rollback() {

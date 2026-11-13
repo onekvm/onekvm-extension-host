@@ -1,7 +1,7 @@
 SUMMARY = "OneKVM extension host, lifecycle policy, and manager CLI"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=8a5a0a588995e3e2c2bfa68f5413df57"
-PR = "r40"
+PR = "r41"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 ONEKVM_TRUSTED_FEED_PREFIXES ?= ""
@@ -19,6 +19,9 @@ inherit cargo cargo-update-recipe-crates pkgconfig systemd useradd
 DEPENDS += "systemd pkgconfig-native"
 
 do_install() {
+    # The container sandbox exposes this existing directory for .nspawn files.
+    # Create it at package installation, before the read-only host service runs.
+    install -d ${D}${sysconfdir}/systemd/nspawn
     install -Dm0755 \
         ${B}/target/${RUST_HOST_SYS}/${BUILD_DIR}/onekvm-extension-host \
         ${D}${bindir}/onekvm-extension-host
@@ -34,6 +37,9 @@ do_install() {
     ln -s ../onekvm-plugin-update.service \
         ${D}${systemd_system_unitdir}/onekvm-pre.target.requires/onekvm-plugin-update.service
     install -d ${D}${datadir}/onekvm
+    if [ -f ${S}/src/network_policy.rs ]; then
+        printf '1\n' >${D}${datadir}/onekvm/extension-network-policy-v1
+    fi
     printf '1\n' >${D}${datadir}/onekvm/plugin-update-version
     install -Dm0644 ${S}/packaging/30-onekvm-extension-group.conf \
         ${D}${systemd_system_unitdir}/onekvm.service.d/30-onekvm-extension-group.conf
@@ -81,7 +87,7 @@ do_install() {
 SYSTEMD_SERVICE:${PN} = "onekvm-extension-host.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
-RDEPENDS:${PN} += "opkg systemd gnupg-gpg wget openssl-bin"
+RDEPENDS:${PN} += "opkg systemd gnupg-gpg wget openssl-bin erofs-utils-dump"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"

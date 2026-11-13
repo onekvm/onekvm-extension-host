@@ -23,7 +23,9 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "frpc",
     "kmod",
     "libcrypto3",
+    "libcurl4",
     "libgcc1",
+    "libjpeg62",
     "libjson-c5",
     "libsqlite3-0",
     "libssl3",
@@ -36,6 +38,7 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "onekvm-core",
     "onekvm-ui",
     "onekvm-extension-host",
+    "onekvm-extension-npu-runtime",
     "onekvm-plugin-manager",
     "onekvm-samba-runtime",
     "rathole",
@@ -669,6 +672,15 @@ mod tests {
     fn accepts_wireguard_plugin_dependencies() {
         let deps =
             parse_package_dependencies("wireguard-tools, onekvm-kernel-module-wireguard").unwrap();
+        validate_package_dependencies(&deps, None).unwrap();
+    }
+
+    #[test]
+    fn accepts_recall_npu_runtime_dependency() {
+        let deps = parse_package_dependencies(
+            "libcurl4 (>= 8.23.0), libjpeg62 (>= 3.1.3), onekvm-extension-npu-runtime",
+        )
+        .unwrap();
         validate_package_dependencies(&deps, None).unwrap();
     }
 }

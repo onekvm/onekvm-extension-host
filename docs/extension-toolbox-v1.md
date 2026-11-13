@@ -19,3 +19,11 @@ still checks the latest manifest and lifecycle; having a visible or pinned tool
 does not authorize a method. Disabling/uninstalling an extension invalidates its
 runtime authorization and stops its managed workers. DATA persists across ordinary removal
 and upgrades; explicit purge/delete_data removes it.
+
+## Web Components
+
+Tool views also accept `renderer: "web-component"` with a bundled `web/*.js` entrypoint.
+The UI registration supplies `{apiVersion: 1, element: CustomElementConstructor}`
+instead of a Vue `component`. Native JavaScript and Lit elements use the same
+window lifecycle and extension-scoped API. See the UI documentation
+`docs/extension-web-component-v1.md` for the framework-neutral host and settings adapter.

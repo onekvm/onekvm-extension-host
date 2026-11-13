@@ -252,7 +252,14 @@ fn missing(plan: &Plan) -> Vec<Value> {
         ];
     }
     if !kernel_changed(plan) {
-        return Vec::new();
+        return match retained::check(plan) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![json!({
+                "package": "installed-plugin-dependencies",
+                "reason": "retained_dependency_missing",
+                "detail": error,
+            })],
+        };
     }
     let mut missing = BTreeMap::new();
     let mut modules = plan.target_modules.clone();
@@ -358,20 +365,148 @@ fn view(plan: &Plan) -> Value {
     })
 }
 
-fn squash(image: &Path, path: &str) -> Result<Vec<u8>, String> {
-    output(
-        "unsquashfs",
-        &[
-            "-mem",
-            "16M",
-            "-processors",
-            "1",
-            "-cat",
-            &image.to_string_lossy(),
-            path,
-        ],
-    )
+/// Target root filesystem inside an extracted bundle. The bundle container is
+/// always SquashFS (RAUC); the root it carries may be SquashFS or EROFS.
+enum RootImage {
+    Squash(PathBuf),
+    Erofs(PathBuf),
 }
+
+const EROFS_MAGIC: u32 = 0xE0F5_E1E2;
+const EROFS_SUPER_OFFSET: usize = 1024;
+/// Bound the EROFS module-tree walk; a kernel module tree has a few thousand
+/// entries at most.
+const EROFS_LIST_LIMIT: usize = 20_000;
+const EROFS_LIST_DEPTH: usize = 16;
+/// `dump.erofs --ls` file type of a directory (EROFS_FT_DIR).
+const EROFS_FT_DIR: &str = "2";
+
+fn root_format(header: &[u8]) -> Option<&'static str> {
+    if header.starts_with(b"hsqs") {
+        return Some("squashfs");
+    }
+    let magic = header.get(EROFS_SUPER_OFFSET..EROFS_SUPER_OFFSET + 4)?;
+    (u32::from_le_bytes(magic.try_into().ok()?) == EROFS_MAGIC).then_some("erofs")
+}
+
+/// Directory entries from `dump.erofs --ls`: (name, is_dir), without `.`/`..`.
+fn erofs_entries(listing: &[u8]) -> Vec<(String, bool)> {
+    let text = String::from_utf8_lossy(listing);
+    let rows = text
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("NID TYPE"))
+        .skip(1);
+    let mut entries = Vec::new();
+    for line in rows {
+        // "%10llu    %u  %s": NID, file type, then the name verbatim.
+        let Some((nid, rest)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some((kind, name)) = rest.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let name = name.trim_start();
+        if nid.parse::<u64>().is_err() || name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        entries.push((name.to_owned(), kind == EROFS_FT_DIR));
+    }
+    entries
+}
+
+/// dump.erofs 1.9 exits 0 even when a path is missing; it reports `<E>` lines
+/// on stderr instead, so treat those as failures.
+fn dump_erofs(args: &[&str]) -> Result<Vec<u8>, String> {
+    let result = Command::new("dump.erofs")
+        .args(args)
+        .output()
+        .map_err(|e| format!("dump.erofs: {e}"))?;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    if result.status.success() && !stderr.lines().any(|l| l.trim_start().starts_with("<E>")) {
+        Ok(result.stdout)
+    } else {
+        Err(format!("dump.erofs: {}", stderr.trim()))
+    }
+}
+
+impl RootImage {
+    fn open(path: PathBuf) -> Result<Self, String> {
+        let mut header = Vec::with_capacity(EROFS_SUPER_OFFSET + 4);
+        fs::File::open(&path)
+            .and_then(|file| {
+                file.take((EROFS_SUPER_OFFSET + 4) as u64)
+                    .read_to_end(&mut header)
+            })
+            .map_err(|e| e.to_string())?;
+        match root_format(&header) {
+            Some("squashfs") => Ok(Self::Squash(path)),
+            Some(_) => Ok(Self::Erofs(path)),
+            None => Err("target rootfs image is neither SquashFS nor EROFS".into()),
+        }
+    }
+
+    fn cat(&self, path: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Squash(image) => output(
+                "unsquashfs",
+                &[
+                    "-mem",
+                    "16M",
+                    "-processors",
+                    "1",
+                    "-cat",
+                    &image.to_string_lossy(),
+                    path,
+                ],
+            ),
+            Self::Erofs(image) => {
+                dump_erofs(&["--cat", &format!("--path=/{path}"), &image.to_string_lossy()])
+            }
+        }
+    }
+
+    /// One line per entry below `dir`, each containing the full path, as
+    /// `module_names` expects.
+    fn list(&self, dir: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Squash(image) => output(
+                "unsquashfs",
+                &[
+                    "-mem",
+                    "16M",
+                    "-processors",
+                    "1",
+                    "-ll",
+                    &image.to_string_lossy(),
+                    dir,
+                ],
+            ),
+            Self::Erofs(image) => {
+                let mut lines = Vec::new();
+                let mut count = 0;
+                let mut pending = vec![(dir.trim_matches('/').to_owned(), 0)];
+                while let Some((current, depth)) = pending.pop() {
+                    let path = format!("--path=/{current}");
+                    let listing = dump_erofs(&["--ls", &path, &image.to_string_lossy()])?;
+                    for (name, is_dir) in erofs_entries(&listing) {
+                        let path = format!("{current}/{name}");
+                        lines.extend_from_slice(path.as_bytes());
+                        lines.push(b'\n');
+                        count += 1;
+                        if count > EROFS_LIST_LIMIT {
+                            return Err("target rootfs module tree is too large".into());
+                        }
+                        if is_dir && depth < EROFS_LIST_DEPTH {
+                            pending.push((path, depth + 1));
+                        }
+                    }
+                }
+                Ok(lines)
+            }
+        }
+    }
+}
+
 fn module_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
     let decoder = flate2::read::GzDecoder::new(data);
     let mut control_data = None;
@@ -396,7 +531,11 @@ fn module_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
                     .join(" ");
                 let script = script.strip_prefix("#!/bin/sh ").unwrap_or(&script);
                 let script = script.strip_prefix("set -e ").unwrap_or(script);
-                if script != "if [ -z \"$D\" ]; then depmod -a fi" {
+                if !matches!(
+                    script,
+                    "if [ -z \"$D\" ]; then depmod -a fi"
+                        | "if [ -z \"$D\" ]; then for module_dir in /usr/lib/modules/*; do [ -d \"$module_dir\" ] || continue depmod -a \"${module_dir##*/}\" done fi"
+                ) {
                     return Err("kernel package contains an unsupported maintenance script".into());
                 }
             }
@@ -423,6 +562,30 @@ fn verify_module_release(data: &[u8], target: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn empty_target_module_group(
+    data: &[u8],
+    provides: &str,
+    target_modules: &BTreeSet<String>,
+) -> Result<bool, String> {
+    let decoder = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(decoder);
+    if let Some(entry) = archive.entries().map_err(|e| e.to_string())?.next() {
+        entry.map_err(|e| e.to_string())?;
+        return Ok(false);
+    }
+    let mut present = false;
+    for alias in provides.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(module) = alias.strip_prefix("kernel-module-") else {
+            return Ok(false);
+        };
+        if !target_modules.contains(&module.replace('-', "_")) {
+            return Ok(false);
+        }
+        present = true;
+    }
+    Ok(present)
 }
 fn module_names(list: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut releases = BTreeSet::new();
@@ -592,30 +755,18 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
             }
         }
     }
-    let image = image.ok_or("update bundle has no SquashFS rootfs image")?;
+    let image = image.ok_or("update bundle has no rootfs image")?;
     if Path::new(&image).components().count() != 1 || !paths::safe_relative(&image) {
         return Err("invalid rootfs image path".into());
     }
-    let image = unpack.join(image);
-    let listing = output(
-        "unsquashfs",
-        &[
-            "-mem",
-            "16M",
-            "-processors",
-            "1",
-            "-ll",
-            &image.to_string_lossy(),
-            "usr/lib/modules",
-        ],
-    )?;
+    let image = RootImage::open(unpack.join(image))?;
+    let listing = image.list("usr/lib/modules")?;
     let (releases, mut target_modules) = module_names(&listing);
     if releases.len() != 1 {
         return Err("target rootfs must identify exactly one kernel release".into());
     }
     let target_kernel = releases.into_iter().next().unwrap();
-    if let Ok(builtins) = squash(
-        &image,
+    if let Ok(builtins) = image.cat(
         &format!("usr/lib/modules/{target_kernel}/modules.builtin"),
     ) {
         target_modules.extend(module_names(&builtins).1);
@@ -623,7 +774,7 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
     let current_kernel = kernel()?;
     let current_kernel_magic = kernel_identity::current_magic()?;
     let target_identity = kernel_identity::decode(
-        &squash(&image, kernel_identity::METADATA.trim_start_matches('/'))
+        &image.cat(kernel_identity::METADATA.trim_start_matches('/'))
             .map_err(|_| "target image is missing kernel magic metadata; use an image with kernel identity support")?,
         &target_kernel,
     )?;
@@ -634,11 +785,11 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
         &target_kernel,
         &target_kernel_magic,
     );
-    let target_build = String::from_utf8(squash(&image, "usr/share/onekvm/build-id")?)
+    let target_build = String::from_utf8(image.cat("usr/share/onekvm/build-id")?)
         .map_err(|e| e.to_string())?
         .trim()
         .to_owned();
-    let machine = squash(&image, "usr/share/onekvm/machine")?;
+    let machine = image.cat("usr/share/onekvm/machine")?;
     if String::from_utf8_lossy(&machine).trim() != text("/usr/share/onekvm/machine")?
         || target_identity
             .machine
@@ -649,7 +800,7 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
         return Err("target rootfs is for a different machine".into());
     }
     if changed
-        && squash(&image, "usr/share/onekvm/plugin-update-version")
+        && image.cat("usr/share/onekvm/plugin-update-version")
             .ok()
             .as_deref()
             != Some(b"1\n")
@@ -657,8 +808,8 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
         return Err("target system does not support installing plugin packages before startup; use a bundle with plugin-update support".into());
     }
     let source_slot = slot()?;
-    let plugins = if changed { inventory()? } else { Vec::new() };
-    let mut baseline = database(&squash(&image, "usr/share/onekvm/opkg-baseline/status")?)?;
+    let plugins = inventory()?;
+    let mut baseline = database(&image.cat("usr/share/onekvm/opkg-baseline/status")?)?;
     if changed {
         for (name, package) in &mut baseline {
             let Some(id) = name
@@ -669,8 +820,7 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
             };
             // opkg's status database drops custom fields; read the original
             // in-image control record for the extension identity.
-            let fields = control::parse_control(&squash(
-                &image,
+            let fields = control::parse_control(&image.cat(
                 &format!("usr/share/onekvm/opkg-baseline/info/{name}.control"),
             )?)?;
             package.extension_version = fields
@@ -680,8 +830,7 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
             if !paths::valid_version(&package.extension_version) {
                 continue;
             }
-            let data = squash(
-                &image,
+            let data = image.cat(
                 &format!(
                     "data/onekvm/apps/{id}/{}/manifest.json",
                     package.extension_version
@@ -715,6 +864,11 @@ fn prepare(filename: &str, allow_untrusted: bool) -> Result<Value, String> {
     save(&plan)?;
     // Keep only the authenticated metadata; the staged .fwup is used by RAUC.
     remove_tree(unpack)?;
+    // Older Core upload handlers install identical-kernel bundles immediately,
+    // without consulting ready/missing. Reject here too, before RAUC can write.
+    if !changed {
+        retained::check(&plan)?;
+    }
     Ok(view(&plan))
 }
 
@@ -788,7 +942,15 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
                     &plan.target_kernel,
                     &plan.target_kernel_magic,
                 )?;
-                let release = ipks::inspect_kernel_dependency_data(name, data)?;
+                let release = match ipks::inspect_kernel_dependency_data(name, data) {
+                    Ok(release) => release,
+                    Err(_) if empty_target_module_group(data, &value.provides, &plan.target_modules)? => {
+                        // ALLOW_EMPTY groups still satisfy package dependencies when
+                        // every advertised driver is already in the authenticated image.
+                        plan.target_kernel.clone()
+                    }
+                    Err(err) => return Err(err),
+                };
                 if release != plan.target_kernel {
                     return Err(format!(
                         "{name} targets kernel {release}, expected {}",
@@ -917,6 +1079,8 @@ fn arm(id: &str) -> Result<Value, String> {
             .map_err(|e| e.to_string())?;
         plan.bundle = pinned.to_string_lossy().into_owned();
     }
+    // The host archives extension data for the plugins recorded here.
+    save(&plan)?;
     // Quiesce plugin databases while taking the rollback snapshot. Source
     // settings and enabled flags are restored even if copying fails.
     let original: BTreeMap<_, _> = plan
@@ -937,24 +1101,9 @@ fn arm(id: &str) -> Result<Value, String> {
         copy_tree(Path::new(paths::APPS_ROOT), &snapshot.join("apps"))?;
         copy_tree(Path::new(paths::CONFIG_ROOT), &snapshot.join("config"))?;
         copy_tree(Path::new("/var/lib/opkg/info"), &snapshot.join("info"))?;
-        // Archive extension-owned data without chowning a copied directory and
-        // then attempting chmod without CAP_FOWNER in Core's CLI child. The
-        // boot helper restores numeric ownership and modes with full privileges.
-        let data_archive = snapshot.join("app-data.tar");
-        let mut args = vec![
-            "-cpf".to_owned(),
-            data_archive.to_string_lossy().into_owned(),
-            "-C".to_owned(),
-            paths::APP_DATA_ROOT.to_owned(),
-        ];
-        for plugin in &plan.plugins {
-            if Path::new(paths::APP_DATA_ROOT).join(&plugin.id).is_dir() {
-                args.push(plugin.id.clone());
-            }
-        }
-        if args.len() > 4 {
-            sys::output("tar", &args)?;
-        }
+        // Extension data may be private to its service user. Core's CLI child
+        // lacks DAC_READ_SEARCH, so the host archives it from the saved plan.
+        crate::dbus_client::archive_update_data(&plan.id)?;
         for (id, value) in &original {
             write_json(snapshot.join("config").join(format!("{id}.json")), value)?;
         }
@@ -988,6 +1137,122 @@ fn arm(id: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_image_format_follows_the_superblock() {
+        let mut erofs = vec![0u8; 2048];
+        erofs[1024..1028].copy_from_slice(&super::EROFS_MAGIC.to_le_bytes());
+        assert_eq!(super::root_format(&erofs), Some("erofs"));
+        assert_eq!(super::root_format(b"hsqs\x00\x00"), Some("squashfs"));
+        assert_eq!(super::root_format(&[0u8; 2048]), None);
+        // Truncated images are neither format.
+        assert_eq!(super::root_format(&erofs[..1026]), None);
+    }
+
+    #[test]
+    fn erofs_listing_feeds_the_module_scan() {
+        let listing = b"Path : /usr/lib/modules/6.18.57-onekvm-0ab8cad\n\
+Size: 4096  On-disk size: 4096  directory\n\
+\n       NID TYPE  FILENAME\n\
+        36    2  .\n\
+        27    2  ..\n\
+      1234    2  kernel\n\
+      1240    1  modules.builtin\n\
+      1250    1  name with space.ko\n";
+        let entries = super::erofs_entries(listing);
+        assert_eq!(
+            entries,
+            vec![
+                ("kernel".to_owned(), true),
+                ("modules.builtin".to_owned(), false),
+                ("name with space.ko".to_owned(), false),
+            ]
+        );
+        let lines = b"usr/lib/modules/6.18.57-onekvm-0ab8cad/kernel/fs/foo-bar.ko\n\
+usr/lib/modules/6.18.57-onekvm-0ab8cad/modules.builtin\n";
+        let (releases, modules) = super::module_names(lines);
+        assert_eq!(releases.into_iter().collect::<Vec<_>>(), ["6.18.57-onekvm-0ab8cad"]);
+        assert_eq!(modules.into_iter().collect::<Vec<_>>(), ["foo_bar"]);
+    }
+
+    /// Same root built as SquashFS and EROFS must yield the same precheck
+    /// inputs. Run with ONEKVM_TEST_SQUASHFS / ONEKVM_TEST_EROFS set and
+    /// unsquashfs / dump.erofs on PATH: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn squashfs_and_erofs_roots_agree() {
+        let open = |var: &str| {
+            super::RootImage::open(std::env::var(var).expect(var).into()).unwrap()
+        };
+        let (squash, erofs) = (open("ONEKVM_TEST_SQUASHFS"), open("ONEKVM_TEST_EROFS"));
+        assert!(matches!(squash, super::RootImage::Squash(_)));
+        assert!(matches!(erofs, super::RootImage::Erofs(_)));
+        let scan = |image: &super::RootImage| {
+            super::module_names(&image.list("usr/lib/modules").unwrap())
+        };
+        let (releases, modules) = scan(&squash);
+        assert_eq!(releases.len(), 1);
+        assert!(modules.len() > 10);
+        assert_eq!(scan(&erofs), (releases, modules));
+        for path in ["usr/share/onekvm/build-id", "usr/share/onekvm/opkg-baseline/status"] {
+            assert_eq!(squash.cat(path).unwrap(), erofs.cat(path).unwrap(), "{path}");
+        }
+        assert!(erofs.cat("usr/share/onekvm/missing").is_err());
+    }
+
+    #[test]
+    fn empty_module_group_requires_every_driver_in_target_image() {
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let archive = tar::Builder::new(gzip);
+        let data = archive.into_inner().unwrap().finish().unwrap();
+        let target = BTreeSet::from(["libaes".into(), "aes_generic".into()]);
+        assert!(empty_target_module_group(&data, "kernel-module-libaes, kernel-module-aes-generic", &target).unwrap());
+        for provides in ["", "unrelated-package", "kernel-module-missing", "kernel-module-libaes, kernel-module-missing"] {
+            assert!(!empty_target_module_group(&data, provides, &target).unwrap());
+        }
+        assert!(!empty_target_module_group(&module_control_archive("postinst", "depmod -a"), "kernel-module-libaes", &target).unwrap());
+        assert!(empty_target_module_group(b"invalid archive", "kernel-module-libaes", &target).is_err());
+    }
+
+    fn module_control_archive(script_name: &str, script: &str) -> Vec<u8> {
+        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(gzip);
+        for (name, content) in [
+            ("control", "Package: onekvm-kernel-module-cifs\nVersion: 1\nArchitecture: all\n"),
+            (script_name, script),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, content.as_bytes()).unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn kernel_control_accepts_generated_depmod_scripts_only() {
+        let scripts = [
+            "#!/bin/sh\nset -e\nif [ -z \"$D\" ]; then\n depmod -a\nfi\n",
+            "set -e\nif [ -z \"$D\" ]; then\nfor module_dir in /usr/lib/modules/*; do\n    [ -d \"$module_dir\" ] || continue\n    depmod -a \"${module_dir##*/}\"\ndone\nfi\n",
+        ];
+        for script in scripts {
+            for name in ["postinst", "postrm"] {
+                let fields = super::module_control(&module_control_archive(name, script)).unwrap();
+                assert_eq!(fields["Package"], "onekvm-kernel-module-cifs");
+            }
+            for name in ["preinst", "prerm"] {
+                assert!(super::module_control(&module_control_archive(name, script)).is_err());
+            }
+            for altered in [
+                format!("{script}touch /tmp/unexpected\n"),
+                script.replace("depmod -a", "depmod -a; touch /tmp/unexpected"),
+                script.replace("depmod -a", "echo ignored"),
+            ] {
+                assert!(super::module_control(&module_control_archive("postinst", &altered)).is_err());
+            }
+        }
+    }
+
     #[test]
     fn extraction_errors_distinguish_verified_signature_from_corrupt_payload() {
         let raw = "Verified inline signature by 'CN = OneKVM'\nVerification of data area failed.\nFailed to extract bundle: bundle payload is corrupted";
@@ -1061,12 +1326,12 @@ mod tests {
         }
     }
     #[test]
-    fn identical_kernel_identity_skips_plugin_requirements() {
+    fn identical_kernel_identity_requires_plugin_metadata() {
         let mut p = plan();
         p.target_kernel = p.current_kernel.clone();
         p.target_kernel_magic = p.current_kernel_magic.clone();
         p.plugins[0].depends = None;
-        assert!(missing(&p).is_empty());
+        assert!(!missing(&p).is_empty());
         assert_eq!(view(&p)["kernel_changed"], false);
     }
     #[test]
@@ -1178,6 +1443,40 @@ mod tests {
         );
         assert!(missing(&p).is_empty());
     }
+}
+
+/// Runs in the extension host, which may read data private to extension
+/// service users. Archives the data of the plugins in the prepared plan; the
+/// boot helper restores numeric ownership and modes with full privileges.
+pub fn archive_app_data(id: &str) -> Result<(), String> {
+    let plan = load()?;
+    if plan.id != id || plan.phase != "prepared" {
+        return Err("update preparation changed".into());
+    }
+    let snapshot = root().join("source");
+    fs::create_dir_all(&snapshot).map_err(|e| e.to_string())?;
+    let data_archive = snapshot.join("app-data.tar");
+    match fs::remove_file(&data_archive) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let mut args = vec![
+        "-cpf".to_owned(),
+        data_archive.to_string_lossy().into_owned(),
+        "-C".to_owned(),
+        paths::APP_DATA_ROOT.to_owned(),
+    ];
+    for plugin in &plan.plugins {
+        if paths::valid_id(&plugin.id) && Path::new(paths::APP_DATA_ROOT).join(&plugin.id).is_dir()
+        {
+            args.push(plugin.id.clone());
+        }
+    }
+    if args.len() > 4 {
+        sys::output("tar", &args)?;
+    }
+    Ok(())
 }
 
 fn bind(from: &Path, to: &Path) -> Result<(), String> {

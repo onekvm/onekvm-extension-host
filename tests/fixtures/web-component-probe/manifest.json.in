@@ -1,0 +1,26 @@
+{
+  "manifest_version": 1, "api_version": 2,
+  "id": "web-component-probe", "version": "@VERSION@", "architecture": "@ARCH@",
+  "kind": "service", "entrypoint": "bin/probe",
+  "i18n": {
+    "default": {"name": "Web Components example", "description": "Native JavaScript and Lit extension views."},
+    "zh": {"name": "Web Components 示例", "description": "原生 JavaScript 与 Lit 扩展视图。"},
+    "zh-TW": {"name": "Web Components 範例", "description": "原生 JavaScript 與 Lit 擴充視圖。"}
+  },
+  "permissions": [], "capabilities": [], "default_enabled": true,
+  "icon": {"source": "lucide", "name": "blocks"},
+  "console": {"entrypoint": "web/console.js"},
+  "page": {"title": "Web Components", "renderer": "web-component", "entrypoint": "web/page.js"},
+  "toolbox": {"items": [
+    {"id": "native", "title": "Native JavaScript", "i18n": {"zh": {"title": "原生 JavaScript"}, "zh-TW": {"title": "原生 JavaScript"}}, "presentation": "window", "size": {"width": 440, "height": 380}, "view": {"renderer": "web-component", "entrypoint": "web/native-tool.js"}},
+    {"id": "lit", "title": "Lit", "presentation": "window", "size": {"width": 440, "height": 380}, "view": {"renderer": "web-component", "entrypoint": "web/lit-tool.js"}}
+  ]},
+  "settings_schema": {"type": "object", "additionalProperties": false, "required": ["service_enabled", "message"], "properties": {
+    "service_enabled": {"type": "boolean", "title": "Service", "i18n": {"default": "Service", "zh": "服务", "zh-TW": "服務"}, "default": false, "readOnly": true},
+    "message": {"type": "string", "title": "Message", "i18n": {"default": "Message", "zh": "消息", "zh-TW": "訊息"}, "default": "Hello", "maxLength": 120}
+  }},
+  "secret_fields": [],
+  "resource_limits": {"memory_max": "8M", "cpu_quota": "5%", "tasks_max": 8, "limit_nofile": 32},
+  "healthcheck": {"type": "exec", "command": ["bin/probe", "--health"], "timeout_seconds": 3},
+  "methods": [{"name": "echo", "command": ["bin/probe", "echo"]}]
+}

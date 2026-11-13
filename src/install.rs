@@ -387,12 +387,13 @@ pub fn install_progress() -> Value {
 }
 
 pub fn install_package(name: &str) -> Result<(), String> {
-    install_package_with_options(name, true, 0)
+    install_package_with_options(name, true, 0, None)
 }
 
-pub fn install_package_with_options(name: &str, wait: bool, size_bytes: u64) -> Result<(), String> {
+pub fn install_package_with_options(name: &str, wait: bool, size_bytes: u64, enable_after_install: Option<bool>) -> Result<(), String> {
+    crate::network_policy::require("extensions")?;
     let package_name = resolve_extension_package(name)?;
-    start_install_job(&package_name, size_bytes)?;
+    start_install_job(&package_name, size_bytes, enable_after_install)?;
     if wait {
         join_install_job()
     } else {
@@ -400,7 +401,7 @@ pub fn install_package_with_options(name: &str, wait: bool, size_bytes: u64) -> 
     }
 }
 
-fn start_install_job(package_name: &str, size_bytes: u64) -> Result<(), String> {
+fn start_install_job(package_name: &str, size_bytes: u64, enable_after_install: Option<bool>) -> Result<(), String> {
     let mut job = job_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -431,7 +432,7 @@ fn start_install_job(package_name: &str, size_bytes: u64) -> Result<(), String> 
     }
     let package = package_name.to_owned();
     *job = Some(thread::spawn(move || {
-        let result = install_package_job(&package, size_bytes);
+        let result = install_package_job(&package, size_bytes, enable_after_install);
         let mut progress = lock_progress();
         progress.active = false;
         match &result {
@@ -464,7 +465,7 @@ fn join_install_job() -> Result<(), String> {
         .unwrap_or_else(|_| Err("install thread panicked".into()))
 }
 
-fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String> {
+fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install: Option<bool>) -> Result<(), String> {
     set_progress("prepare", None, 0, size_bytes, "Refreshing package lists");
     crate::feed::refresh_if_stale()?;
     sys::with_lock(|| {
@@ -500,7 +501,7 @@ fn install_package_job(package_name: &str, size_bytes: u64) -> Result<(), String
             let arguments =
                 crate::package_policy::offline_install_arguments(&tmp, &cache, &[], false)?;
             log_install_message("Saving previous extension state");
-            let prep = prepare_installed_upgrade(&info)?;
+            let prep = prepare_installed_upgrade(&info, enable_after_install)?;
             set_progress(
                 "install",
                 Some(0),
@@ -730,7 +731,7 @@ fn apply_opkg_line(phase: &str, line: &str, installed: &mut u32, packages: u32, 
     }
 }
 
-pub fn install_local(stdin: &mut dyn Read) -> Result<(), String> {
+pub fn install_local(stdin: &mut dyn Read, enable_after_install: Option<bool>) -> Result<(), String> {
     fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
     let path = unique_temp_file(paths::OPKG_CACHE, "local-extension-")?;
     let mut file = fs::File::create(&path).map_err(|e| e.to_string())?;
@@ -744,33 +745,47 @@ pub fn install_local(stdin: &mut dyn Read) -> Result<(), String> {
         let _ = fs::remove_file(&path);
         return Err("local extension package or bundle exceeds 32 MiB".into());
     }
-    let result = sys::with_lock(|| install_upload_unlocked(path.to_str().unwrap_or_default()));
+    let result = sys::with_lock(|| install_upload_unlocked(path.to_str().unwrap_or_default(), enable_after_install));
     let _ = fs::remove_file(&path);
     result
 }
 
-pub fn install_local_path(filename: &str) -> Result<(), String> {
+pub fn install_local_path(filename: &str, enable_after_install: Option<bool>) -> Result<(), String> {
     validate_local_upload_path(filename)?;
-    sys::with_lock(|| install_upload_unlocked(filename))
+    sys::with_lock(|| install_upload_unlocked(filename, enable_after_install))
 }
 
-fn install_upload_unlocked(filename: &str) -> Result<(), String> {
+fn install_upload_unlocked(filename: &str, enable_after_install: Option<bool>) -> Result<(), String> {
     let value = inspect_local_upload(filename)?;
     crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
-    install_validated_unlocked(&value.info, &value.paths)
+    install_validated_unlocked(&value.info, &value.paths, enable_after_install)
 }
 
 struct UpgradePrep {
     snapshot: crate::transaction::Snapshot,
-    state_exists: bool,
+    enabled_after_install: bool,
     state: crate::state::PluginState,
 }
 
-fn prepare_installed_upgrade(info: &PackageInfo) -> Result<UpgradePrep, String> {
+fn enabled_after_install(manifest: &crate::manifest::Manifest, state: &crate::state::PluginState, existing_install: bool, requested: Option<bool>) -> bool {
+    if manifest.is_environment() {
+        return false;
+    }
+    if existing_install {
+        return state.enabled;
+    }
+    requested.unwrap_or_else(|| crate::state::starts_enabled(manifest))
+}
+
+fn prepare_installed_upgrade(info: &PackageInfo, requested: Option<bool>) -> Result<UpgradePrep, String> {
     host::validate_device_variant(&info.manifest)?;
-    let state_exists = paths::state_path(&info.manifest.id).exists();
+    // An uninstall keeps settings but removes the installed versions. Such a
+    // new install must honor the checkbox instead of an old disabled record.
+    let existing_install = paths::state_path(&info.manifest.id).exists()
+        && !installed_versions(&info.manifest.id)?.is_empty();
     let state = read_state(&info.manifest.id)?;
-    if !state_exists && crate::state::starts_enabled(&info.manifest) {
+    let enabled_after_install = enabled_after_install(&info.manifest, &state, existing_install, requested);
+    if !existing_install && enabled_after_install {
         memory::validate(&info.manifest.id, &info.manifest)?;
     }
     let was_running = state.enabled
@@ -791,7 +806,7 @@ fn prepare_installed_upgrade(info: &PackageInfo) -> Result<UpgradePrep, String> 
 
     Ok(UpgradePrep {
         snapshot,
-        state_exists,
+        enabled_after_install,
         state,
     })
 }
@@ -809,9 +824,7 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
             state.active_version = info.manifest.version.clone();
             state.revision += 1;
         }
-        if !prep.state_exists && crate::state::starts_enabled(&info.manifest) {
-            state.enabled = true;
-        }
+        state.enabled = prep.enabled_after_install;
         crate::state::normalize_environment(&info.manifest, &mut state);
         write_state(&info.manifest.id, &state)?;
         if state.enabled {
@@ -828,7 +841,7 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
     }
 }
 
-fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf]) -> Result<(), String> {
+fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf], enable_after_install: Option<bool>) -> Result<(), String> {
     let cache = unique_temp_dir(paths::OPKG_CACHE, "local-cache-")?;
     let tmp = unique_temp_dir(paths::OPKG_CACHE, "local-tmp-")?;
     let result = (|| {
@@ -836,10 +849,12 @@ fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf]) -> Resu
         for filename in filenames {
             download.push(filename.to_str().ok_or("invalid local package path")?);
         }
-        run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+        if crate::network_policy::require("extensions").is_ok() {
+            run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+        }
         let arguments =
             crate::package_policy::offline_install_arguments(&tmp, &cache, filenames, true)?;
-        let prep = prepare_installed_upgrade(info)?;
+        let prep = prepare_installed_upgrade(info, enable_after_install)?;
         if let Err(err) = run_opkg_progress(
             &tmp,
             &cache,
@@ -879,6 +894,9 @@ fn stop_before_removal(id: &str, state: &crate::state::PluginState) -> Result<()
 }
 
 pub fn remove_package(name: &str) -> Result<(), String> {
+    if crate::system_plugin::load_system_plugins()?.contains_key(name) {
+        return Err("native plugin packages are managed by the system image".into());
+    }
     let package_name = resolve_extension_package(name)
         .map_err(|_| "remove accepts an extension id or onekvm-extension-* package name")?;
     let id = package_name.trim_start_matches("onekvm-extension-");
@@ -896,6 +914,9 @@ pub fn remove_package(name: &str) -> Result<(), String> {
 }
 
 pub fn purge(id: &str) -> Result<(), String> {
+    if crate::system_plugin::load_system_plugins()?.contains_key(id) {
+        return Err("native plugin packages are managed by the system image".into());
+    }
     if !paths::valid_id(id) {
         return Err(format!("invalid extension id {id:?}"));
     }
@@ -1023,6 +1044,38 @@ mod tests {
     use super::{
         download_percent, parse_content_length, parse_output_percent, validate_local_upload_path,
     };
+
+    #[test]
+    fn new_installation_honors_enable_choice_and_legacy_defaults() {
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.kind = "service".into();
+        let state = crate::state::PluginState::default();
+        for default in [false, true] {
+            manifest.default_enabled = default;
+            assert_eq!(super::enabled_after_install(&manifest, &state, false, None), default);
+            assert!(super::enabled_after_install(&manifest, &state, false, Some(true)));
+            assert!(!super::enabled_after_install(&manifest, &state, false, Some(false)));
+        }
+        manifest.kind = "cloud-provider".into();
+        assert!(!super::enabled_after_install(&manifest, &state, false, None));
+    }
+
+    #[test]
+    fn upgrade_preserves_enabled_intent_and_environments_never_start() {
+        let mut manifest = crate::manifest::Manifest::default();
+        manifest.kind = "service".into();
+        for enabled in [false, true] {
+            let state = crate::state::PluginState { enabled, ..Default::default() };
+            for requested in [None, Some(false), Some(true)] {
+                assert_eq!(super::enabled_after_install(&manifest, &state, true, requested), enabled);
+            }
+        }
+        manifest.kind = "environment".into();
+        let state = crate::state::PluginState { enabled: true, ..Default::default() };
+        for exists in [false, true] {
+            assert!(!super::enabled_after_install(&manifest, &state, exists, Some(true)));
+        }
+    }
 
     #[test]
     fn installation_log_keeps_a_bounded_utf8_tail_and_final_failure() {

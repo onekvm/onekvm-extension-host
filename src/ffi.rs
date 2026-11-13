@@ -92,6 +92,12 @@ pub unsafe extern "C" fn onekvm_host_simple(
             }
             return crate::network_modules::load(cstr(id)?);
         }
+        if method == "ArchiveUpdateData" {
+            if revision != 0 {
+                return Err("update archive revision must be zero".into());
+            }
+            return crate::update::archive_app_data(cstr(id)?);
+        }
         if matches!(method, "CaptureTransaction" | "RestoreTransaction") {
             if revision != 0 {
                 return Err("transaction revision must be zero".into());

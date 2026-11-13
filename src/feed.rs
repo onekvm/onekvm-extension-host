@@ -243,6 +243,7 @@ pub fn update_status() -> serde_json::Value {
 }
 
 fn refresh_with_policy(force: bool) -> Result<(), String> {
+    crate::network_policy::require("extensions")?;
     let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
     if !force && validate_policy_freshness(&policy).is_ok() {
         return Ok(());

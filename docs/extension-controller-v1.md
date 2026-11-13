@@ -56,6 +56,13 @@ The helper retains `CAP_SETUID` and `CAP_SETGID` for that transition; both are
 cleared from a child after it switches to the unprivileged identity, while
 `RestrictSUIDSGID` continues to prevent creation of SUID/SGID files.
 
+`container-admin` runs as `root` so importd and machined can authorize container
+operations without polkit. It adds writable `/etc/systemd/nspawn` and
+`/var/lib/machines` paths for container settings and OCI mount-stack cloning,
+and allows `AF_NETLINK` alongside `network`. Other filesystem, device and
+resource restrictions remain active. Container processes themselves are started
+by the host's `systemd-nspawn@` units, outside the extension's resource limits.
+
 `host-unrestricted` is a separate, high-risk opt-in for a host administration
 surface that must behave exactly like a root login on the device. It runs as
 `root` without the extension filesystem, device, network, namespace,
@@ -102,12 +109,15 @@ Routes accept three authentication modes:
 
 - `session` is served below `/api/plugins/<extension-id>/` and requires a
   valid OneKVM device session.
-- `passthrough` is served below `/plugins/<extension-id>/` and also requires a
-  valid OneKVM device session.
+- `passthrough` is served below `/plugins/<extension-id>/`. It only forwards
+  the client's `Authorization` header. Core does not check a device session
+  for a `unix` or `http` route; the extension checks that header. A `file`
+  route still requires a device session, because Core serves those files.
 - `public` is served below `/plugins/<extension-id>/` without a OneKVM device
-  session. It is reserved for narrow external identity-provider callbacks
-  that authenticate their own unguessable, expiring, single-use state.
+  session. Core forwards the client's `Authorization` header. Use it for an
+  identity-provider callback that validates its own one-time state.
 
-Only the route prefix explicitly marked `public` bypasses device login. Do
-not use `public` for settings, credential reads, disconnect actions, static
-pages, or long-lived sockets.
+Device login is skipped only for `public` routes and for `unix` or `http`
+`passthrough` routes. Do not use either mode for settings, credential reads,
+disconnect actions, or static pages. A static page stays behind the device
+session.
