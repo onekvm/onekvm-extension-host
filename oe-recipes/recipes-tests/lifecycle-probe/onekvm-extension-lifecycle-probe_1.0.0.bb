@@ -8,6 +8,15 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/../../../tests/fixtures/lifecycle-probe:$
 # it; headless machines use the fixture's non-screen test payload.
 SRC_URI = "file://Makefile file://manifest.json.in file://probe.sh file://tool.js file://LICENSE"
 SRC_URI:append:onekvm-with-screen = " file://screen-app"
+# screen-app is generated and ignored by Git; skip the probe in a clean
+# checkout so the missing directory does not stop parsing.
+python () {
+    if 'onekvm-with-screen' not in d.getVar('OVERRIDES').split(':'):
+        return
+    app = os.path.join(d.getVar('FILE_DIRNAME'), '../../../tests/fixtures/lifecycle-probe/screen-app')
+    if not os.path.isdir(app):
+        raise bb.parse.SkipRecipe('screen-app is missing; run tests/build-lifecycle-probe.sh')
+}
 S = "${UNPACKDIR}"
 inherit onekvm-extension
 OPKGBUILDCMD = "opkg-build -Z gzip"
