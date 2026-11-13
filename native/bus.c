@@ -1201,6 +1201,7 @@ static int on_name_owner(sd_bus_message *message, void *userdata, sd_bus_error *
 static const sd_bus_vtable host_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_METHOD("ApplyConfig", "stsas", "", host_apply_config, 0),
+    SD_BUS_METHOD("ArchiveUpdateData", "st", "", host_simple, 0),
     SD_BUS_METHOD("CaptureTransaction", "st", "", host_simple, 0),
     SD_BUS_METHOD("RestoreTransaction", "st", "", host_simple, 0),
     SD_BUS_METHOD("CheckHealth", "st", "", host_simple, 0),
@@ -1719,7 +1720,8 @@ static int cli_set_error(char **err, const char *text) {
     return *err ? -EIO : -ENOMEM;
 }
 
-int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision, char **err) {
+int onekvm_cli_host_simple_timeout(const char *method, const char *id, uint64_t revision,
+                                   uint64_t timeout_usec, char **err) {
     sd_bus *bus = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *message = NULL;
@@ -1732,7 +1734,7 @@ int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision
     result = sd_bus_message_append(message, "st", id, revision);
     if (result < 0)
         goto out;
-    result = sd_bus_call(bus, message, 35000000, &error, NULL);
+    result = sd_bus_call(bus, message, timeout_usec, &error, NULL);
     if (result < 0)
         result = cli_set_error(err, sd_bus_error_is_set(&error) ? error.message : strerror(-result));
 out:
@@ -1740,6 +1742,10 @@ out:
     sd_bus_message_unref(message);
     sd_bus_unref(bus);
     return result < 0 ? result : 0;
+}
+
+int onekvm_cli_host_simple(const char *method, const char *id, uint64_t revision, char **err) {
+    return onekvm_cli_host_simple_timeout(method, id, revision, 35000000, err);
 }
 
 int onekvm_cli_host_invoke(const char *id, const char *method, const char *request, char **response,

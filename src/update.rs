@@ -1079,6 +1079,8 @@ fn arm(id: &str) -> Result<Value, String> {
             .map_err(|e| e.to_string())?;
         plan.bundle = pinned.to_string_lossy().into_owned();
     }
+    // The host archives extension data for the plugins recorded here.
+    save(&plan)?;
     // Quiesce plugin databases while taking the rollback snapshot. Source
     // settings and enabled flags are restored even if copying fails.
     let original: BTreeMap<_, _> = plan
@@ -1099,24 +1101,9 @@ fn arm(id: &str) -> Result<Value, String> {
         copy_tree(Path::new(paths::APPS_ROOT), &snapshot.join("apps"))?;
         copy_tree(Path::new(paths::CONFIG_ROOT), &snapshot.join("config"))?;
         copy_tree(Path::new("/var/lib/opkg/info"), &snapshot.join("info"))?;
-        // Archive extension-owned data without chowning a copied directory and
-        // then attempting chmod without CAP_FOWNER in Core's CLI child. The
-        // boot helper restores numeric ownership and modes with full privileges.
-        let data_archive = snapshot.join("app-data.tar");
-        let mut args = vec![
-            "-cpf".to_owned(),
-            data_archive.to_string_lossy().into_owned(),
-            "-C".to_owned(),
-            paths::APP_DATA_ROOT.to_owned(),
-        ];
-        for plugin in &plan.plugins {
-            if Path::new(paths::APP_DATA_ROOT).join(&plugin.id).is_dir() {
-                args.push(plugin.id.clone());
-            }
-        }
-        if args.len() > 4 {
-            sys::output("tar", &args)?;
-        }
+        // Extension data may be private to its service user. Core's CLI child
+        // lacks DAC_READ_SEARCH, so the host archives it from the saved plan.
+        crate::dbus_client::archive_update_data(&plan.id)?;
         for (id, value) in &original {
             write_json(snapshot.join("config").join(format!("{id}.json")), value)?;
         }
@@ -1456,6 +1443,40 @@ usr/lib/modules/6.18.57-onekvm-0ab8cad/modules.builtin\n";
         );
         assert!(missing(&p).is_empty());
     }
+}
+
+/// Runs in the extension host, which may read data private to extension
+/// service users. Archives the data of the plugins in the prepared plan; the
+/// boot helper restores numeric ownership and modes with full privileges.
+pub fn archive_app_data(id: &str) -> Result<(), String> {
+    let plan = load()?;
+    if plan.id != id || plan.phase != "prepared" {
+        return Err("update preparation changed".into());
+    }
+    let snapshot = root().join("source");
+    fs::create_dir_all(&snapshot).map_err(|e| e.to_string())?;
+    let data_archive = snapshot.join("app-data.tar");
+    match fs::remove_file(&data_archive) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let mut args = vec![
+        "-cpf".to_owned(),
+        data_archive.to_string_lossy().into_owned(),
+        "-C".to_owned(),
+        paths::APP_DATA_ROOT.to_owned(),
+    ];
+    for plugin in &plan.plugins {
+        if paths::valid_id(&plugin.id) && Path::new(paths::APP_DATA_ROOT).join(&plugin.id).is_dir()
+        {
+            args.push(plugin.id.clone());
+        }
+    }
+    if args.len() > 4 {
+        sys::output("tar", &args)?;
+    }
+    Ok(())
 }
 
 fn bind(from: &Path, to: &Path) -> Result<(), String> {

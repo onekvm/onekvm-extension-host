@@ -8,6 +8,13 @@ extern "C" {
         revision: u64,
         err: *mut *mut c_char,
     ) -> c_int;
+    fn onekvm_cli_host_simple_timeout(
+        method: *const c_char,
+        id: *const c_char,
+        revision: u64,
+        timeout_usec: u64,
+        err: *mut *mut c_char,
+    ) -> c_int;
     fn onekvm_cli_host_invoke(
         id: *const c_char,
         method: *const c_char,
@@ -80,6 +87,20 @@ pub fn health(id: &str, revision: u64) -> Result<(), String> {
 
 pub fn transaction(operation: &str, id: &str) -> Result<(), String> {
     host_simple(operation, id, 0)
+}
+
+/// Extension data can be large (Recall keeps recordings); allow 30 minutes.
+pub fn archive_update_data(plan_id: &str) -> Result<(), String> {
+    let method = c_string("ArchiveUpdateData")?;
+    let id = c_string(plan_id)?;
+    let mut err = std::ptr::null_mut();
+    let status = unsafe {
+        onekvm_cli_host_simple_timeout(method.as_ptr(), id.as_ptr(), 0, 1_800_000_000, &mut err)
+    };
+    if status != 0 {
+        return Err(fail(status, err, "extension host"));
+    }
+    Ok(())
 }
 
 fn host_simple(method: &str, id: &str, revision: u64) -> Result<(), String> {
