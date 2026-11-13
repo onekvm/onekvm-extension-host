@@ -200,12 +200,14 @@ extension host. The installed versions can satisfy dependencies, but extension
 transactions cannot replace image packages or shared libraries. Optional runtimes
 outside the image and extension packages can still be installed or updated. A
 missing/invalid baseline fails closed; newer system dependencies require a signed
-sqfs system update. Dependencies are downloaded using the original signed
+system update. Dependencies are downloaded using the original signed
 indexes and package checksum validation, then every selected payload is checked
 against the image baseline. Installation uses only those local files with no
 software sources configured, so the solver cannot introduce other system
 candidates. Local uploads containing image packages are rejected. Explicit system
-updates use the target image's separate offline installation path.
+updates use the target image's separate offline installation path. The system update
+precheck reads the target root from SquashFS or EROFS images (`unsquashfs` or
+`dump.erofs`); the RAUC bundle around it is always SquashFS.
 
 ## Native browser views
 

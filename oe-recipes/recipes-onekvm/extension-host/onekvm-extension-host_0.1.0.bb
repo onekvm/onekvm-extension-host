@@ -1,7 +1,7 @@
 SUMMARY = "OneKVM extension host, lifecycle policy, and manager CLI"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=8a5a0a588995e3e2c2bfa68f5413df57"
-PR = "r40"
+PR = "r41"
 OPKGBUILDCMD = "opkg-build -Z gzip"
 
 ONEKVM_TRUSTED_FEED_PREFIXES ?= ""
@@ -87,7 +87,7 @@ do_install() {
 SYSTEMD_SERVICE:${PN} = "onekvm-extension-host.service"
 SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
-RDEPENDS:${PN} += "opkg systemd gnupg-gpg wget openssl-bin"
+RDEPENDS:${PN} += "opkg systemd gnupg-gpg wget openssl-bin erofs-utils-dump"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"
