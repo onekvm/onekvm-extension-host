@@ -5,6 +5,13 @@ EXCLUDE_FROM_WORLD = "1"
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../../tests/fixtures/web-component-probe:${THISDIR}/../../..:"
 # Generate the ignored Lit bundle with tests/build-web-component-probe.sh.
 SRC_URI = "file://Makefile file://manifest.json.in file://probe.sh file://native-view.js file://console.js file://lit-tool.bundle.js file://LICENSE"
+# A clean checkout of the layer has no bundle; skip the probe there so the
+# missing file does not stop parsing of every image that uses this layer.
+python () {
+    bundle = os.path.join(d.getVar('FILE_DIRNAME'), '../../../tests/fixtures/web-component-probe/lit-tool.bundle.js')
+    if not os.path.isfile(bundle):
+        raise bb.parse.SkipRecipe('lit-tool.bundle.js is missing; run tests/build-web-component-probe.sh')
+}
 S = "${UNPACKDIR}"
 inherit onekvm-extension
 OPKGBUILDCMD = "opkg-build -Z gzip"
