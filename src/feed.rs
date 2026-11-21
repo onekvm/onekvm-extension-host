@@ -179,7 +179,7 @@ fn manifest_from_package_fields(fields: &BTreeMap<String, String>) -> Result<Man
     Ok(extension)
 }
 
-fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     fn value(byte: u8) -> Option<u8> {
         match byte {
             b'A'..=b'Z' => Some(byte - b'A'),

@@ -34,6 +34,8 @@ pub const LEGACY_CONFIG: &str = "/var/lib/onekvm/extensions/config";
 pub const LEGACY_STATE: &str = "/var/lib/onekvm/extensions/state";
 pub const CATALOG_CACHE: &str = "/data/onekvm/plugin-catalog.json";
 pub const MARKETPLACE_CACHE: &str = "/data/onekvm/plugin-marketplace.json";
+/// Marketplace icons by content hash; Core serves them at `/api/extension-icons/`.
+pub const MARKETPLACE_ICONS: &str = "/data/onekvm/plugin-marketplace-icons";
 pub const ONEKVM_CONFIG: &str = "/etc/onekvm/config.json";
 #[allow(dead_code)]
 pub const SYSTEMD_RUN: &str = "/bin/systemd-run";
