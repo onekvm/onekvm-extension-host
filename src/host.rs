@@ -415,7 +415,7 @@ fn marketplace_package_name(request: Option<&Value>) -> Result<String, String> {
     Err("package or id is required".into())
 }
 
-const MARKETPLACE_CACHE_VERSION: i32 = 7;
+const MARKETPLACE_CACHE_VERSION: i32 = 8;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MarketplaceDiskCache {

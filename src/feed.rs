@@ -12,7 +12,8 @@ use crate::manifest::{decode_manifest, Manifest};
 use crate::paths;
 use crate::sys;
 
-const MAX_FEED_ICON_DATA_URL: usize = 384 * 1024;
+// Base64 of the largest allowed icon plus its `data:` prefix.
+const MAX_FEED_ICON_DATA_URL: usize = crate::marketplace_icons::MAX_ICON_BYTES.div_ceil(3) * 4 + 32;
 const MAX_CUSTOM_FEED_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_DISPLAY_NAME: usize = 64;
 const SOURCE_KEY_PREFIX: &str = "# OneKVM-Source-Key:";
