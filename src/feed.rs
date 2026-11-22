@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::parse_control;
 use crate::feed_keys::{self, SourceKey};
+use crate::feed_mirrors::{Failure, FetchError};
 use crate::manifest::{decode_manifest, Manifest};
 use crate::paths;
 use crate::sys;
@@ -20,6 +21,8 @@ const SOURCE_KEY_PREFIX: &str = "# OneKVM-Source-Key:";
 const SOURCE_NAME_PREFIX: &str = "# OneKVM-Source-Name:";
 const FEED_UPDATE_RETRY_COOLDOWN_SECS: u64 = 60;
 const FEED_UPDATE_STALE_RUNNING_SECS: u64 = 120;
+/// Signed external indexes refresh at least this often.
+const FEED_INDEX_MAX_AGE_SECS: u64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedUpdateStatus {
@@ -28,6 +31,10 @@ pub struct FeedUpdateStatus {
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub error: String,
+    /// Each source's result in the last update; `state` is "partial" when
+    /// some sources failed and the rest were updated.
+    #[serde(default)]
+    pub sources: Vec<SourceUpdate>,
 }
 
 impl Default for FeedUpdateStatus {
@@ -38,8 +45,25 @@ impl Default for FeedUpdateStatus {
             started_at: None,
             finished_at: None,
             error: String::new(),
+            sources: Vec::new(),
         }
     }
+}
+
+/// One package source's result in the last list update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceUpdate {
+    /// The key the source list reports for this source.
+    pub key: String,
+    pub builtin: bool,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    /// The server the distribution lists came from, default or mirror.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +270,7 @@ pub fn update_status() -> serde_json::Value {
 fn refresh_with_policy(force: bool) -> Result<(), String> {
     crate::network_policy::require("extensions")?;
     let policy = load_feed_policy(paths::TRUSTED_FEEDS)?;
-    if !force && validate_policy_freshness(&policy).is_ok() {
+    if !force && fresh_enough(&policy) {
         return Ok(());
     }
     let status = read_update_status();
@@ -263,7 +287,7 @@ fn refresh_with_policy(force: bool) -> Result<(), String> {
     sys::try_with_lock(|| {
         // Recheck after claiming the global lock. Another caller may have
         // refreshed the indexes between the initial freshness check and here.
-        if !force && validate_policy_freshness(&policy).is_ok() {
+        if !force && fresh_enough(&policy) {
             return Ok(());
         }
         let status = read_update_status();
@@ -283,33 +307,197 @@ fn refresh_with_policy(force: bool) -> Result<(), String> {
             started_at: Some(started_at),
             finished_at: None,
             error: String::new(),
+            sources: Vec::new(),
         });
 
-        let result = (|| {
-            feed_keys::prepare_keyring(&policy.keys)?;
-            crate::feed_mirrors::refresh(|| {
-                // Recheck the selected URL against the image's distribution trust policy.
-                let selected = load_feed_policy(paths::TRUSTED_FEEDS)?;
-                sys::opkg_update().map_err(|err| format!("signed feed update failed: {err}"))?;
-                relax_opkg_list_permissions();
-                validate_policy_freshness(&selected)
-                    .map_err(|err| format!("reject package feed: {err}"))
-            })
-        })();
+        let (sources, result) = update_sources(&policy);
+        let state = if result.is_err() {
+            "failed"
+        } else if sources.iter().any(|source| !source.ok) {
+            "partial"
+        } else {
+            "succeeded"
+        };
         let finished = FeedUpdateStatus {
-            state: if result.is_ok() {
-                "succeeded".into()
-            } else {
-                "failed".into()
-            },
+            state: state.into(),
             pid: None,
             started_at: Some(started_at),
             finished_at: Some(now_secs()),
             error: result.clone().err().unwrap_or_default(),
+            sources,
         };
         write_update_status(finished);
         result
     })
+}
+
+/// Whether the lists can be used without updating. An update within the
+/// index window counts even when list times come from the server, and sources
+/// that failed in it do not hold up the rest until the window has passed.
+fn fresh_enough(policy: &FeedPolicy) -> bool {
+    if validate_policy_freshness(policy).is_ok() {
+        return true;
+    }
+    let status = read_update_status();
+    matches!(status.state.as_str(), "succeeded" | "partial")
+        && status
+            .finished_at
+            .is_some_and(|finished| now_secs().saturating_sub(finished) < FEED_INDEX_MAX_AGE_SECS)
+        && (policy.metadata_list.is_empty()
+            || validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())
+                .is_ok())
+}
+
+/// Updates each package source on its own, so one that fails leaves the
+/// others current. The update fails when the distribution feed fails, or
+/// when every source fails.
+fn update_sources(policy: &FeedPolicy) -> (Vec<SourceUpdate>, Result<(), String>) {
+    if let Err(err) = feed_keys::prepare_keyring(&policy.keys) {
+        return (Vec::new(), Err(err));
+    }
+    let base = match opkg_base_config() {
+        Ok(base) => base,
+        Err(err) => return (Vec::new(), Err(err)),
+    };
+    let mut sources = Vec::new();
+    let mut distribution_error = None;
+    for path in paths::feed_config_paths() {
+        let builtin = path == Path::new(paths::FEED_CONFIG);
+        let key = if builtin {
+            paths::BUILTIN_FEED_NAME.to_owned()
+        } else {
+            custom_source_key(&path).unwrap_or_default()
+        };
+        let outcome = if builtin {
+            crate::feed_mirrors::refresh(|| {
+                // Recheck the selected URL against the image's distribution trust policy.
+                let selected = load_feed_policy(paths::TRUSTED_FEEDS)
+                    .map_err(|err| FetchError::new(Failure::Rejected, err))?;
+                update_source_lists(&base, &path)?;
+                relax_opkg_list_permissions();
+                validate_source_lists(&selected, &path).map_err(|err| {
+                    FetchError::new(Failure::Rejected, format!("reject package feed: {err}"))
+                })
+            })
+        } else {
+            update_source_lists(&base, &path).map(|()| {
+                relax_opkg_list_permissions();
+                String::new()
+            })
+        };
+        let update = match outcome {
+            Ok(server) => SourceUpdate {
+                key,
+                builtin,
+                ok: true,
+                failure: None,
+                server,
+                error: String::new(),
+            },
+            Err(error) => {
+                eprintln!("Package source {key} update failed: {}", error.detail);
+                if builtin {
+                    distribution_error = Some(error.detail.clone());
+                }
+                SourceUpdate {
+                    key,
+                    builtin,
+                    ok: false,
+                    failure: Some(error.failure),
+                    server: String::new(),
+                    error: error.detail,
+                }
+            }
+        };
+        sources.push(update);
+    }
+    let result = match distribution_error {
+        Some(error) => Err(error),
+        None if !sources.is_empty() && sources.iter().all(|source| !source.ok) => Err(sources
+            .iter()
+            .map(|source| format!("{}: {}", source.key, source.error))
+            .collect::<Vec<_>>()
+            .join("; ")),
+        None => Ok(()),
+    };
+    (sources, result)
+}
+
+fn custom_source_key(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix(paths::FEED_CUSTOM_PREFIX)?
+        .strip_suffix(paths::FEED_CUSTOM_SUFFIX)
+        .map(str::to_owned)
+}
+
+/// opkg settings from every configuration file that names no package source.
+fn opkg_base_config() -> Result<String, String> {
+    opkg_base_config_at(Path::new(paths::OPKG_CONF_DIR))
+}
+
+fn opkg_base_config_at(directory: &Path) -> Result<String, String> {
+    let feed_name = Path::new(paths::FEED_CONFIG).file_name();
+    let mut files: Vec<PathBuf> = fs::read_dir(directory)
+        .map_err(|e| format!("read {}: {e}", directory.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let Some(name) = path.file_name() else {
+                return false;
+            };
+            let name_text = name.to_string_lossy();
+            name_text.ends_with(".conf")
+                && Some(name) != feed_name
+                && !name_text.starts_with(paths::FEED_CUSTOM_PREFIX)
+                && path.is_file()
+        })
+        .collect();
+    files.sort();
+    let mut text = String::new();
+    for path in files {
+        let content =
+            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        for line in content.lines() {
+            if matches!(line.split_whitespace().next(), Some("src" | "src/gz")) {
+                continue;
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    Ok(text)
+}
+
+/// Updates the lists of one source file, leaving every other list as it is.
+fn update_source_lists(base: &str, source: &Path) -> Result<(), FetchError> {
+    let failed = |detail: String| FetchError::new(Failure::Failed, detail);
+    let text = fs::read_to_string(source)
+        .map_err(|e| failed(format!("read {}: {e}", source.display())))?;
+    let name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let directory = Path::new(paths::OPKG_SOURCE_CONFIGS);
+    fs::create_dir_all(directory)
+        .map_err(|e| failed(format!("prepare {}: {e}", directory.display())))?;
+    let config = directory.join(&name);
+    sys::atomic_write(&config, format!("{base}\n{text}").as_bytes(), 0o600).map_err(failed)?;
+    let result = sys::opkg_update_with(&config);
+    let _ = fs::remove_file(&config);
+    result.map_err(|error| crate::feed_mirrors::update_failure(&error))
+}
+
+/// The distribution lists exist and its signed metadata is still valid.
+fn validate_source_lists(policy: &FeedPolicy, source: &Path) -> Result<(), String> {
+    if !policy.metadata_list.is_empty() {
+        validate_feed_freshness(&policy.metadata_list, paths::OPKG_LISTS, SystemTime::now())?;
+    }
+    for feed in read_configured_urls(source, true)? {
+        if !Path::new(paths::OPKG_LISTS).join(&feed.name).is_file() {
+            return Err(format!("missing feed index {}", feed.name));
+        }
+    }
+    Ok(())
 }
 
 fn now_secs() -> u64 {
@@ -362,7 +550,7 @@ fn validate_policy_freshness(policy: &FeedPolicy) -> Result<(), String> {
                 .elapsed()
                 .map_err(|_| "feed index timestamp is in the future")?
                 .as_secs()
-                >= 900
+                >= FEED_INDEX_MAX_AGE_SECS
         {
             return Err(format!("feed index {name} needs refreshing"));
         }
@@ -1004,10 +1192,10 @@ fn same_url_prefix(prefix: &ConfiguredUrl, feed: &ConfiguredUrl) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        custom_feed_path, encode_source_file, icon_data_url_from_package_fields,
-        load_feed_policy_at, manifest_from_package_fields, parse_source_metadata, parse_url,
-        set_path_enabled, valid_feed_source_display_name, valid_icon_data_url,
-        validate_custom_feed_text, validate_source_trust, SourceKey,
+        custom_feed_path, custom_source_key, encode_source_file, icon_data_url_from_package_fields,
+        load_feed_policy_at, manifest_from_package_fields, opkg_base_config_at,
+        parse_source_metadata, parse_url, set_path_enabled, valid_feed_source_display_name,
+        valid_icon_data_url, validate_custom_feed_text, validate_source_trust, SourceKey,
     };
     use crate::{feed_keys, paths};
     use std::collections::BTreeMap;
@@ -1083,6 +1271,40 @@ mod tests {
         fields.insert("X-OneKVM-Extension-Version".into(), "1.0.0".into());
         fields.insert("X-OneKVM-Extension-Manifest".into(), "not-base64".into());
         assert!(manifest_from_package_fields(&fields).is_err());
+    }
+
+    #[test]
+    fn each_source_updates_with_the_shared_settings_only() {
+        let root = std::env::temp_dir().join(format!("onekvm-opkg-base-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("opkg.conf"),
+            "option lists_dir /lists\nsrc/gz stray https://x/feed\n",
+        )
+        .unwrap();
+        fs::write(root.join("arch.conf"), "arch all 1\n").unwrap();
+        fs::write(
+            root.join("onekvm-feed.conf"),
+            "src onekvm-main https://a/main\n",
+        )
+        .unwrap();
+        fs::write(root.join("onekvm-ext-lab.conf"), "src lab https://b/feed\n").unwrap();
+        fs::write(
+            root.join("onekvm-ext-off.conf.disabled"),
+            "src off https://c/feed\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes.txt"), "src notes https://d/feed\n").unwrap();
+        assert_eq!(
+            opkg_base_config_at(&root).unwrap(),
+            "arch all 1\noption lists_dir /lists\n"
+        );
+        assert_eq!(
+            custom_source_key(std::path::Path::new("/etc/opkg/onekvm-ext-lab.conf")).as_deref(),
+            Some("lab")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

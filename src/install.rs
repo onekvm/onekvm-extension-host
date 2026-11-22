@@ -454,6 +454,16 @@ fn start_install_job(package_name: &str, size_bytes: u64, enable_after_install: 
     Ok(())
 }
 
+/// Empties a download directory, so another attempt starts from scratch.
+fn reset_directory(path: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("clear {}: {err}", path.display())),
+    }
+    fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))
+}
+
 fn join_install_job() -> Result<(), String> {
     let handle = job_slot()
         .lock()
@@ -481,13 +491,17 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
                 size_bytes,
                 "Downloading packages",
             );
-            run_opkg_progress(
-                &tmp,
-                &cache,
-                &["--download-only", "install", package_name],
-                "download",
-                size_bytes,
-            )?;
+            crate::feed_mirrors::download(|| {
+                reset_directory(&cache)?;
+                reset_directory(&tmp)?;
+                run_opkg_progress(
+                    &tmp,
+                    &cache,
+                    &["--download-only", "install", package_name],
+                    "download",
+                    size_bytes,
+                )
+            })?;
             let downloaded = directory_size(&cache);
             set_progress(
                 "download",
@@ -557,6 +571,7 @@ pub(crate) fn run_opkg_progress(
     fs::create_dir_all(cache).map_err(|e| e.to_string())?;
     let mut command = Command::new(paths::OPKG);
     crate::proxy::apply(&mut command)?;
+    sys::apply_opkg_download_limits(&mut command);
     command
         .arg(if phase == "download" { "-V2" } else { "-V1" })
         .arg("--tmp-dir")
@@ -615,10 +630,15 @@ pub(crate) fn run_opkg_progress(
     drop(tx);
     let mut installed = 0u32;
     let mut last_output = String::new();
+    // A failed download explains the failure better than opkg's last line.
+    let mut download_error = String::new();
     let packages = count_ipks(cache).max(1);
     for line in rx {
         if !line.trim().is_empty() {
             last_output = line.trim().to_owned();
+        }
+        if download_error.is_empty() && crate::feed_mirrors::is_download_failure(&line) {
+            download_error = line.trim().to_owned();
         }
         log_install_message(&line);
         apply_opkg_line(phase, &line, &mut installed, packages, total_bytes);
@@ -634,7 +654,11 @@ pub(crate) fn run_opkg_progress(
     if status.success() {
         Ok(())
     } else {
-        let detail = last_output;
+        let detail = if download_error.is_empty() {
+            last_output
+        } else {
+            download_error
+        };
         if detail.is_empty() {
             Err(format!("opkg failed with {}", status.code().unwrap_or(-1)))
         } else {
@@ -850,7 +874,11 @@ fn install_validated_unlocked(info: &PackageInfo, filenames: &[PathBuf], enable_
             download.push(filename.to_str().ok_or("invalid local package path")?);
         }
         if crate::network_policy::require("extensions").is_ok() {
-            run_opkg_progress(&tmp, &cache, &download, "download", 0)?;
+            crate::feed_mirrors::download(|| {
+                reset_directory(&cache)?;
+                reset_directory(&tmp)?;
+                run_opkg_progress(&tmp, &cache, &download, "download", 0)
+            })?;
         }
         let arguments =
             crate::package_policy::offline_install_arguments(&tmp, &cache, filenames, true)?;

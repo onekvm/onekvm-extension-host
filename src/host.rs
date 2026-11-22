@@ -162,6 +162,9 @@ fn apply_command_method(
                     .and_then(|value| value.get("refresh"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // A failed update still lists what the device has; the page
+                // reads each source's result from `feed_update`.
+                let mut refresh_error = None;
                 if refresh
                     && crate::feed::list_feed_sources()?.iter().any(|source| {
                         source.enabled
@@ -170,7 +173,7 @@ fn apply_command_method(
                             })
                     })
                 {
-                    crate::feed::refresh()?;
+                    refresh_error = crate::feed::refresh().err();
                 }
                 // Current pages load icons by URL; older ones expect them inline.
                 let icon_urls = request
@@ -178,7 +181,11 @@ fn apply_command_method(
                     .and_then(|value| value.get("icon_urls"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                return Ok(marketplace_list_packages(icon_urls)?);
+                let mut list = marketplace_list_packages(icon_urls)?;
+                if let (Some(error), Some(object)) = (refresh_error, list.as_object_mut()) {
+                    object.insert("refresh_error".into(), json!(error));
+                }
+                return Ok(list);
             }
             "list_sources" => {
                 return Ok(marketplace_list_sources()?);
