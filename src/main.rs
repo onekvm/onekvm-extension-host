@@ -16,6 +16,7 @@ mod ipks;
 mod kernel_identity;
 mod lifecycle;
 mod manifest;
+mod marketplace_icons;
 mod memory;
 mod network_modules;
 mod network_policy;

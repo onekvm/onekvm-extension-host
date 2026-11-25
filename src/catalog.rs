@@ -449,12 +449,15 @@ pub fn custom_icon_data_url(manifest: &Manifest) -> String {
     let Ok(meta) = fs::metadata(&path) else {
         return String::new();
     };
-    if !meta.is_file() || meta.len() == 0 || meta.len() > 256 * 1024 {
+    if !meta.is_file() || meta.len() > crate::marketplace_icons::MAX_ICON_BYTES as u64 {
         return String::new();
     }
     let Ok(content) = fs::read(&path) else {
         return String::new();
     };
+    if !crate::marketplace_icons::icon_fits(mime, &content) {
+        return String::new();
+    }
     format!("data:{mime};base64,{}", crate::ipk::base64_encode(&content))
 }
 

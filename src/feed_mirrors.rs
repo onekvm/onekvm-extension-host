@@ -4,11 +4,82 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{paths, sys};
 
-pub fn refresh(update: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+/// Why a package source could not be used, ordered by how well each explains
+/// a failure when several servers failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Failure {
+    /// HTTP 404 or 410: nothing is published at this address. For the
+    /// distribution feed, this system version has no feed yet.
+    NotFound,
+    /// The lists failed signature or validity checks.
+    Rejected,
+    /// TLS certificate verification failed.
+    Certificate,
+    /// The server answered with another HTTP error.
+    ServerError,
+    /// Timeout, DNS or connection failure.
+    Unreachable,
+    Failed,
+}
+
+impl Failure {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NotFound => "not published (HTTP 404)",
+            Self::Rejected => "rejected by signature or validity checks",
+            Self::Certificate => "certificate verification failed",
+            Self::ServerError => "server error",
+            Self::Unreachable => "timed out or unreachable",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchError {
+    pub failure: Failure,
+    pub detail: String,
+}
+
+impl FetchError {
+    pub fn new(failure: Failure, detail: impl Into<String>) -> Self {
+        Self {
+            failure,
+            detail: detail.into(),
+        }
+    }
+
+    /// The failure that best explains several, with every detail kept.
+    fn combine(errors: Vec<FetchError>) -> FetchError {
+        let failure = errors
+            .iter()
+            .map(|error| error.failure)
+            .min()
+            .unwrap_or(Failure::Failed);
+        let detail = errors
+            .into_iter()
+            .map(|error| error.detail)
+            .collect::<Vec<_>>()
+            .join("; ");
+        FetchError::new(failure, detail)
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// Updates the distribution feed lists from the default server, or from the
+/// fastest mirror that works. Returns the server used.
+pub fn refresh(update: impl FnMut() -> Result<(), FetchError>) -> Result<String, FetchError> {
     refresh_at(
         Path::new(paths::FEED_CONFIG),
         Path::new(paths::FEED_DEFAULT),
@@ -19,12 +90,105 @@ pub fn refresh(update: impl FnMut() -> Result<(), String>) -> Result<(), String>
     )
 }
 
-fn probe(url: &str) -> Option<Duration> {
+/// Runs a package download; when the active distribution server fails to
+/// deliver a package, moves to the fastest other mirror and downloads again.
+/// A mirror that works stays selected for later downloads.
+pub fn download(attempt: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+    download_at(
+        Path::new(paths::FEED_CONFIG),
+        Path::new(paths::FEED_DEFAULT),
+        Path::new(paths::FEED_PROFILES),
+        Path::new(paths::FEED_MIRRORS),
+        probe,
+        attempt,
+    )
+}
+
+/// Whether an opkg error came from downloading a file.
+pub fn is_download_failure(error: &str) -> bool {
+    error.contains("Failed to download") || error.contains("wget returned")
+}
+
+/// Explains a failed opkg update, asking the server again for the file that
+/// failed when the output does not say why.
+pub fn update_failure(error: &str) -> FetchError {
+    update_failure_with(error, probe)
+}
+
+fn update_failure_with(
+    error: &str,
+    probe: impl Fn(&str) -> Result<Duration, Failure>,
+) -> FetchError {
+    let failure = if let Some(url) = failed_download_url(error) {
+        match probe(url) {
+            Err(failure) => failure,
+            Ok(_) => match wget_exit_code(error) {
+                Some(4) => Failure::Unreachable,
+                Some(5) => Failure::Certificate,
+                Some(8) => Failure::ServerError,
+                _ => Failure::Failed,
+            },
+        }
+    } else if error.contains("timed out") {
+        Failure::Unreachable
+    } else if error.to_ascii_lowercase().contains("signature") {
+        Failure::Rejected
+    } else {
+        Failure::Failed
+    };
+    FetchError::new(failure, error)
+}
+
+fn failed_download_url(error: &str) -> Option<&str> {
+    let rest = &error[error.find("Failed to download ")? + "Failed to download ".len()..];
+    let end = rest.find([',', ' ']).unwrap_or(rest.len());
+    let url = &rest[..end];
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
+fn wget_exit_code(error: &str) -> Option<i32> {
+    let rest = &error[error.find("wget returned ")? + "wget returned ".len()..];
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Classifies a wget exit code and its `--server-response` output; `None`
+/// means the deadline stopped it.
+fn wget_failure(code: Option<i32>, output: &str) -> Failure {
+    match code {
+        Some(8) => match last_http_status(output) {
+            Some(404 | 410) => Failure::NotFound,
+            _ => Failure::ServerError,
+        },
+        None | Some(4) => Failure::Unreachable,
+        Some(5) => Failure::Certificate,
+        _ => Failure::Failed,
+    }
+}
+
+fn last_http_status(output: &str) -> Option<u16> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .filter(|field| field.starts_with("HTTP/"))
+                .and_then(|_| fields.next())
+                .and_then(|code| code.parse().ok())
+        })
+        .last()
+}
+
+fn probe(url: &str) -> Result<Duration, Failure> {
     let started = Instant::now();
-    sys::run_with_timeout(
+    let done = sys::run_captured(
         "/usr/bin/wget",
         &[
             "--quiet".into(),
+            "--server-response".into(),
             "--tries=1".into(),
             "--timeout=3".into(),
             "--output-document=/dev/null".into(),
@@ -33,8 +197,12 @@ fn probe(url: &str) -> Option<Duration> {
         ],
         Duration::from_secs(4),
     )
-    .ok()
-    .map(|_| started.elapsed())
+    .map_err(|_| Failure::Failed)?;
+    if done.code == Some(0) {
+        Ok(started.elapsed())
+    } else {
+        Err(wget_failure(done.code, &done.output))
+    }
 }
 
 struct Profile {
@@ -149,109 +317,234 @@ fn atomic_link(target: &Path, active: &Path) -> Result<(), String> {
     Err("create temporary feed symlink".into())
 }
 
-fn refresh_at(
+/// The managed distribution feed: its current state, to put back after a
+/// failed switch, and the default server followed by its mirrors.
+struct Managed {
+    current: String,
+    mode: u32,
+    old_target: Option<PathBuf>,
+    candidates: Vec<Profile>,
+}
+
+/// `None` when the feed is disabled, customized or has no usable layout;
+/// those configurations remain administrator owned.
+fn managed(
     active: &Path,
     defaults: &Path,
     directory: &Path,
     mirrors: &Path,
-    probe: impl Fn(&str) -> Option<Duration> + Sync,
-    mut update: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
-    // Disabled, locally customized and legacy configurations remain administrator owned.
+) -> Result<Option<Managed>, String> {
     let (Ok(current), Ok(default), Ok(info)) = (
         fs::read_to_string(active),
         fs::read_to_string(defaults),
         fs::symlink_metadata(active),
     ) else {
-        return update();
+        return Ok(None);
     };
     let old_target = fs::read_link(active).ok();
-    let managed = old_target
+    let is_managed = old_target
         .as_ref()
         .is_some_and(|target| target == defaults || *target == profile_path(directory, &current));
-    if !managed && feed_lines(&current) != feed_lines(&default) {
-        return update();
+    if !is_managed && feed_lines(&current) != feed_lines(&default) {
+        return Ok(None);
     }
     let mirror_text = match fs::read_to_string(mirrors) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(format!("read feed mirrors: {err}")),
     };
-    let Some(candidates) = profiles(&default, defaults, directory, &mirror_text) else {
-        return update();
+    Ok(
+        profiles(&default, defaults, directory, &mirror_text).map(|candidates| Managed {
+            current,
+            mode: info.permissions().mode() & 0o777,
+            old_target,
+            candidates,
+        }),
+    )
+}
+
+impl Managed {
+    /// The candidate opkg uses now; a regular file still holds the default.
+    fn active_target(&self, defaults: &Path) -> PathBuf {
+        self.old_target
+            .clone()
+            .unwrap_or_else(|| defaults.to_path_buf())
+    }
+
+    fn switch(&self, candidate: &Profile, defaults: &Path, active: &Path) -> Result<(), String> {
+        if candidate.target != defaults {
+            sys::atomic_write(&candidate.target, candidate.text.as_bytes(), 0o644)?;
+        }
+        atomic_link(&candidate.target, active)
+    }
+
+    fn restore(&self, active: &Path) -> Result<(), String> {
+        match &self.old_target {
+            Some(target) => atomic_link(target, active),
+            None => sys::atomic_write(active, self.current.as_bytes(), self.mode),
+        }
+    }
+}
+
+/// Probes candidates concurrently and returns the reachable ones, fastest
+/// first, with why the others are unreachable.
+fn rank<'a>(
+    candidates: &[&'a Profile],
+    probe: &(impl Fn(&str) -> Result<Duration, Failure> + Sync),
+) -> (Vec<&'a Profile>, Vec<FetchError>) {
+    // HTTPS GET time includes DNS, TLS and response latency.
+    let results = std::thread::scope(|scope| {
+        let jobs: Vec<_> = candidates
+            .iter()
+            .map(|candidate| scope.spawn(move || (probe(&candidate.probe_url), *candidate)))
+            .collect();
+        jobs.into_iter()
+            .filter_map(|job| job.join().ok())
+            .collect::<Vec<_>>()
+    });
+    let mut reachable = Vec::new();
+    let mut failures = Vec::new();
+    for (result, candidate) in results {
+        let server = origin(&candidate.probe_url).unwrap_or_default();
+        match result {
+            Ok(elapsed) => {
+                eprintln!(
+                    "Feed mirror {server} responded in {} ms",
+                    elapsed.as_millis()
+                );
+                reachable.push((elapsed, candidate));
+            }
+            Err(failure) => failures.push(FetchError::new(
+                failure,
+                format!("{server}: {}", failure.describe()),
+            )),
+        }
+    }
+    reachable.sort_by_key(|(elapsed, _)| *elapsed);
+    (
+        reachable
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect(),
+        failures,
+    )
+}
+
+fn refresh_at(
+    active: &Path,
+    defaults: &Path,
+    directory: &Path,
+    mirrors: &Path,
+    probe: impl Fn(&str) -> Result<Duration, Failure> + Sync,
+    mut update: impl FnMut() -> Result<(), FetchError>,
+) -> Result<String, FetchError> {
+    let Some(state) = managed(active, defaults, directory, mirrors)
+        .map_err(|e| FetchError::new(Failure::Failed, e))?
+    else {
+        return update().map(|_| String::new());
     };
     let mut switched = false;
-    let result = (|| {
-        let mut failures = Vec::new();
-        let mut attempt = |candidate: &Profile| -> Result<(), String> {
-            if candidate.target != defaults {
-                sys::atomic_write(&candidate.target, candidate.text.as_bytes(), 0o644)?;
-            }
-            switched = true;
-            atomic_link(&candidate.target, active)?;
-            eprintln!(
-                "Updating distribution feed from {}",
-                origin(&candidate.probe_url).unwrap_or_default()
-            );
-            update()
-        };
-        if candidates.len() == 1 || probe(&candidates[0].probe_url).is_some() {
-            match attempt(&candidates[0]) {
-                Ok(()) => return Ok(()),
-                Err(err) => failures.push(err),
-            }
-        } else {
-            failures.push("default feed is unreachable".into());
-        }
-        // Probe both mirrors concurrently; HTTPS GET time includes DNS, TLS and response latency.
-        let mut reachable = std::thread::scope(|scope| {
-            let jobs: Vec<_> = candidates[1..]
-                .iter()
-                .map(|candidate| {
-                    let probe = &probe;
-                    scope.spawn(move || {
-                        probe(&candidate.probe_url).map(|elapsed| (elapsed, candidate))
-                    })
-                })
-                .collect();
-            jobs.into_iter()
-                .filter_map(|job| job.join().ok().flatten())
-                .collect::<Vec<_>>()
-        });
-        reachable.sort_by_key(|(elapsed, _)| *elapsed);
-        for (elapsed, candidate) in reachable {
-            eprintln!(
-                "Feed mirror {} responded in {} ms",
-                origin(&candidate.probe_url).unwrap_or_default(),
-                elapsed.as_millis()
-            );
-            match attempt(candidate) {
-                Ok(()) => return Ok(()),
-                Err(err) => failures.push(err),
-            }
-        }
-        Err(format!(
-            "distribution feed refresh failed: {}",
-            failures.join("; ")
-        ))
-    })();
-    if result.is_err() && switched {
-        let restored = match old_target {
-            Some(target) => atomic_link(&target, active),
-            None => sys::atomic_write(
-                active,
-                current.as_bytes(),
-                info.permissions().mode() & 0o777,
-            ),
-        };
-        restored.map_err(|err| {
+    let mut failures = Vec::new();
+    let mut attempt = |candidate: &Profile| -> Result<String, FetchError> {
+        switched = true;
+        state
+            .switch(candidate, defaults, active)
+            .map_err(|e| FetchError::new(Failure::Failed, e))?;
+        let server = origin(&candidate.probe_url).unwrap_or_default().to_owned();
+        eprintln!("Updating distribution feed from {server}");
+        update()
+            .map(|_| server.clone())
+            .map_err(|error| FetchError::new(error.failure, format!("{server}: {}", error.detail)))
+    };
+    let primary = &state.candidates[0];
+    let checked = if state.candidates.len() == 1 {
+        Ok(Duration::ZERO)
+    } else {
+        probe(&primary.probe_url)
+    };
+    match checked {
+        Ok(_) => match attempt(primary) {
+            Ok(server) => return Ok(server),
+            Err(error) => failures.push(error),
+        },
+        Err(failure) => failures.push(FetchError::new(
+            failure,
             format!(
-                "{}; restore feed configuration: {err}",
-                result.as_ref().unwrap_err()
-            )
-        })?;
+                "{}: {}",
+                origin(&primary.probe_url).unwrap_or_default(),
+                failure.describe()
+            ),
+        )),
     }
-    result
+    let others: Vec<&Profile> = state.candidates[1..].iter().collect();
+    let (reachable, unreachable) = rank(&others, &probe);
+    failures.extend(unreachable);
+    for candidate in reachable {
+        match attempt(candidate) {
+            Ok(server) => return Ok(server),
+            Err(error) => failures.push(error),
+        }
+    }
+    let mut error = FetchError::combine(failures);
+    error.detail = format!("distribution feed refresh failed: {}", error.detail);
+    if switched {
+        if let Err(restore) = state.restore(active) {
+            error.detail = format!("{}; restore feed configuration: {restore}", error.detail);
+        }
+    }
+    Err(error)
+}
+
+fn download_at(
+    active: &Path,
+    defaults: &Path,
+    directory: &Path,
+    mirrors: &Path,
+    probe: impl Fn(&str) -> Result<Duration, Failure> + Sync,
+    mut attempt: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let first = match attempt() {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !is_download_failure(&first) {
+        return Err(first);
+    }
+    let Ok(Some(state)) = managed(active, defaults, directory, mirrors) else {
+        return Err(first);
+    };
+    let current = state.active_target(defaults);
+    let others: Vec<&Profile> = state
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.target != current)
+        .collect();
+    if others.is_empty() {
+        return Err(first);
+    }
+    let (reachable, _) = rank(&others, &probe);
+    let mut errors = vec![first];
+    let mut switched = false;
+    for candidate in reachable {
+        let server = origin(&candidate.probe_url).unwrap_or_default().to_owned();
+        if let Err(error) = state.switch(candidate, defaults, active) {
+            errors.push(error);
+            break;
+        }
+        switched = true;
+        eprintln!("Downloading packages again from {server}");
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("{server}: {error}")),
+        }
+    }
+    let mut error = errors.join("; ");
+    if switched {
+        if let Err(restore) = state.restore(active) {
+            error = format!("{error}; restore feed configuration: {restore}");
+        }
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -300,15 +593,32 @@ mod tests {
         fn refresh(
             &self,
             probe: impl Fn(&str) -> Option<Duration> + Sync,
-            update: impl FnMut() -> Result<(), String>,
+            mut update: impl FnMut() -> Result<(), String>,
         ) -> Result<(), String> {
             refresh_at(
                 &self.active,
                 &self.defaults,
                 &self.directory,
                 &self.mirrors,
-                probe,
-                update,
+                |url| probe(url).ok_or(Failure::Unreachable),
+                || update().map_err(|e| FetchError::new(Failure::Failed, e)),
+            )
+            .map(|_| ())
+            .map_err(|error| error.detail)
+        }
+
+        fn download(
+            &self,
+            probe: impl Fn(&str) -> Option<Duration> + Sync,
+            attempt: impl FnMut() -> Result<(), String>,
+        ) -> Result<(), String> {
+            download_at(
+                &self.active,
+                &self.defaults,
+                &self.directory,
+                &self.mirrors,
+                |url| probe(url).ok_or(Failure::Unreachable),
+                attempt,
             )
         }
     }
@@ -452,6 +762,121 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&fixture.active).unwrap(),
             "src local https://custom.invalid/feed\n"
+        );
+    }
+
+    const DOWNLOAD_FAILED: &str = "opkg failed with 255: Failed to download https://pkg-dev.onekvm.org/nanokvm/0.2.0/onekvm-extensions/onekvm-extension-x.ipk, wget returned 4.";
+
+    #[test]
+    fn failed_downloads_move_to_the_fastest_other_mirror_and_stay_there() {
+        let fixture = Fixture::new();
+        let mut servers = Vec::new();
+        fixture
+            .download(mirror_latency, || {
+                let text = fs::read_to_string(&fixture.active).unwrap();
+                servers.push(text.clone());
+                if text.contains("pkg-dev.onekvm.org") {
+                    Err(DOWNLOAD_FAILED.into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(fs::read_to_string(&fixture.active)
+            .unwrap()
+            .contains("pkg-dev.tyo.onekvm.org"));
+    }
+
+    #[test]
+    fn other_install_errors_and_unmanaged_feeds_do_not_switch_mirrors() {
+        let fixture = Fixture::new();
+        let original = fs::read(&fixture.active).unwrap();
+        let error = fixture
+            .download(|_| panic!("no probe"), || Err("unknown package 'x'".into()))
+            .unwrap_err();
+        assert_eq!(error, "unknown package 'x'");
+        fs::write(&fixture.active, "src local https://custom.invalid/feed\n").unwrap();
+        assert!(fixture
+            .download(|_| panic!("custom source"), || Err(DOWNLOAD_FAILED.into()))
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(&fixture.active).unwrap(),
+            "src local https://custom.invalid/feed\n"
+        );
+        assert_ne!(fs::read(&fixture.active).unwrap(), original);
+    }
+
+    #[test]
+    fn downloads_failing_everywhere_restore_the_selected_server() {
+        let fixture = Fixture::new();
+        fixture.refresh(mirror_latency, || Ok(())).unwrap();
+        let selected = fs::read_link(&fixture.active).unwrap();
+        let mut attempts = 0;
+        let error = fixture
+            .download(
+                |_| Some(Duration::ZERO),
+                || {
+                    attempts += 1;
+                    Err(DOWNLOAD_FAILED.into())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert!(error.contains("pkg-dev.sgp.onekvm.org"));
+        assert_eq!(fs::read_link(&fixture.active).unwrap(), selected);
+    }
+
+    #[test]
+    fn unpublished_versions_are_told_apart_from_unreachable_servers() {
+        let fixture = Fixture::new();
+        let error = refresh_at(
+            &fixture.active,
+            &fixture.defaults,
+            &fixture.directory,
+            &fixture.mirrors,
+            |url| {
+                if url.contains(".sgp.") {
+                    Err(Failure::Unreachable)
+                } else {
+                    Err(Failure::NotFound)
+                }
+            },
+            || panic!("nothing to update"),
+        )
+        .unwrap_err();
+        assert_eq!(error.failure, Failure::NotFound);
+        assert!(error.detail.contains("pkg-dev.sgp.onekvm.org: timed out"));
+
+        assert_eq!(
+            wget_failure(Some(8), "  HTTP/1.1 302 Found\n  HTTP/1.1 404 Not Found\n"),
+            Failure::NotFound
+        );
+        assert_eq!(
+            wget_failure(Some(8), "  HTTP/1.1 503 Service Unavailable\n"),
+            Failure::ServerError
+        );
+        assert_eq!(wget_failure(Some(4), ""), Failure::Unreachable);
+        assert_eq!(wget_failure(None, ""), Failure::Unreachable);
+        assert_eq!(wget_failure(Some(5), ""), Failure::Certificate);
+
+        let failed = "opkg update failed with 1: error: opkg_download_backend: Failed to download https://a.example/feed/Packages, wget returned 8.";
+        let checked = update_failure_with(failed, |url| {
+            assert_eq!(url, "https://a.example/feed/Packages");
+            Err(Failure::NotFound)
+        });
+        assert_eq!(checked.failure, Failure::NotFound);
+        assert_eq!(
+            update_failure_with(failed, |_| Ok(Duration::ZERO)).failure,
+            Failure::ServerError
+        );
+        assert_eq!(
+            update_failure_with("opkg update timed out after 60 seconds: ", |_| panic!()).failure,
+            Failure::Unreachable
+        );
+        assert_eq!(
+            update_failure_with("error: Signature verification failed", |_| panic!()).failure,
+            Failure::Rejected
         );
     }
 

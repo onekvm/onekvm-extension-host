@@ -106,6 +106,25 @@ fallbacks are prohibited.
 The screen launcher uses the namespaced ID `<source>/<id>` and loads the
 bundle from the resolved `package_root`.
 
+## Points provided by Core
+
+Core consumes some points itself. The host registers them with provider `core`
+whether or not any extension is installed, and an extension cannot declare the
+same name.
+
+| Point | Version | Purpose |
+| --- | --- | --- |
+| `extend.notification` | 1 | Notification delivery channel |
+
+A notification channel contributes `{"title": "..."}` (optional, at most 64
+characters) and a public `method` without `args`. Core invokes the method for
+each notification with the notification JSON on stdin, including test
+notifications sent from the Notifications settings page. On success the method
+prints a JSON object such as `{}` and exits with 0; on failure it writes the
+reason to stderr and exits with a non-zero status. The channel
+keeps its own parameters, such as tokens, recipients and level filters, in its
+extension settings. The payload is documented in Core's `docs/notifications.md`.
+
 The generic change token and transactional installation/removal semantics are
 documented in [extension-lifecycle.md](extension-lifecycle.md). Pending upgrade
 contributions are withheld until the transaction commits. Consumers must retire

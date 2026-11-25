@@ -73,9 +73,24 @@ pub fn validate_provider(owner: &str, declared: &[ExtensionPoint]) -> Result<(),
     add_points(&mut points, owner, declared)
 }
 
+/// Provider name for points consumed by Core itself. Core is always present,
+/// so these points do not depend on an installed extension or system plugin.
+pub const CORE_PROVIDER: &str = "core";
+
+/// `extend.notification`: notification delivery channels, documented in
+/// docs/extension-points.md.
+fn core_points() -> Vec<ExtensionPoint> {
+    vec![ExtensionPoint {
+        id: "extend.notification".into(),
+        version: 1,
+        aliases: Vec::new(),
+    }]
+}
+
 fn registry(exclude_provider: Option<&str>) -> Result<Registry, String> {
     let mut points = BTreeMap::new();
     let mut sources = Vec::new();
+    add_points(&mut points, CORE_PROVIDER, &core_points())?;
     for system in load_system_plugins()?.into_values() {
         if exclude_provider == Some(system.id.as_str()) || !sandbox::is_enabled(&system.unit) {
             continue;
@@ -188,6 +203,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(registry["extend.mqtt"].provider, "mqtt");
+    }
+
+    #[test]
+    fn core_points_are_reserved_for_core() {
+        let mut registry = BTreeMap::new();
+        add_points(&mut registry, CORE_PROVIDER, &core_points()).unwrap();
+        assert_eq!(registry["extend.notification"].provider, "core");
+        assert_eq!(registry["extend.notification"].version, 1);
+        assert!(add_points(
+            &mut registry,
+            "notifier",
+            &[ExtensionPoint {
+                id: "extend.notification".into(),
+                version: 1,
+                aliases: vec![],
+            }]
+        )
+        .is_err());
     }
 
     #[test]

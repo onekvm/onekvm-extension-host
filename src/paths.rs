@@ -8,6 +8,8 @@ pub const RUNTIME_ROOT: &str = "/run/onekvm/extensions";
 pub const AUTH_ROOT: &str = "/run/onekvm/extension-auth";
 pub const LOCK_PATH: &str = "/run/onekvm/extension-manager.lock";
 pub const OPKG_UPDATE_STATUS: &str = "/run/onekvm/opkg-update.json";
+/// One opkg configuration per package source while its lists update.
+pub const OPKG_SOURCE_CONFIGS: &str = "/run/onekvm/opkg-sources";
 pub const CONTRIBUTIONS_GENERATION: &str = "/run/onekvm/contributions-generation";
 pub const GENERATION_PATH: &str = "/run/onekvm/extension-host-generation";
 pub const MACHINE_PROFILE: &str = "/usr/share/onekvm/machine.json";
@@ -34,6 +36,8 @@ pub const LEGACY_CONFIG: &str = "/var/lib/onekvm/extensions/config";
 pub const LEGACY_STATE: &str = "/var/lib/onekvm/extensions/state";
 pub const CATALOG_CACHE: &str = "/data/onekvm/plugin-catalog.json";
 pub const MARKETPLACE_CACHE: &str = "/data/onekvm/plugin-marketplace.json";
+/// Marketplace icons by content hash; Core serves them at `/api/extension-icons/`.
+pub const MARKETPLACE_ICONS: &str = "/data/onekvm/plugin-marketplace-icons";
 pub const ONEKVM_CONFIG: &str = "/etc/onekvm/config.json";
 #[allow(dead_code)]
 pub const SYSTEMD_RUN: &str = "/bin/systemd-run";

@@ -162,6 +162,9 @@ fn apply_command_method(
                     .and_then(|value| value.get("refresh"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // A failed update still lists what the device has; the page
+                // reads each source's result from `feed_update`.
+                let mut refresh_error = None;
                 if refresh
                     && crate::feed::list_feed_sources()?.iter().any(|source| {
                         source.enabled
@@ -170,9 +173,19 @@ fn apply_command_method(
                             })
                     })
                 {
-                    crate::feed::refresh()?;
+                    refresh_error = crate::feed::refresh().err();
                 }
-                return Ok(marketplace_list_packages()?);
+                // Current pages load icons by URL; older ones expect them inline.
+                let icon_urls = request
+                    .as_ref()
+                    .and_then(|value| value.get("icon_urls"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut list = marketplace_list_packages(icon_urls)?;
+                if let (Some(error), Some(object)) = (refresh_error, list.as_object_mut()) {
+                    object.insert("refresh_error".into(), json!(error));
+                }
+                return Ok(list);
             }
             "list_sources" => {
                 return Ok(marketplace_list_sources()?);
@@ -409,7 +422,7 @@ fn marketplace_package_name(request: Option<&Value>) -> Result<String, String> {
     Err("package or id is required".into())
 }
 
-const MARKETPLACE_CACHE_VERSION: i32 = 6;
+const MARKETPLACE_CACHE_VERSION: i32 = 8;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MarketplaceDiskCache {
@@ -418,18 +431,24 @@ struct MarketplaceDiskCache {
     packages: Value,
 }
 
-fn marketplace_list_packages() -> Result<Value, String> {
+fn marketplace_list_packages(icon_urls: bool) -> Result<Value, String> {
+    let icons = Path::new(paths::MARKETPLACE_ICONS);
     let mut result = if let Ok(fingerprint) = marketplace_fingerprint() {
-        if let Some(cached) = read_marketplace_cache(&fingerprint) {
+        if let Some(cached) = read_marketplace_cache(&fingerprint)
+            .filter(|cached| marketplace_icons_present(icons, cached))
+        {
             cached
         } else {
-            let built = build_marketplace_list_packages()?;
+            let built = build_marketplace_list_packages(icons)?;
             let _ = write_marketplace_cache(&fingerprint, &built);
             built
         }
     } else {
-        build_marketplace_list_packages()?
+        build_marketplace_list_packages(icons)?
     };
+    if !icon_urls {
+        inline_marketplace_icons(icons, &mut result);
+    }
     if let Some(object) = result.as_object_mut() {
         object.insert("storage".into(), marketplace_storage());
         object.insert("feed_update".into(), crate::feed::update_status());
@@ -465,7 +484,43 @@ fn storage_usage(path: &str) -> Option<(u64, u64)> {
     ))
 }
 
-fn build_marketplace_list_packages() -> Result<Value, String> {
+fn marketplace_icons_present(icons: &Path, list: &Value) -> bool {
+    list.get("packages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|package| package.get("icon_url").and_then(Value::as_str))
+        .filter(|url| !url.is_empty())
+        .all(|url| {
+            crate::marketplace_icons::name_from_url(url)
+                .is_some_and(|name| crate::marketplace_icons::exists(icons, name))
+        })
+}
+
+/// Restores the inline icon fields that older marketplace pages read.
+fn inline_marketplace_icons(icons: &Path, list: &mut Value) {
+    let Some(packages) = list.get_mut("packages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for package in packages {
+        let data = package
+            .get("icon_url")
+            .and_then(Value::as_str)
+            .and_then(crate::marketplace_icons::name_from_url)
+            .and_then(|name| crate::marketplace_icons::data_url(icons, name))
+            .unwrap_or_default();
+        if !data.is_empty() {
+            if let Some(icon) = package.get_mut("icon") {
+                if icon.get("source").and_then(Value::as_str) == Some("custom") {
+                    icon["data"] = json!(data);
+                }
+            }
+        }
+        package["icon_data_url"] = json!(data);
+    }
+}
+
+fn build_marketplace_list_packages(icons: &Path) -> Result<Value, String> {
     use crate::manifest::{installed_versions, load_installed, PageIcon};
     use std::collections::BTreeSet;
 
@@ -506,9 +561,15 @@ fn build_marketplace_list_packages() -> Result<Value, String> {
             .icon
             .clone()
             .or_else(|| manifest.page.as_ref().and_then(|page| page.icon.clone()));
+        let icon_url = if icon_data_url.is_empty() {
+            String::new()
+        } else {
+            crate::marketplace_icons::store(icons, &icon_data_url)
+                .map(|name| format!("{}{name}", crate::marketplace_icons::URL_PREFIX))
+                .unwrap_or_default()
+        };
         let mut icon_value = match icon {
             Some(PageIcon { source, name, path }) => {
-                let custom = source == "custom";
                 let mut value = json!({ "source": source });
                 if !name.is_empty() {
                     value["name"] = json!(name);
@@ -516,18 +577,12 @@ fn build_marketplace_list_packages() -> Result<Value, String> {
                 if !path.is_empty() {
                     value["path"] = json!(path);
                 }
-                if custom && !icon_data_url.is_empty() {
-                    value["data"] = json!(icon_data_url);
-                }
                 value
             }
             None => Value::Null,
         };
-        if icon_value.is_null() && !icon_data_url.is_empty() {
-            icon_value = json!({
-                "source": "custom",
-                "data": icon_data_url,
-            });
+        if icon_value.is_null() && !icon_url.is_empty() {
+            icon_value = json!({ "source": "custom" });
         }
         packages.push(json!({
             "id": id,
@@ -543,7 +598,7 @@ fn build_marketplace_list_packages() -> Result<Value, String> {
             "update_available": update_available,
             "i18n": manifest.i18n,
             "icon": icon_value,
-            "icon_data_url": icon_data_url,
+            "icon_url": icon_url,
             "size_bytes": size_bytes,
             "installed_size_bytes": installed_size_bytes,
         }));
@@ -617,6 +672,13 @@ fn build_marketplace_list_packages() -> Result<Value, String> {
             .and_then(Value::as_str)
             .cmp(&b.get("id").and_then(Value::as_str))
     });
+    let used = packages
+        .iter()
+        .filter_map(|package| package.get("icon_url").and_then(Value::as_str))
+        .filter_map(crate::marketplace_icons::name_from_url)
+        .map(str::to_owned)
+        .collect();
+    crate::marketplace_icons::prune(icons, &used);
     Ok(json!({ "packages": packages }))
 }
 

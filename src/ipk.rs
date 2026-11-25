@@ -9,7 +9,6 @@ use crate::control::parse_control;
 use crate::manifest::{decode_manifest, Manifest};
 
 const MAX_IPK_MEMBER: u64 = 256 << 20;
-const MAX_PREVIEW_ICON: u64 = 1 << 20;
 const MAX_LAYOUT: u64 = 64 * 1024;
 
 // Platform libs plus companion program packages split out of extension recipes
@@ -434,11 +433,14 @@ fn extract_preview_icon(compressed: &[u8], manifest: &Manifest) -> Result<String
         if name != target {
             continue;
         }
-        if entry.size() > MAX_PREVIEW_ICON {
+        if entry.size() > crate::marketplace_icons::MAX_ICON_BYTES as u64 {
             return Ok(String::new());
         }
         let mut content = Vec::new();
         entry.read_to_end(&mut content).map_err(|e| e.to_string())?;
+        if !crate::marketplace_icons::icon_fits(mime, &content) {
+            return Ok(String::new());
+        }
         return Ok(format!("data:{mime};base64,{}", base64_encode(&content)));
     }
     Ok(String::new())
