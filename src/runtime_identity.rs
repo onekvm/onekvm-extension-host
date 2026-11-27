@@ -361,7 +361,7 @@ fn migrate(path: &Path, source: u32, target: (u32, u32)) -> io::Result<()> {
     // migrations and restored snapshots can be identified by their owner.
     set_owner(&dir, (0, 0))?;
     dir.set_permissions(fs::Permissions::from_mode(0o700))?;
-    migrate_children(&dir, source, target)?;
+    migrate_children(&dir, &mount_id(&dir)?, source, target)?;
     if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -370,40 +370,40 @@ fn migrate(path: &Path, source: u32, target: (u32, u32)) -> io::Result<()> {
 }
 
 fn open_child(dir: &File, name: &OsStr) -> io::Result<File> {
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
     let name = CString::new(name.as_bytes())?;
-    let how = OpenHow {
-        flags: (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
-        mode: 0,
-        resolve: 0x01 | 0x04, // RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS
-    };
     let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
+        libc::openat(
             dir.as_raw_fd(),
             name.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { File::from_raw_fd(fd as i32) })
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn migrate_children(dir: &File, source: u32, target: (u32, u32)) -> io::Result<()> {
+fn mount_id(file: &File) -> io::Result<String> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("extension data mount ID is unavailable"))
+}
+
+fn migrate_children(dir: &File, mount: &str, source: u32, target: (u32, u32)) -> io::Result<()> {
     for entry in fs::read_dir(fd_path(dir))? {
         let entry = entry?;
         let child = open_child(dir, &entry.file_name())?;
+        // Compare mount IDs rather than devices to reject bind mounts as well.
+        // All subsequent metadata and ownership operations use this same fd.
+        if mount_id(&child)? != mount {
+            return Err(io::Error::other("cannot migrate mounted extension data"));
+        }
         let info = child.metadata()?;
         if info.is_dir() && (info.uid() == source || info.uid() == target.0) {
-            migrate_children(&child, source, target)?;
+            migrate_children(&child, mount, source, target)?;
         }
         if info.uid() == source {
             if !info.is_dir() && info.nlink() != 1 {
