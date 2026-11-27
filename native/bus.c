@@ -3,6 +3,7 @@
 #include <linux/capability.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -413,6 +414,7 @@ static int append_transient_property(sd_bus_message *message,
         result = append_bind_paths_property(message, name, value);
     } else if (strcmp(name, "ReadOnlyPaths") == 0 ||
                strcmp(name, "ReadWritePaths") == 0 ||
+               strcmp(name, "ExtensionDirectories") == 0 ||
                strcmp(name, "SupplementaryGroups") == 0 ||
                strcmp(name, "SystemCallArchitectures") == 0 ||
                strcmp(name, "BindsTo") == 0 || strcmp(name, "PartOf") == 0 ||
@@ -521,7 +523,7 @@ static int append_transient_property(sd_bus_message *message,
     return result;
 }
 
-static int wait_for_unit_start(sd_bus *bus, const char *unit) {
+static int wait_for_unit_start(sd_bus *bus, const char *unit, const char *job) {
     const uint64_t deadline = now_usec() + 35000000ull;
     for (;;) {
         sd_bus_message *reply = NULL;
@@ -545,6 +547,16 @@ static int wait_for_unit_start(sd_bus *bus, const char *unit) {
             result = -EIO;
         else if (now_usec() >= deadline)
             result = -ETIMEDOUT;
+        else if (job && (result < 0 || strcmp(state, "inactive") == 0)) {
+            /* A failed image dependency can leave the consumer inactive or
+             * unload it. Its start job is gone as soon as that happens. */
+            sd_bus_error job_error = SD_BUS_ERROR_NULL;
+            int pending = sd_bus_get_property_trivial(
+                bus, SYSTEMD_NAME, job, "org.freedesktop.systemd1.Job",
+                "Id", &job_error, 'u', &(uint32_t){});
+            sd_bus_error_free(&job_error);
+            result = pending < 0 ? -EIO : -EAGAIN;
+        }
         else
             result = -EAGAIN;
         free(state);
@@ -583,7 +595,10 @@ static int wait_for_unit_stop(sd_bus *bus, const char *unit) {
                 result = sd_bus_get_property_string(bus, SYSTEMD_NAME, path,
                                                     SYSTEMD_UNIT, "ActiveState",
                                                     &error, &state);
-            if (result >= 0 && strcmp(state, "inactive") == 0)
+            /* Failed units have already exited and run their stop commands.
+             * StopUnit need not clear their diagnostic failed state. */
+            if (result >= 0 &&
+                (strcmp(state, "inactive") == 0 || strcmp(state, "failed") == 0))
                 result = 0;
             else if (now_usec() >= deadline)
                 result = -ETIMEDOUT;
@@ -687,7 +702,8 @@ static int append_service_properties(sd_bus_message *message, const char *unit,
 
 /* 1: UNIT is loaded and its service runs in DIR; 0: loaded with another
  * working directory (an older extension version); -ENOENT: not loaded. */
-static int unit_runs_in(sd_bus *bus, const char *unit, const char *dir) {
+static int unit_runs_in(sd_bus *bus, const char *unit, const char *dir,
+                        const char *extension_directory) {
     sd_bus_message *reply = NULL;
     sd_bus_error error = SD_BUS_ERROR_NULL;
     const char *path = NULL;
@@ -707,6 +723,24 @@ static int unit_runs_in(sd_bus *bus, const char *unit, const char *dir) {
                                             "WorkingDirectory", &error, &current);
     if (result >= 0)
         result = strcmp(current, dir) == 0 ? 1 : 0;
+    if (result == 1 && extension_directory) {
+        char **directories = NULL;
+        result = sd_bus_get_property_strv(bus, SYSTEMD_NAME, path,
+                                          "org.freedesktop.systemd1.Service",
+                                          "ExtensionDirectories", &error,
+                                          &directories);
+        if (result >= 0) {
+            const bool empty = !directories || !directories[0];
+            result = extension_directory[0]
+                ? !empty && !directories[1] && strcmp(directories[0], extension_directory) == 0
+                : empty;
+        }
+        if (directories) {
+            for (char **item = directories; *item; item++)
+                free(*item);
+            free(directories);
+        }
+    }
 out:
     free(current);
     sd_bus_error_free(&error);
@@ -720,7 +754,7 @@ int onekvm_systemd_unit_runs_in(const char *unit, const char *dir) {
     sd_bus *bus = NULL;
     int result = sd_bus_open_system(&bus);
     if (result >= 0)
-        result = unit_runs_in(bus, unit, dir);
+        result = unit_runs_in(bus, unit, dir, NULL);
     if (bus)
         sd_bus_flush_close_unref(bus);
     return result;
@@ -730,8 +764,9 @@ int onekvm_systemd_unit_runs_in(const char *unit, const char *dir) {
  * has unloaded it (CollectMode=inactive-or-failed). Otherwise
  * StartTransientUnit reports EEXIST and restarts the old unit, old command
  * and all, which the warm-restart path below would accept. */
-static int retire_other_version(sd_bus *bus, const char *unit, const char *dir) {
-    if (!dir || !dir[0] || unit_runs_in(bus, unit, dir) != 0)
+static int retire_other_version(sd_bus *bus, const char *unit, const char *dir,
+                                const char *extension_directory) {
+    if (!dir || !dir[0] || unit_runs_in(bus, unit, dir, extension_directory) != 0)
         return 0;
     sd_bus_error error = SD_BUS_ERROR_NULL;
     int result = sd_bus_call_method(bus, SYSTEMD_NAME, SYSTEMD_PATH, SYSTEMD_MANAGER,
@@ -748,7 +783,7 @@ static int retire_other_version(sd_bus *bus, const char *unit, const char *dir) 
                        "ResetFailedUnit", &error, NULL, "s", unit);
     sd_bus_error_free(&error);
     const uint64_t deadline = now_usec() + 5000000ull;
-    while (unit_runs_in(bus, unit, dir) != -ENOENT) {
+    while (unit_runs_in(bus, unit, dir, NULL) != -ENOENT) {
         if (now_usec() >= deadline)
             return -EBUSY;
         struct timespec delay = { .tv_sec = 0, .tv_nsec = 25000000 };
@@ -778,7 +813,13 @@ int onekvm_start_transient_service(const char *unit, const char *slice,
     int result = sd_bus_open_system(&bus);
     if (result < 0)
         goto out;
-    result = retire_other_version(bus, unit, working_directory);
+    const char *extension_directory = "";
+    const char prefix[] = "ExtensionDirectories=";
+    for (size_t i = 0; i < nproperties; i++) {
+        if (strncmp(properties[i], prefix, sizeof(prefix) - 1) == 0)
+            extension_directory = properties[i] + sizeof(prefix) - 1;
+    }
+    result = retire_other_version(bus, unit, working_directory, extension_directory);
     if (result < 0)
         goto out;
     result = sd_bus_message_new_method_call(bus, &message, "org.freedesktop.systemd1",
@@ -852,15 +893,19 @@ int onekvm_start_transient_service(const char *unit, const char *slice,
     if (result < 0)
         goto out;
     result = sd_bus_call(bus, message, 0, &error, &reply);
-    if (result >= 0)
-        result = wait_for_unit_start(bus, socket_unit ? socket_unit : unit);
+    if (result >= 0) {
+        const char *job = NULL;
+        if (extension_directory[0] && !socket_unit)
+            sd_bus_message_read(reply, "o", &job);
+        result = wait_for_unit_start(bus, socket_unit ? socket_unit : unit, job);
+    }
     else if (result == -EEXIST && !socket_unit) {
         /* A just-stopped transient unit can remain loaded until systemd's
          * garbage collector runs. StartTransientUnit still restarts that
          * existing unit before reporting EEXIST; accept it once Type=exec has
          * reached active instead of turning a successful warm restart into a
          * reconcile failure. */
-        int started = wait_for_unit_start(bus, unit);
+        int started = wait_for_unit_start(bus, unit, NULL);
         if (started >= 0)
             result = 0;
     }
@@ -1080,7 +1125,7 @@ int onekvm_systemd_unit_action(const char *action, const char *unit) {
         result = 0;
     if (result >= 0 &&
         (strcmp(action, "start") == 0 || strcmp(action, "restart") == 0))
-        result = wait_for_unit_start(bus, unit);
+        result = wait_for_unit_start(bus, unit, NULL);
     else if (result >= 0 && strcmp(action, "stop") == 0)
         result = wait_for_unit_stop(bus, unit);
 out:

@@ -1,0 +1,13 @@
+[Unit]
+Description=OneKVM extension runtime image %i
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=25s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN
+ExecStart=/usr/bin/onekvm-extension-host --runtime-image mount %i
+ExecStopPost=/usr/bin/onekvm-extension-host --runtime-image unmount %i

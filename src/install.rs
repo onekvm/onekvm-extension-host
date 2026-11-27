@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +114,9 @@ fn path_clean(path: &Path) -> String {
 pub fn inspect_local_path(filename: &str) -> Result<PackagePreview, String> {
     validate_local_upload_path(filename)?;
     let value = inspect_local_upload(filename)?;
+    if value.bundle {
+        crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
+    }
     host::validate_device_variant(&value.info.manifest)?;
     let installed = installed_versions(&value.info.manifest.id)
         .map(|versions| !versions.is_empty())
@@ -159,7 +163,11 @@ fn inspect_local_upload(filename: &str) -> Result<InspectedUpload, String> {
     let bundle = is_ipks(filename).map_err(|e| format!("inspect local extension upload: {e}"))?;
     let architectures = opkg_architectures()?;
     if !bundle {
+        crate::ipks::require_unsigned_development()?;
         let info = inspect_ipk(filename, "", &architectures, None)?;
+        if info.manifest.runtime_image.is_some() {
+            return Err("runtime images require a publisher-signed IPKS or a signed feed".into());
+        }
         let packages = std::collections::BTreeMap::from([(info.name.clone(), info.clone())]);
         return Ok(InspectedUpload {
             info,
@@ -171,7 +179,10 @@ fn inspect_local_upload(filename: &str) -> Result<InspectedUpload, String> {
     }
     fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
     let directory = unique_temp_dir(paths::OPKG_CACHE, "local-ipks-")?;
-    match inspect_ipks(filename, &directory, &architectures) {
+    match inspect_ipks(filename, &directory, &architectures).and_then(|value| {
+        value.validate_current_kernel()?;
+        Ok(value)
+    }) {
         Ok(value) => Ok(InspectedUpload {
             info: value.root.clone(),
             paths: value.paths,
@@ -481,6 +492,9 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
     sys::with_lock(|| {
         crate::transaction::recover_all(true)?;
         fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
+        if size_bytes > paths::MAX_LOCAL_IPK {
+            require_feed_space(paths::OPKG_CACHE, size_bytes)?;
+        }
         let cache = unique_temp_dir(paths::OPKG_CACHE, "ext-cache-")?;
         let tmp = unique_temp_dir(paths::OPKG_CACHE, "ext-tmp-")?;
         let result = (|| {
@@ -512,6 +526,12 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
             );
             log_install_message("Verifying downloaded package and manifest");
             let info = inspect_cached_extension(&cache, package_name)?;
+            if info.manifest.runtime_image.is_some() {
+                let rollback_bytes = crate::transaction::snapshot_payload_size(&info.manifest.id)?;
+                // Cache and transaction data live on /data. The download is
+                // already allocated, so reserve the installed files and backup.
+                require_feed_space(paths::OPKG_CACHE, info.payload_bytes.saturating_add(rollback_bytes))?;
+            }
             let arguments =
                 crate::package_policy::offline_install_arguments(&tmp, &cache, &[], false)?;
             log_install_message("Saving previous extension state");
@@ -538,6 +558,16 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
         let _ = fs::remove_dir_all(&tmp);
         result
     })
+}
+
+fn require_feed_space(path: &str, bytes: u64) -> Result<(), String> {
+    const FILESYSTEM_RESERVE: u64 = 4 << 20;
+    let (_, available) = host::storage_usage(path).ok_or("cannot determine free space for extension installation")?;
+    let required = bytes.saturating_add(FILESYSTEM_RESERVE);
+    if available < required {
+        return Err(format!("extension installation requires {required} free bytes on /data (available: {available})"));
+    }
+    Ok(())
 }
 
 fn inspect_cached_extension(cache: &Path, package_name: &str) -> Result<PackageInfo, String> {
@@ -782,6 +812,9 @@ pub fn install_local_path(filename: &str, enable_after_install: Option<bool>) ->
 fn install_upload_unlocked(filename: &str, enable_after_install: Option<bool>) -> Result<(), String> {
     let value = inspect_local_upload(filename)?;
     crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
+    crate::transaction::recover_all(true)?;
+    lifecycle::migrate_legacy_layout()
+        .map_err(|err| format!("migrate extension configuration: {err}"))?;
     install_validated_unlocked(&value.info, &value.paths, enable_after_install)
 }
 
@@ -838,8 +871,12 @@ fn prepare_installed_upgrade(info: &PackageInfo, requested: Option<bool>) -> Res
 fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(), String> {
     let result = (|| {
         log_install_message("Validating installed extension");
-        load_installed(&info.manifest.id, &info.manifest.version)
+        let installed = load_installed(&info.manifest.id, &info.manifest.version)
             .map_err(|e| format!("installed extension failed validation: {e}"))?;
+        if installed.manifest.runtime_image != info.manifest.runtime_image {
+            return Err("installed runtime image declaration differs from the authenticated package".into());
+        }
+        crate::runtime_image::record_authenticated(&info.manifest)?;
         if !info.manifest.kernel_modules.is_empty() {
             sys::run(paths::DEPMOD, &["-a".into()])?;
         }
@@ -856,7 +893,10 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
             lifecycle::enable_unlocked(&info.manifest.id)?;
             log_install_message("Checking extension startup");
             lifecycle::check_started(&info.manifest.id)?;
+        } else if crate::runtime_identity::is_managed(&installed.manifest) {
+            crate::dbus_client::reconcile(&installed.manifest.id, state.revision)?;
         }
+        crate::runtime_image::validate_install(&installed, state.enabled)?;
         Ok(())
     })();
     match result {
@@ -933,6 +973,7 @@ pub fn remove_package(name: &str) -> Result<(), String> {
         let mut state = read_state(id)?;
         stop_before_removal(id, &state)?;
         sys::opkg(&["remove", &package_name])?;
+        crate::runtime_image::forget_authenticated(id)?;
         state = read_state(id)?;
         state.enabled = false;
         state.active_version.clear();
@@ -956,6 +997,7 @@ pub fn purge(id: &str) -> Result<(), String> {
         if package_installed(&package_name) {
             sys::opkg(&["remove", &package_name])?;
         }
+        crate::runtime_image::forget_authenticated(id)?;
         for name in [
             Path::new(paths::APPS_ROOT).join(id),
             Path::new(paths::APP_DATA_ROOT).join(id),
@@ -1042,7 +1084,7 @@ fn opkg_architectures() -> Result<BTreeSet<String>, String> {
 fn unique_temp_dir(root: &str, prefix: &str) -> Result<PathBuf, String> {
     for n in 0..1000 {
         let path = Path::new(root).join(format!("{prefix}{}-{n}", std::process::id()));
-        match fs::create_dir(&path) {
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.to_string()),

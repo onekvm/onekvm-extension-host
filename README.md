@@ -140,7 +140,15 @@ and a 64 KiB output file. Use an atomic rename so catalog readers never observe
 partially written JSON. The optional `name` is the user-facing directory label
 (up to 255 UTF-8 bytes, without control characters); `id` remains the stable identity.
 
+## Extension runtime images
+
+Large sandboxed extensions can opt in to a read-only runtime image using the
+normal signed package workflow. See [Extension runtime images](docs/extension-runtime-image-v1.md).
+
 ## Local extension identity
+
+Host-managed extensions can opt in to a private Linux runtime account. See
+[Dedicated extension runtime accounts](docs/extension-runtime-identity.md).
 
 Core verifies extension connections using Unix `SO_PEERCRED` and the systemd
 service cgroup. The host registers the exact service unit and manifest

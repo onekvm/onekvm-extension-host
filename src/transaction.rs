@@ -88,6 +88,29 @@ fn owned_packages(status: &str, id: &str, layout: &Layout) -> BTreeSet<String> {
         .collect()
 }
 
+pub(crate) fn snapshot_payload_size(id: &str) -> Result<u64, String> {
+    let layout = Layout::default();
+    let mut pending = vec![layout.apps.join(id), layout.data.join(id)];
+    let mut bytes = 0u64;
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("estimate rollback space for {}: {error}", path.display())),
+        };
+        // Include a tar header and block padding for each entry.
+        bytes = bytes.saturating_add(512);
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).map_err(|error| error.to_string())? {
+                pending.push(entry.map_err(|error| error.to_string())?.path());
+            }
+        } else if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len().saturating_add(511) / 512 * 512);
+        }
+    }
+    Ok(bytes)
+}
+
 impl Snapshot {
     fn directory(&self) -> PathBuf {
         self.layout.root.join(&self.id)

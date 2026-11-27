@@ -100,8 +100,12 @@ pub fn run(argv0: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error
             | "detail"
             | "status"
             | "feed-status"
+            | "inspect-local-path"
     );
-    if !progress_query && args[0] != "refresh" && !read_only_query {
+    // A local upload must pass authentication before recovery or migration
+    // can modify the installed state. The local installer does both under its lock.
+    let local_install = matches!(args[0].as_str(), "install-local" | "install-local-path");
+    if !progress_query && args[0] != "refresh" && !read_only_query && !local_install {
         sys::with_lock(|| {
             crate::transaction::recover_all(true)?;
             lifecycle::migrate_legacy_layout()

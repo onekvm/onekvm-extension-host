@@ -196,7 +196,10 @@ pub fn activate(id: &str, version: &str) -> Result<(), String> {
             if state.enabled {
                 enable_unlocked(id)?;
                 check_started(id)?;
+            } else if crate::runtime_identity::is_managed(&extension.manifest) {
+                crate::dbus_client::reconcile(id, state.revision)?;
             }
+            crate::runtime_image::validate_install(&extension, state.enabled)?;
             Ok(())
         })();
         match result {
@@ -503,7 +506,11 @@ fn configure_request(id: &str, request: ConfigureRequest) -> Result<(), String> 
             if extension.manifest.controller.is_none()
                 && extension.manifest.settings_reload == "watch"
             {
-                settings::write_runtime_settings(id, &current)?;
+                if crate::runtime_identity::is_managed(&extension.manifest) {
+                    crate::dbus_client::apply_config(id, state.revision, "{}", &[])?;
+                } else {
+                    settings::write_runtime_settings(id, &current)?;
+                }
             }
             return Ok(());
         }
@@ -526,7 +533,11 @@ fn configure_request(id: &str, request: ConfigureRequest) -> Result<(), String> 
                 crate::dbus_client::apply_config(id, state.revision, &settings, &changed_keys)?;
             } else if extension.manifest.settings_reload == "watch" {
                 let settings = settings::settings_for_state(&extension, &state)?;
-                settings::write_runtime_settings(id, &settings)?;
+                if crate::runtime_identity::is_managed(&extension.manifest) {
+                    crate::dbus_client::apply_config(id, state.revision, "{}", &changed_keys)?;
+                } else {
+                    settings::write_runtime_settings(id, &settings)?;
+                }
             } else if state.enabled {
                 crate::dbus_client::disable(id, state.revision)?;
                 crate::dbus_client::reconcile(id, state.revision)?;
