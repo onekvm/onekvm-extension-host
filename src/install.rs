@@ -489,6 +489,9 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
     sys::with_lock(|| {
         crate::transaction::recover_all(true)?;
         fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
+        if size_bytes > paths::MAX_LOCAL_IPK {
+            require_feed_space(paths::OPKG_CACHE, size_bytes)?;
+        }
         let cache = unique_temp_dir(paths::OPKG_CACHE, "ext-cache-")?;
         let tmp = unique_temp_dir(paths::OPKG_CACHE, "ext-tmp-")?;
         let result = (|| {
@@ -520,6 +523,12 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
             );
             log_install_message("Verifying downloaded package and manifest");
             let info = inspect_cached_extension(&cache, package_name)?;
+            if info.manifest.runtime_image.is_some() {
+                let rollback_bytes = crate::transaction::snapshot_payload_size(&info.manifest.id)?;
+                // Cache and transaction data live on /data. The download is
+                // already allocated, so reserve the installed files and backup.
+                require_feed_space(paths::OPKG_CACHE, info.payload_bytes.saturating_add(rollback_bytes))?;
+            }
             let arguments =
                 crate::package_policy::offline_install_arguments(&tmp, &cache, &[], false)?;
             log_install_message("Saving previous extension state");
@@ -546,6 +555,16 @@ fn install_package_job(package_name: &str, size_bytes: u64, enable_after_install
         let _ = fs::remove_dir_all(&tmp);
         result
     })
+}
+
+fn require_feed_space(path: &str, bytes: u64) -> Result<(), String> {
+    const FILESYSTEM_RESERVE: u64 = 4 << 20;
+    let (_, available) = host::storage_usage(path).ok_or("cannot determine free space for extension installation")?;
+    let required = bytes.saturating_add(FILESYSTEM_RESERVE);
+    if available < required {
+        return Err(format!("extension installation requires {required} free bytes on /data (available: {available})"));
+    }
+    Ok(())
 }
 
 fn inspect_cached_extension(cache: &Path, package_name: &str) -> Result<PackageInfo, String> {

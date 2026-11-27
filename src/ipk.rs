@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
+use std::fs::File;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
 
 use crate::control::parse_control;
-use crate::manifest::{decode_manifest, Manifest};
+use crate::manifest::{Manifest, decode_manifest};
 
 const MAX_IPK_MEMBER: u64 = 256 << 20;
+const MAX_EXPANDED_PAYLOAD: u64 = 512 << 20;
+const MAX_EXPANDED_CONTROL: u64 = 1 << 20;
 const MAX_LAYOUT: u64 = 64 * 1024;
 
 // Platform libs plus companion program packages split out of extension recipes
@@ -37,6 +41,7 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "onekvm-core",
     "onekvm-ui",
     "onekvm-extension-host",
+    "onekvm-extension-runtime-image",
     "onekvm-extension-npu-runtime",
     "onekvm-plugin-manager",
     "onekvm-samba-runtime",
@@ -63,6 +68,7 @@ pub struct PackageInfo {
     pub architecture: String,
     pub dependencies: Vec<PackageDependency>,
     pub manifest: Manifest,
+    pub payload_bytes: u64,
     pub preview_icon_data_url: String,
 }
 
@@ -72,14 +78,24 @@ pub fn inspect_ipk(
     accepted: &BTreeSet<String>,
     bundled: Option<&BTreeSet<String>>,
 ) -> Result<PackageInfo, String> {
-    let members = read_ar(filename)?;
-    if members.get("debian-binary").map(Vec::as_slice) != Some(b"2.0\n") {
+    let mut file = File::open(filename).map_err(|error| error.to_string())?;
+    let members = ar_members(&mut file)?;
+    let mut version_marker = [0; 4];
+    let supported = members.get("debian-binary").is_some_and(|member| {
+        member.size == version_marker.len() as u64
+            && member
+                .reader(&mut file)
+                .and_then(|mut reader| reader.read_exact(&mut version_marker))
+                .is_ok()
+            && &version_marker == b"2.0\n"
+    });
+    if !supported {
         return Err("unsupported IPK format".into());
     }
     let control = members
         .get("control.tar.gz")
         .ok_or_else(|| "IPK has no control.tar.gz".to_string())?;
-    let fields = inspect_control(control)?;
+    let fields = inspect_control_reader(control.reader(&mut file).map_err(|e| e.to_string())?)?;
     let dependencies =
         parse_package_dependencies(fields.get("Depends").map(String::as_str).unwrap_or(""))?;
     let info_name = fields["Package"].clone();
@@ -108,20 +124,46 @@ pub fn inspect_ipk(
         None => return Err("IPK has no supported data archive".into()),
     };
     let expected_id = info_name.trim_start_matches("onekvm-extension-");
-    let manifest = inspect_data(data, expected_id)?;
-    let preview = extract_preview_icon(data, &manifest)?;
+    let (manifest, payload_bytes, image_checked) = inspect_data_reader(
+        data.reader(&mut file).map_err(|e| e.to_string())?,
+        expected_id,
+    )?;
+    if !image_checked {
+        verify_runtime_image(
+            data.reader(&mut file).map_err(|e| e.to_string())?,
+            &manifest,
+        )?;
+    }
+    if manifest.runtime_image.is_some()
+        && !dependencies
+            .iter()
+            .any(|dep| dep.name == "onekvm-extension-runtime-image" && dep.compare.is_empty())
+    {
+        return Err(
+            "runtime image package requires the onekvm-extension-runtime-image dependency".into(),
+        );
+    }
+    let preview = extract_preview_icon(
+        data.reader(&mut file).map_err(|e| e.to_string())?,
+        &manifest,
+    )?;
     Ok(PackageInfo {
         name: info_name,
         version: fields["Version"].clone(),
         architecture: fields["Architecture"].clone(),
         dependencies,
         manifest,
+        payload_bytes,
         preview_icon_data_url: preview,
     })
 }
 
 pub fn inspect_control(compressed: &[u8]) -> Result<BTreeMap<String, String>, String> {
-    let decoder = GzDecoder::new(compressed);
+    inspect_control_reader(compressed)
+}
+
+fn inspect_control_reader(compressed: impl Read) -> Result<BTreeMap<String, String>, String> {
+    let decoder = GzDecoder::new(compressed).take(MAX_EXPANDED_CONTROL + 1);
     let mut archive = Archive::new(decoder);
     let mut control = None;
     for entry in archive.entries().map_err(|e| e.to_string())? {
@@ -149,6 +191,9 @@ pub fn inspect_control(compressed: &[u8]) -> Result<BTreeMap<String, String>, St
             _ => {}
         }
     }
+    if archive.into_inner().limit() == 0 {
+        return Err("expanded IPK control archive exceeds 1 MiB".into());
+    }
     parse_control(&control.ok_or_else(|| "package control file is missing".to_string())?)
 }
 
@@ -162,7 +207,10 @@ pub fn inspect_kernel_control(data: &[u8]) -> Result<BTreeMap<String, String>, S
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if !matches!(name, "control" | "preinst" | "postinst" | "prerm" | "postrm") {
+        if !matches!(
+            name,
+            "control" | "preinst" | "postinst" | "prerm" | "postrm"
+        ) {
             continue;
         }
         if !entry.header().entry_type().is_file() {
@@ -192,7 +240,7 @@ pub fn inspect_kernel_control(data: &[u8]) -> Result<BTreeMap<String, String>, S
                 }
             }
             "preinst" | "prerm" => {
-                return Err("kernel package contains an unsupported maintenance script".into())
+                return Err("kernel package contains an unsupported maintenance script".into());
             }
             _ => (),
         }
@@ -274,18 +322,36 @@ pub fn validate_package_dependencies(
 }
 
 pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, String> {
-    let decoder = GzDecoder::new(compressed);
+    let (manifest, _, image_checked) = inspect_data_reader(compressed, expected_id)?;
+    if !image_checked {
+        verify_runtime_image(compressed, &manifest)?;
+    }
+    Ok(manifest)
+}
+
+fn inspect_data_reader(
+    compressed: impl Read,
+    expected_id: &str,
+) -> Result<(Manifest, u64, bool), String> {
+    let decoder = GzDecoder::new(compressed).take(MAX_EXPANDED_PAYLOAD + 1);
     let mut archive = Archive::new(decoder);
     let mut entries = Vec::new();
-    let mut manifest_data = None;
-    let mut regular_json = BTreeMap::new();
+    let mut manifest: Option<Manifest> = None;
+    let mut regular_json = BTreeSet::new();
+    let prefix = format!("data/onekvm/apps/{expected_id}/");
+    let mut image_checked = false;
+    let mut payload_bytes = 0u64;
     for (count, entry) in archive.entries().map_err(|e| e.to_string())?.enumerate() {
         if count > 10000 {
             return Err("extension has too many archive entries".into());
         }
         let mut entry = entry.map_err(|e| e.to_string())?;
         let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
+        if name.len() > 4096 {
+            return Err("extension archive path is too long".into());
+        }
         let kind = entry.header().entry_type();
+        payload_bytes = payload_bytes.saturating_add(entry.size());
         if !matches!(
             kind,
             EntryType::Directory | EntryType::Regular | EntryType::Symlink | EntryType::Link
@@ -300,33 +366,43 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             .unwrap_or_default();
         let mode = entry.header().mode().unwrap_or(0);
         entries.push((name.clone(), linkname, mode, kind));
-        if Path::new(&name)
-            .file_name()
-            .and_then(|value| value.to_str())
-            == Some("manifest.json")
-            && matches!(kind, EntryType::Regular)
+        if kind.is_file()
+            && name
+                .strip_prefix(&prefix)
+                .and_then(|path| path.split_once('/'))
+                .is_some_and(|(_, file)| file == "manifest.json")
         {
+            if manifest.is_some() {
+                return Err("extension IPK has more than one manifest".into());
+            }
             if entry.size() > 64 * 1024 {
                 return Err("manifest is too large".into());
             }
             let mut data = Vec::new();
             entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
-            manifest_data = Some(data);
-        } else if name.contains("/web/")
+            let parsed = decode_manifest(&data)?;
+            if name != format!("{prefix}{}/manifest.json", parsed.version) {
+                return Err("manifest version does not match its archive directory".into());
+            }
+            manifest = Some(parsed);
+        } else if let Some((path, hash)) = manifest.as_ref().and_then(runtime_image_path) {
+            if name == path {
+                check_runtime_image_entry(&mut entry, hash)?;
+                image_checked = true;
+            }
+        }
+        if name.contains("/web/")
             && name.ends_with(".json")
             && matches!(kind, EntryType::Regular)
+            && entry.size() <= MAX_LAYOUT
         {
-            if entry.size() > MAX_LAYOUT {
-                regular_json.insert(name, None);
-                continue;
-            }
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data).map_err(|e| e.to_string())?;
-            regular_json.insert(name, Some(data));
+            regular_json.insert(name);
         }
     }
-    let manifest =
-        decode_manifest(&manifest_data.ok_or_else(|| "manifest.json is missing".to_string())?)?;
+    if archive.into_inner().limit() == 0 {
+        return Err("expanded extension IPK exceeds 512 MiB".into());
+    }
+    let manifest = manifest.ok_or("manifest.json is missing")?;
     if manifest.id != expected_id {
         return Err(format!(
             "manifest id {:?} does not match package",
@@ -362,6 +438,21 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             return Err(format!("duplicate archive path /{name}"));
         }
         present.insert(name.clone(), (*mode, *kind));
+    }
+    if let Some(image) = &manifest.runtime_image {
+        require_regular(&present, &root, &image.path)?;
+        let path = format!("{root}/{}", image.path);
+        for parent in Path::new(&path).ancestors().skip(1) {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if present
+                .get(parent.to_string_lossy().as_ref())
+                .is_some_and(|(_, kind)| !kind.is_dir())
+            {
+                return Err("runtime image has a non-directory ancestor".into());
+            }
+        }
     }
     let mut executables = Vec::new();
     if !manifest.entrypoint.is_empty() {
@@ -401,11 +492,8 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
         if !matches!(kind, EntryType::Regular) {
             return Err(format!("{} is not a regular file", page.entrypoint));
         }
-        if page.renderer == "layout" {
-            match regular_json.get(&path) {
-                Some(Some(_)) => {}
-                _ => return Err(format!("{} is missing or too large", page.entrypoint)),
-            }
+        if page.renderer == "layout" && !regular_json.contains(&path) {
+            return Err(format!("{} is missing or too large", page.entrypoint));
         }
         if let Some(icon) = &page.icon {
             if icon.source == "custom" {
@@ -432,7 +520,61 @@ pub fn inspect_data(compressed: &[u8], expected_id: &str) -> Result<Manifest, St
             require_regular(&present, &root, &icon.path)?;
         }
     }
-    Ok(manifest)
+    let image_checked = manifest.runtime_image.is_none() || image_checked;
+    Ok((manifest, payload_bytes, image_checked))
+}
+
+fn runtime_image_path(manifest: &Manifest) -> Option<(String, &str)> {
+    let image = manifest.runtime_image.as_ref()?;
+    Some((
+        format!(
+            "data/onekvm/apps/{}/{}/{}",
+            manifest.id, manifest.version, image.path
+        ),
+        &image.sha256,
+    ))
+}
+
+// The standard writer places the manifest before the image. Also accept tar
+// archives with a different entry order, while skipping this pass for plain IPKs.
+fn verify_runtime_image(compressed: impl Read, manifest: &Manifest) -> Result<(), String> {
+    let Some((path, hash)) = runtime_image_path(manifest) else {
+        return Ok(());
+    };
+    let mut archive = Archive::new(GzDecoder::new(compressed).take(MAX_EXPANDED_PAYLOAD + 1));
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let name = clean_archive_path(&entry.path().map_err(|e| e.to_string())?.to_string_lossy())?;
+        if name == path {
+            return check_runtime_image_entry(&mut entry, hash);
+        }
+    }
+    Err("runtime image is missing".into())
+}
+
+fn check_runtime_image_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    hash: &str,
+) -> Result<(), String> {
+    let header = entry.header();
+    if !header.entry_type().is_file() {
+        return Err("runtime image must be a regular file".into());
+    }
+    if header.mode().ok().map(|mode| mode & 0o7777) != Some(0o444)
+        || header.uid().ok() != Some(0)
+        || header.gid().ok() != Some(0)
+    {
+        return Err("runtime image must be root:root with mode 0444".into());
+    }
+    if entry.size() == 0 || entry.size() > 240 << 20 {
+        return Err("runtime image must be between 1 byte and 240 MiB".into());
+    }
+    let mut digest = Sha256::new();
+    let size = io::copy(entry, &mut digest).map_err(|e| e.to_string())?;
+    if size != entry.size() || format!("{:x}", digest.finalize()) != hash {
+        return Err("runtime image SHA-256 does not match the manifest".into());
+    }
+    Ok(())
 }
 
 fn require_regular(
@@ -447,7 +589,7 @@ fn require_regular(
     }
 }
 
-fn extract_preview_icon(compressed: &[u8], manifest: &Manifest) -> Result<String, String> {
+fn extract_preview_icon(compressed: impl Read, manifest: &Manifest) -> Result<String, String> {
     let icon = manifest
         .icon
         .as_ref()
@@ -473,7 +615,7 @@ fn extract_preview_icon(compressed: &[u8], manifest: &Manifest) -> Result<String
         "data/onekvm/apps/{}/{}/{}",
         manifest.id, manifest.version, icon.path
     );
-    let decoder = GzDecoder::new(compressed);
+    let decoder = GzDecoder::new(compressed).take(MAX_EXPANDED_PAYLOAD + 1);
     let mut archive = Archive::new(decoder);
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
@@ -511,6 +653,67 @@ pub fn clean_archive_path(name: &str) -> Result<String, String> {
         return Err(format!("unsafe archive path {name:?}"));
     }
     Ok(parts.join("/"))
+}
+
+struct ArMember {
+    offset: u64,
+    size: u64,
+}
+
+impl ArMember {
+    fn reader<'a>(&self, file: &'a mut File) -> io::Result<io::Take<&'a mut File>> {
+        file.seek(SeekFrom::Start(self.offset))?;
+        Ok(file.take(self.size))
+    }
+}
+
+fn ar_members(file: &mut File) -> Result<BTreeMap<String, ArMember>, String> {
+    let len = file.metadata().map_err(|error| error.to_string())?.len();
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)
+        .map_err(|_| "invalid IPK archive")?;
+    if &magic != b"!<arch>\n" {
+        return Err("invalid IPK archive".into());
+    }
+    let mut members = BTreeMap::new();
+    let mut position = magic.len() as u64;
+    while position < len {
+        if members.len() == 32 {
+            return Err("IPK has too many members".into());
+        }
+        let mut header = [0; 60];
+        file.read_exact(&mut header)
+            .map_err(|_| "invalid IPK member header")?;
+        if &header[58..60] != b"`\n" {
+            return Err("invalid IPK member header".into());
+        }
+        let name = std::str::from_utf8(&header[..16])
+            .map_err(|_| "invalid IPK member name")?
+            .trim()
+            .trim_end_matches('/');
+        let size = std::str::from_utf8(&header[48..58])
+            .map_err(|_| "invalid IPK member size")?
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "invalid IPK member size")?;
+        if size > MAX_IPK_MEMBER {
+            return Err("IPK member exceeds 256 MiB".into());
+        }
+        let offset = position + header.len() as u64;
+        position = offset + size + size % 2;
+        if position > len {
+            return Err(format!("truncated IPK member {name}"));
+        }
+        if members
+            .insert(name.into(), ArMember { offset, size })
+            .is_some()
+        {
+            return Err(format!("duplicate IPK member {name}"));
+        }
+        file.seek(SeekFrom::Start(position))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(members)
 }
 
 /// Read only control metadata for signed dependency IPKs. Runtime packages may

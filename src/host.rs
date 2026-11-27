@@ -468,7 +468,7 @@ fn marketplace_storage() -> Value {
     })
 }
 
-fn storage_usage(path: &str) -> Option<(u64, u64)> {
+pub(crate) fn storage_usage(path: &str) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path).ok()?;
     let mut vfs = unsafe { std::mem::zeroed::<libc::statvfs>() };
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut vfs) } != 0 {

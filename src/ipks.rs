@@ -249,6 +249,7 @@ fn inspect_bundled(path: &Path, accepted: &BTreeSet<String>) -> Result<BundledIp
             architecture: fields["Architecture"].clone(),
             dependencies,
             manifest: crate::manifest::Manifest::default(),
+            payload_bytes: 0,
             preview_icon_data_url: String::new(),
         },
     })
