@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +114,9 @@ fn path_clean(path: &Path) -> String {
 pub fn inspect_local_path(filename: &str) -> Result<PackagePreview, String> {
     validate_local_upload_path(filename)?;
     let value = inspect_local_upload(filename)?;
+    if value.bundle {
+        crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
+    }
     host::validate_device_variant(&value.info.manifest)?;
     let installed = installed_versions(&value.info.manifest.id)
         .map(|versions| !versions.is_empty())
@@ -159,6 +163,7 @@ fn inspect_local_upload(filename: &str) -> Result<InspectedUpload, String> {
     let bundle = is_ipks(filename).map_err(|e| format!("inspect local extension upload: {e}"))?;
     let architectures = opkg_architectures()?;
     if !bundle {
+        crate::ipks::require_unsigned_development()?;
         let info = inspect_ipk(filename, "", &architectures, None)?;
         let packages = std::collections::BTreeMap::from([(info.name.clone(), info.clone())]);
         return Ok(InspectedUpload {
@@ -171,7 +176,10 @@ fn inspect_local_upload(filename: &str) -> Result<InspectedUpload, String> {
     }
     fs::create_dir_all(paths::OPKG_CACHE).map_err(|e| e.to_string())?;
     let directory = unique_temp_dir(paths::OPKG_CACHE, "local-ipks-")?;
-    match inspect_ipks(filename, &directory, &architectures) {
+    match inspect_ipks(filename, &directory, &architectures).and_then(|value| {
+        value.validate_current_kernel()?;
+        Ok(value)
+    }) {
         Ok(value) => Ok(InspectedUpload {
             info: value.root.clone(),
             paths: value.paths,
@@ -782,6 +790,9 @@ pub fn install_local_path(filename: &str, enable_after_install: Option<bool>) ->
 fn install_upload_unlocked(filename: &str, enable_after_install: Option<bool>) -> Result<(), String> {
     let value = inspect_local_upload(filename)?;
     crate::package_policy::validate_local_packages(value.packages.keys().map(String::as_str))?;
+    crate::transaction::recover_all(true)?;
+    lifecycle::migrate_legacy_layout()
+        .map_err(|err| format!("migrate extension configuration: {err}"))?;
     install_validated_unlocked(&value.info, &value.paths, enable_after_install)
 }
 
@@ -1042,7 +1053,7 @@ fn opkg_architectures() -> Result<BTreeSet<String>, String> {
 fn unique_temp_dir(root: &str, prefix: &str) -> Result<PathBuf, String> {
     for n in 0..1000 {
         let path = Path::new(root).join(format!("{prefix}{}-{n}", std::process::id()));
-        match fs::create_dir(&path) {
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => return Ok(path),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err.to_string()),

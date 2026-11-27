@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::ipk::inspect_kernel_control as module_control;
 use crate::{control, ipk, ipks, kernel_identity, manifest, paths, state, sys};
 
 #[path = "update_retained.rs"]
@@ -507,46 +508,6 @@ impl RootImage {
     }
 }
 
-fn module_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
-    let decoder = flate2::read::GzDecoder::new(data);
-    let mut control_data = None;
-    for entry in tar::Archive::new(decoder)
-        .entries()
-        .map_err(|e| e.to_string())?
-    {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if entry.size() > 65536 {
-            return Err("kernel control entry is too large".into());
-        }
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        match name {
-            "control" => control_data = Some(bytes),
-            "postinst" | "postrm" => {
-                let script = String::from_utf8_lossy(&bytes)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let script = script.strip_prefix("#!/bin/sh ").unwrap_or(&script);
-                let script = script.strip_prefix("set -e ").unwrap_or(script);
-                if !matches!(
-                    script,
-                    "if [ -z \"$D\" ]; then depmod -a fi"
-                        | "if [ -z \"$D\" ]; then for module_dir in /usr/lib/modules/*; do [ -d \"$module_dir\" ] || continue depmod -a \"${module_dir##*/}\" done fi"
-                ) {
-                    return Err("kernel package contains an unsupported maintenance script".into());
-                }
-            }
-            "preinst" | "prerm" => {
-                return Err("kernel package contains an unsupported maintenance script".into())
-            }
-            _ => (),
-        }
-    }
-    control::parse_control(&control_data.ok_or("kernel package control is missing")?)
-}
 
 fn verify_module_release(data: &[u8], target: &str) -> Result<(), String> {
     let release = data
@@ -905,6 +866,10 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
         }
         let bundle = ipks::is_ipks(upload.to_str().unwrap())?;
         let files = if bundle {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&extracted)
+                .map_err(|e| e.to_string())?;
             ipks::inspect_ipks(upload.to_str().unwrap(), &extracted, &architectures)?.paths
         } else {
             vec![upload.clone()]
@@ -992,6 +957,9 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
                     }
                 }
             } else if paths::valid_package_name(name) {
+                if !bundle {
+                    ipks::require_unsigned_development()?;
+                }
                 // Only optional module packages may carry the narrowly allowed depmod script.
                 ipk::inspect_control(control_bytes)?;
                 match ipk::inspect_data(data, name.trim_start_matches("onekvm-extension-")) {

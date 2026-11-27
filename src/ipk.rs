@@ -152,6 +152,54 @@ pub fn inspect_control(compressed: &[u8]) -> Result<BTreeMap<String, String>, St
     parse_control(&control.ok_or_else(|| "package control file is missing".to_string())?)
 }
 
+pub fn inspect_kernel_control(data: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let decoder = flate2::read::GzDecoder::new(data);
+    let mut control_data = None;
+    for entry in tar::Archive::new(decoder)
+        .entries()
+        .map_err(|e| e.to_string())?
+    {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !matches!(name, "control" | "preinst" | "postinst" | "prerm" | "postrm") {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err("kernel control entry must be a regular file".into());
+        }
+        if entry.size() > 65536 {
+            return Err("kernel control entry is too large".into());
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        match name {
+            "control" if control_data.is_none() => control_data = Some(bytes),
+            "control" => return Err("duplicate kernel package control".into()),
+            "postinst" | "postrm" => {
+                let script = String::from_utf8_lossy(&bytes)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let script = script.strip_prefix("#!/bin/sh ").unwrap_or(&script);
+                let script = script.strip_prefix("set -e ").unwrap_or(script);
+                if !matches!(
+                    script,
+                    "if [ -z \"$D\" ]; then depmod -a fi"
+                        | "if [ -z \"$D\" ]; then for module_dir in /usr/lib/modules/*; do [ -d \"$module_dir\" ] || continue depmod -a \"${module_dir##*/}\" done fi"
+                ) {
+                    return Err("kernel package contains an unsupported maintenance script".into());
+                }
+            }
+            "preinst" | "prerm" => {
+                return Err("kernel package contains an unsupported maintenance script".into())
+            }
+            _ => (),
+        }
+    }
+    parse_control(&control_data.ok_or("kernel package control is missing")?)
+}
+
 pub fn parse_package_dependencies(value: &str) -> Result<Vec<PackageDependency>, String> {
     if value.is_empty() {
         return Ok(Vec::new());
