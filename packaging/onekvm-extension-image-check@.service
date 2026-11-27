@@ -1,0 +1,12 @@
+[Unit]
+Description=Validate OneKVM extension runtime image %i
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=25s
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN
+ExecStart=/usr/bin/onekvm-extension-host --runtime-image check %i
+ExecStopPost=/usr/bin/onekvm-extension-host --runtime-image clean-check %i

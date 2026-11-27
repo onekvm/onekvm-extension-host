@@ -179,6 +179,7 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     if limits.limit_nofile > 0 {
         arguments.push(format!("--property=LimitNOFILE={}", limits.limit_nofile));
     }
+    crate::runtime_image::append_properties(extension, &mut arguments);
     arguments
 }
 

@@ -37,6 +37,8 @@ struct Package {
     #[serde(default)]
     extension: Option<manifest::Manifest>,
     #[serde(default)]
+    runtime_image_verified: bool,
+    #[serde(default)]
     modules: BTreeSet<String>,
 }
 
@@ -970,6 +972,12 @@ fn add(id: &str, stdin: &mut dyn Read) -> Result<Value, String> {
                             ipk::inspect_ipk(file.to_str().unwrap(), name, &architectures, None)?
                                 .manifest
                         };
+                        if m.runtime_image.is_some() {
+                            if !bundle {
+                                return Err("runtime images require a publisher-signed IPKS".into());
+                            }
+                            value.runtime_image_verified = true;
+                        }
                         if !plan.plugins.iter().any(|p| p.id == m.id) {
                             return Err(
                                 "supplemental packages must belong to an installed plugin".into()
@@ -1740,6 +1748,13 @@ fn boot() -> Result<Value, String> {
             })
             .unwrap_or_else(|| plugin.version.clone());
         let installed = manifest::load_installed(&plugin.id, &version)?;
+        if let Some(authenticated) = plan.packages.get(&name).filter(|p| p.runtime_image_verified) {
+            let candidate = authenticated.extension.as_ref().ok_or("missing staged extension manifest")?;
+            if installed.manifest.runtime_image != candidate.runtime_image {
+                return Err("installed runtime image declaration differs from the authenticated package".into());
+            }
+            crate::runtime_image::record_authenticated(candidate)?;
+        }
         let mut state = state::read_state(&plugin.id)?;
         state.active_version = version;
         state.revision = state.revision.saturating_add(1);

@@ -148,6 +148,9 @@ pub fn inspect_ipks(
         accepted,
         Some(&bundled_names),
     )?;
+    if root.manifest.runtime_image.is_some() && manifest.version != 2 {
+        return Err("runtime images require a publisher-signed IPKS".into());
+    }
     let extension_root = format!(
         "data/onekvm/apps/{}/{}",
         root.manifest.id, root.manifest.version

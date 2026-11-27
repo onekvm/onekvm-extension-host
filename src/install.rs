@@ -165,6 +165,9 @@ fn inspect_local_upload(filename: &str) -> Result<InspectedUpload, String> {
     if !bundle {
         crate::ipks::require_unsigned_development()?;
         let info = inspect_ipk(filename, "", &architectures, None)?;
+        if info.manifest.runtime_image.is_some() {
+            return Err("runtime images require a publisher-signed IPKS or a signed feed".into());
+        }
         let packages = std::collections::BTreeMap::from([(info.name.clone(), info.clone())]);
         return Ok(InspectedUpload {
             info,
@@ -868,8 +871,12 @@ fn prepare_installed_upgrade(info: &PackageInfo, requested: Option<bool>) -> Res
 fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(), String> {
     let result = (|| {
         log_install_message("Validating installed extension");
-        load_installed(&info.manifest.id, &info.manifest.version)
+        let installed = load_installed(&info.manifest.id, &info.manifest.version)
             .map_err(|e| format!("installed extension failed validation: {e}"))?;
+        if installed.manifest.runtime_image != info.manifest.runtime_image {
+            return Err("installed runtime image declaration differs from the authenticated package".into());
+        }
+        crate::runtime_image::record_authenticated(&info.manifest)?;
         if !info.manifest.kernel_modules.is_empty() {
             sys::run(paths::DEPMOD, &["-a".into()])?;
         }
@@ -887,6 +894,7 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
             log_install_message("Checking extension startup");
             lifecycle::check_started(&info.manifest.id)?;
         }
+        crate::runtime_image::validate_install(&installed, state.enabled)?;
         Ok(())
     })();
     match result {
@@ -963,6 +971,7 @@ pub fn remove_package(name: &str) -> Result<(), String> {
         let mut state = read_state(id)?;
         stop_before_removal(id, &state)?;
         sys::opkg(&["remove", &package_name])?;
+        crate::runtime_image::forget_authenticated(id)?;
         state = read_state(id)?;
         state.enabled = false;
         state.active_version.clear();
@@ -986,6 +995,7 @@ pub fn purge(id: &str) -> Result<(), String> {
         if package_installed(&package_name) {
             sys::opkg(&["remove", &package_name])?;
         }
+        crate::runtime_image::forget_authenticated(id)?;
         for name in [
             Path::new(paths::APPS_ROOT).join(id),
             Path::new(paths::APP_DATA_ROOT).join(id),

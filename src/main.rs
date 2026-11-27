@@ -25,6 +25,7 @@ mod package_sizes;
 mod paths;
 mod ports;
 mod proxy;
+mod runtime_image;
 mod sandbox;
 mod settings;
 mod state;
@@ -41,6 +42,8 @@ fn main() {
     let rest: Vec<String> = arguments.collect();
     let result = if rest.first().map(String::as_str) == Some("--plugin-helper") {
         helper::run(rest.into_iter().skip(1).collect())
+    } else if rest.first().map(String::as_str) == Some("--runtime-image") {
+        runtime_image::command(&rest[1..]).map_err(Into::into)
     } else if rest.is_empty() && is_host_binary(&argv0) {
         run_host()
     } else {

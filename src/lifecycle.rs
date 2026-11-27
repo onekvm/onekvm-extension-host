@@ -197,6 +197,7 @@ pub fn activate(id: &str, version: &str) -> Result<(), String> {
                 enable_unlocked(id)?;
                 check_started(id)?;
             }
+            crate::runtime_image::validate_install(&extension, state.enabled)?;
             Ok(())
         })();
         match result {

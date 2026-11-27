@@ -98,6 +98,9 @@ pub fn apply(
     }
     let extension = load_installed(id, &state.active_version)?;
     if !method.is_empty() {
+        if extension.manifest.runtime_image.is_some() && crate::transaction::pending(id) {
+            return Err(format!("extension {id} is changing versions"));
+        }
         let spec = extension
             .manifest
             .methods
@@ -126,6 +129,9 @@ pub fn apply(
             }
             stop_helper(id)?;
             stop_legacy(id)?;
+            if event == "disable" {
+                crate::runtime_image::stop(&extension)?;
+            }
             return Ok(Value::Null);
         }
         return apply_legacy(&extension, &state, event);
@@ -278,8 +284,13 @@ fn apply_command_method(
             serde_json::from_slice(&output).map_err(|e| format!("decode method response: {e}"))
         });
     let repaired = repair_settings_output_permission(id);
+    let cleanup = if !state.enabled && extension.manifest.runtime_image.is_some() {
+        stop_helper(id)
+    } else {
+        Ok(())
+    };
     match (result, repaired) {
-        (Ok(value), Ok(())) => Ok(value),
+        (Ok(value), Ok(())) => cleanup.map(|()| value),
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),
     }
@@ -944,7 +955,10 @@ fn build_method_command(
 
 fn apply_legacy(extension: &Installed, state: &PluginState, event: &str) -> Result<Value, String> {
     match event {
-        "disable" => stop_legacy(&extension.manifest.id),
+        "disable" => {
+            stop_legacy(&extension.manifest.id)?;
+            crate::runtime_image::stop(extension)
+        }
         "enable" | "reconcile" | "config_changed" if state.enabled => {
             start_legacy(extension, state)
         }
@@ -974,52 +988,66 @@ fn apply_controller(
     prepare_runtime_dirs(id)?;
     let settings = settings_for_state(extension, state)?;
     write_runtime_settings(id, &settings)?;
-    let helper_started = ensure_helper(extension, None)?;
-    let generation = host
-        .generation
-        .lock()
-        .map_err(|_| "host state lock is poisoned".to_string())?
-        .clone();
-    if helper_started && state.enabled && event == "invoke" {
-        let payload = json!({
+    let image_disable = event == "disable" && extension.manifest.runtime_image.is_some();
+    if image_disable && !is_active(&paths::helper_unit(id)) {
+        // A stopped helper has no children to clean up. Avoid activating a
+        // missing or damaged image merely to run the disable hook.
+        cleanup_disabled_controller(id)?;
+        return Ok(Value::Null);
+    }
+    let result = (|| {
+        let helper_started = ensure_helper(extension, None)?;
+        let generation = host
+            .generation
+            .lock()
+            .map_err(|_| "host state lock is poisoned".to_string())?
+            .clone();
+        if helper_started && state.enabled && event == "invoke" {
+            let payload = json!({
+                "api_version": 1,
+                "event": "reconcile",
+                "extension_id": id,
+                "revision": state.revision,
+                "enabled": true,
+                "settings": settings,
+                "reason": "helper_restarted",
+                "core_generation": generation,
+            });
+            let plan = run_controller(extension, &payload, "reconcile")?;
+            execute_plan(extension, &plan)?;
+        }
+        let mut payload = json!({
             "api_version": 1,
-            "event": "reconcile",
+            "event": event,
             "extension_id": id,
             "revision": state.revision,
-            "enabled": true,
+            "enabled": state.enabled,
             "settings": settings,
-            "reason": "helper_restarted",
+            "reason": reason,
             "core_generation": generation,
         });
-        let plan = run_controller(extension, &payload, "reconcile")?;
+        if !changed_keys.is_empty() {
+            payload["changed_keys"] = json!(changed_keys);
+        }
+        if !method.is_empty() {
+            payload["method"] = json!(method);
+        }
+        if let Some(request) = request {
+            payload["request"] = request;
+        }
+        let plan = run_controller(extension, &payload, event)?;
         execute_plan(extension, &plan)?;
+        repair_settings_output_permission(id)?;
+        Ok(plan.response.unwrap_or(Value::Null))
+    })();
+    if image_disable {
+        let cleanup = cleanup_disabled_controller(id);
+        return result.and_then(|value| cleanup.map(|()| value));
     }
-    let mut payload = json!({
-        "api_version": 1,
-        "event": event,
-        "extension_id": id,
-        "revision": state.revision,
-        "enabled": state.enabled,
-        "settings": settings,
-        "reason": reason,
-        "core_generation": generation,
-    });
-    if !changed_keys.is_empty() {
-        payload["changed_keys"] = json!(changed_keys);
-    }
-    if !method.is_empty() {
-        payload["method"] = json!(method);
-    }
-    if let Some(request) = request {
-        payload["request"] = request;
-    }
-    let plan = run_controller(extension, &payload, event)?;
-    execute_plan(extension, &plan)?;
-    repair_settings_output_permission(id)?;
-    if !state.enabled {
+    if !state.enabled && (result.is_ok() || extension.manifest.runtime_image.is_some()) {
         stop_helper(id)?;
     }
-    Ok(plan.response.unwrap_or(Value::Null))
+    result
 }
 
 pub fn reconcile_all(host: &Host, generation: &str) -> Result<(), String> {
@@ -1368,10 +1396,14 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         .map(|address| (socket_unit.as_str(), address));
     if let Err(err) = systemd_run_with_socket(&arguments, socket) {
         let _ = stop_systemd_unit(&socket_unit);
-        let _ = stop_systemd_unit(&unit);
+        if extension.manifest.runtime_image.is_some() {
+            let _ = unit_action("stop", &unit);
+        } else {
+            let _ = stop_systemd_unit(&unit);
+        }
         remove_authorization(&extension.manifest.id);
         let _ = fs::remove_dir_all(Path::new(paths::RUNTIME_ROOT).join(&extension.manifest.id));
-        return Err(err);
+        return Err(crate::runtime_image::startup_error(extension, err));
     }
     std::thread::sleep(Duration::from_millis(200));
     let active_unit = if socket.is_some() {
@@ -1522,7 +1554,11 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
     } else {
         "controller"
     };
-    let reuse_key = format!("sandbox-v4:{}:{mode}", extension.manifest.version);
+    let mut reuse_key = format!("sandbox-v4:{}:{mode}", extension.manifest.version);
+    if let Some(image) = &extension.manifest.runtime_image {
+        reuse_key.push(':');
+        reuse_key.push_str(&image.sha256);
+    }
     if helper_ready(id, &reuse_key) {
         return Ok(false);
     }
@@ -1597,7 +1633,15 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
             .into_owned(),
     ]);
     arguments.extend(controller_command.into_iter().skip(1));
-    systemd_run(&arguments).map_err(|err| format!("start extension helper: {err}"))?;
+    if let Err(error) = systemd_run(&arguments) {
+        if extension.manifest.runtime_image.is_some() {
+            let _ = stop_helper(id);
+        }
+        return Err(crate::runtime_image::startup_error(
+            extension,
+            format!("start extension helper: {error}"),
+        ));
+    }
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if helper_ready(id, &reuse_key) {
@@ -1651,7 +1695,15 @@ pub fn stop_declared_service_units(manifest: &Manifest, disable: bool) -> Result
 pub fn stop_extension_runtime(id: &str) -> Result<(), String> {
     stop_helper(id)?;
     stop_legacy_unit(id)?;
-    stop_legacy_controller_units(id)
+    stop_legacy_controller_units(id)?;
+    if let Ok(state) = read_state(id) {
+        if !state.active_version.is_empty() {
+            if let Ok(extension) = load_installed(id, &state.active_version) {
+                crate::runtime_image::stop(&extension)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stop_systemd_unit(unit: &str) -> Result<(), String> {
@@ -1670,10 +1722,11 @@ fn stop_helper(id: &str) -> Result<(), String> {
     if !address.exists() && !Path::new(paths::TRANSIENT_ROOT).join(&unit).exists() {
         return Ok(());
     }
-    if is_active(&unit) {
-        unit_action("stop", &unit)?;
-    } else if is_failed(&unit) {
+    if is_failed(&unit) {
         let _ = unit_action("reset-failed", &unit);
+    } else {
+        // Stop an activating helper as well. It may already hold its image.
+        unit_action("stop", &unit)?;
     }
     let _ = fs::remove_file(address);
     Ok(())

@@ -1,10 +1,11 @@
 fn main() {
     println!("cargo:rerun-if-changed=native/bus.c");
+    println!("cargo:rerun-if-changed=native/runtime-image.c");
     let libsystemd = pkg_config::Config::new()
         .probe("libsystemd")
         .expect("libsystemd is required");
     let mut build = cc::Build::new();
-    build.file("native/bus.c").warnings(true);
+    build.files(["native/bus.c", "native/runtime-image.c"]).warnings(true);
     for path in &libsystemd.include_paths {
         build.include(path);
     }

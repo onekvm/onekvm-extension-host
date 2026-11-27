@@ -33,6 +33,8 @@ do_install() {
         ${D}${systemd_system_unitdir}/onekvm-extension-host.service
     install -Dm0644 ${S}/packaging/onekvm-plugin-update.service \
         ${D}${systemd_system_unitdir}/onekvm-plugin-update.service
+    install -m0644 ${S}/packaging/onekvm-extension-image@.service \
+        ${S}/packaging/onekvm-extension-image-check@.service ${D}${systemd_system_unitdir}/
     install -d ${D}${systemd_system_unitdir}/onekvm-pre.target.requires
     ln -s ../onekvm-plugin-update.service \
         ${D}${systemd_system_unitdir}/onekvm-pre.target.requires/onekvm-plugin-update.service
@@ -62,6 +64,8 @@ do_install() {
         ${D}${docdir}/onekvm/extension-logging-v1.md
     install -Dm0644 ${S}/docs/extension-toolbox-v1.md \
         ${D}${docdir}/onekvm/extension-toolbox-v1.md
+    install -Dm0644 ${S}/docs/extension-runtime-image-v1.md \
+        ${D}${docdir}/onekvm/extension-runtime-image-v1.md
     install -Dm0644 ${S}/docs/ipks-v1.md \
         ${D}${docdir}/onekvm/ipks-v1.md
 
@@ -89,11 +93,14 @@ SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 
 RDEPENDS:${PN} += "opkg systemd gnupg-gpg onekvm-feed-key wget openssl-bin erofs-utils-dump"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
+RPROVIDES:${PN} += "onekvm-extension-runtime-image"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"
 
 FILES:${PN} += "\
     ${systemd_system_unitdir}/onekvm-plugin-update.service \
+    ${systemd_system_unitdir}/onekvm-extension-image@.service \
+    ${systemd_system_unitdir}/onekvm-extension-image-check@.service \
     ${systemd_system_unitdir}/onekvm-pre.target.requires \
     ${datadir}/onekvm \
     ${datadir}/dbus-1/system.d/org.onekvm.ExtensionHost1.conf \
