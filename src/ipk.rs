@@ -41,6 +41,7 @@ const PLATFORM_DEPENDENCIES: &[&str] = &[
     "onekvm-core",
     "onekvm-ui",
     "onekvm-extension-host",
+    crate::runtime_identity::PACKAGE_CAPABILITY,
     "onekvm-extension-runtime-image",
     "onekvm-extension-npu-runtime",
     "onekvm-plugin-manager",
@@ -142,6 +143,13 @@ pub fn inspect_ipk(
         return Err(
             "runtime image package requires the onekvm-extension-runtime-image dependency".into(),
         );
+    }
+    if manifest.runtime_identity.is_some()
+        && !dependencies.iter().any(|dep| {
+            dep.name == crate::runtime_identity::PACKAGE_CAPABILITY && dep.compare.is_empty()
+        })
+    {
+        return Err("dedicated runtime account requires the onekvm-extension-dedicated-account dependency".into());
     }
     let preview = extract_preview_icon(
         data.reader(&mut file).map_err(|e| e.to_string())?,

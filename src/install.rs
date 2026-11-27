@@ -893,6 +893,8 @@ fn commit_installed_package(info: &PackageInfo, prep: UpgradePrep) -> Result<(),
             lifecycle::enable_unlocked(&info.manifest.id)?;
             log_install_message("Checking extension startup");
             lifecycle::check_started(&info.manifest.id)?;
+        } else if crate::runtime_identity::is_managed(&installed.manifest) {
+            crate::dbus_client::reconcile(&installed.manifest.id, state.revision)?;
         }
         crate::runtime_image::validate_install(&installed, state.enabled)?;
         Ok(())

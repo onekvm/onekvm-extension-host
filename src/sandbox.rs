@@ -9,7 +9,10 @@ use crate::sys;
 
 const NPU_USER_MODELS: &str = "/data/onekvm/npu-models";
 
-pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
+pub fn sandbox_arguments(
+    extension: &Installed,
+    account: Option<&crate::runtime_identity::Account>,
+) -> Vec<String> {
     let id = &extension.manifest.id;
     let permissions: std::collections::BTreeSet<_> = extension
         .manifest
@@ -20,7 +23,9 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     if permissions.contains("host-unrestricted") {
         return unrestricted_host_arguments();
     }
-    let (runtime_user, runtime_group) = sandbox_identity(&permissions);
+    let (runtime_user, runtime_group) = account
+        .map(|account| (account.name.as_str(), account.name.as_str()))
+        .unwrap_or_else(|| sandbox_identity(&permissions));
     let mut arguments = vec![
         "--property=Type=exec".into(),
         format!("--property=User={runtime_user}"),
@@ -68,6 +73,12 @@ pub fn sandbox_arguments(extension: &Installed) -> Vec<String> {
     }
     let mut devices = Vec::new();
     let mut supplementary_groups = Vec::new();
+    if account.is_some() {
+        // Core brokers access via group-owned sockets and checks the calling
+        // service's registered cgroup and capabilities.
+        supplementary_groups.push("onekvm-extension");
+        arguments.push("--setenv=ONEKVM_EXTENSION_RUNTIME_IDENTITY=dedicated".into());
+    }
     if permissions.contains("device-video") {
         devices.extend(glob_paths("/dev/video*"));
         // Nodes opened to extensions (e.g. the decoder) are group video.
@@ -292,8 +303,11 @@ fn glob_simple(pattern: &str) -> Result<Vec<String>, String> {
     }
 }
 
-pub fn helper_sandbox_arguments(extension: &Installed) -> Vec<String> {
-    let mut arguments = sandbox_arguments(extension);
+pub fn helper_sandbox_arguments(
+    extension: &Installed,
+    account: Option<&crate::runtime_identity::Account>,
+) -> Vec<String> {
+    let mut arguments = sandbox_arguments(extension, account);
     for argument in &mut arguments {
         if argument == "--property=ProtectControlGroups=yes" {
             *argument = "--property=ProtectControlGroups=no".into();
@@ -632,7 +646,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let args = sandbox_arguments(&extension);
+        let args = sandbox_arguments(&extension, None);
         for expected in [
             "--property=User=root",
             "--property=ProtectSystem=strict",
@@ -646,9 +660,45 @@ mod tests {
             assert!(args.iter().any(|arg| arg == expected), "{expected}");
         }
         extension.manifest.permissions = vec!["network".into()];
-        let ordinary = sandbox_arguments(&extension);
+        let ordinary = sandbox_arguments(&extension, None);
         assert!(ordinary.iter().any(|arg| arg == "--property=User=onekvm-extension"));
         assert!(!ordinary.iter().any(|arg| arg == "--property=ReadWritePaths=/var/lib/machines"));
+    }
+
+    #[test]
+    fn dedicated_account_applies_to_all_sandboxes_with_or_without_an_image() {
+        let account = crate::runtime_identity::Account { name: "okv-example".into(), id: 698 };
+        let mut extension = crate::manifest::Installed {
+            root: "/data/onekvm/apps/example/1.0".into(),
+            manifest: crate::manifest::Manifest {
+                id: "example".into(),
+                version: "1.0".into(),
+                permissions: vec!["network".into(), "network-admin".into()],
+                runtime_identity: Some(crate::runtime_identity::Declaration::Dedicated),
+                ..Default::default()
+            },
+        };
+        for image in [None, Some(crate::manifest::RuntimeImage {
+            path: "runtime/example.raw".into(),
+            sha256: "1".repeat(64),
+        })] {
+            extension.manifest.runtime_image = image;
+            for args in [
+                sandbox_arguments(&extension, Some(&account)),
+                super::helper_sandbox_arguments(&extension, Some(&account)),
+            ] {
+                for option in [
+                    "--property=User=okv-example",
+                    "--property=Group=okv-example",
+                    "--property=SupplementaryGroups=onekvm-extension",
+                    "--property=AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW",
+                    "--property=DeviceAllow=/dev/net/tun rw",
+                ] {
+                    assert!(args.iter().any(|arg| arg == option), "{option}");
+                }
+                assert_eq!(args.iter().filter(|arg| arg.starts_with("--property=User=")).count(), 1);
+            }
+        }
     }
 
     #[test]

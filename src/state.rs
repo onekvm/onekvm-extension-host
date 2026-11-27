@@ -190,6 +190,10 @@ fn disable_conflicting_cloud_provider_states() -> Result<(), String> {
 
 pub fn prepare_runtime_dirs(id: &str) -> Result<(), String> {
     let (uid, gid) = sys::runtime_ids()?;
+    prepare_runtime_dirs_as(id, uid, gid)
+}
+
+pub fn prepare_runtime_dirs_as(id: &str, uid: u32, gid: u32) -> Result<(), String> {
     fs::create_dir_all(paths::RUNTIME_ROOT).map_err(|e| e.to_string())?;
     set_mode_if_needed(Path::new(paths::RUNTIME_ROOT), 0o755)?;
     let euid = unsafe { libc::geteuid() } as u32;

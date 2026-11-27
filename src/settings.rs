@@ -1,5 +1,6 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde_json::Value;
@@ -138,21 +139,28 @@ fn validate_value(property: &SettingProperty, value: &Value) -> Result<(), Strin
 
 pub fn write_runtime_settings(id: &str, settings: &Value) -> Result<(), String> {
     prepare_runtime_dirs(id)?;
+    write_prepared_runtime_settings(id, settings, None)
+}
+
+pub fn write_prepared_runtime_settings(
+    id: &str,
+    settings: &Value,
+    account: Option<&crate::runtime_identity::Account>,
+) -> Result<(), String> {
     let mut data = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     data.push(b'\n');
     let destination = Path::new(paths::RUNTIME_ROOT).join(id).join("config.json");
-    if fs::read(&destination).ok().as_deref() == Some(data.as_slice()) {
+    let (owner, mode) = if let Some(account) = account {
+        ((0, account.id), 0o640)
+    } else {
+        (sys::runtime_ids()?, 0o600)
+    };
+    if fs::symlink_metadata(&destination).is_ok_and(|info| {
+        info.is_file() && (info.uid(), info.gid()) == owner && info.mode() & 0o7777 == mode
+    }) && fs::read(&destination).ok().as_deref() == Some(data.as_slice()) {
         return Ok(());
     }
-    sys::atomic_write(&destination, &data, 0o600)?;
-    let (uid, gid) = sys::runtime_ids()?;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(destination.as_os_str().as_bytes())
-        .map_err(|_| "path contains NUL".to_string())?;
-    if unsafe { libc::chown(c_path.as_ptr(), uid, gid) } != 0 {
-        return Err("chown runtime settings".into());
-    }
-    Ok(())
+    sys::atomic_write_owned(&destination, &data, mode, Some(owner))
 }
 
 pub fn repair_settings_output_permissions() -> Result<(), String> {
@@ -264,26 +272,36 @@ pub fn service_enabled(settings: &Value) -> bool {
 }
 
 pub fn repair_settings_output_permission(id: &str) -> Result<(), String> {
-    let path = Path::new(paths::APP_DATA_ROOT)
-        .join(id)
-        .join(paths::SETTINGS_OUTPUT);
-    let info = match fs::symlink_metadata(&path) {
-        Ok(info) => info,
+    let directory = Path::new(paths::APP_DATA_ROOT).join(id);
+    let file = match fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(directory.join(paths::SETTINGS_OUTPUT))
+    {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.to_string()),
     };
-    if !info.is_file() {
+    let info = file.metadata().map_err(|e| e.to_string())?;
+    if !info.is_file() || info.nlink() != 1 {
         return Err(format!(
-            "extension settings output for {id} is not a regular file"
+            "extension settings output for {id} must be a regular file with one link"
         ));
     }
-    let (_, gid) = sys::runtime_ids()?;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "path contains NUL".to_string())?;
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } != 0 {
+    let data = fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
+    if !data.is_dir() {
+        return Err(format!("invalid extension data directory for {id}"));
+    }
+    if info.uid() != data.uid() {
+        return Ok(());
+    }
+    let gid = data.gid();
+    if info.gid() == gid && info.mode() & 0o7777 == 0o640 {
+        return Ok(());
+    }
+    if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, gid) } != 0 {
         return Err(format!("set extension settings output group for {id}"));
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+    file.set_permissions(fs::Permissions::from_mode(0o640))
         .map_err(|e| format!("set extension settings output mode for {id}: {e}"))
 }

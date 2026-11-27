@@ -147,6 +147,9 @@ normal signed package workflow. See [Extension runtime images](docs/extension-ru
 
 ## Local extension identity
 
+Host-managed extensions can opt in to a private Linux runtime account. See
+[Dedicated extension runtime accounts](docs/extension-runtime-identity.md).
+
 Core verifies extension connections using Unix `SO_PEERCRED` and the systemd
 service cgroup. The host registers the exact service unit and manifest
 capabilities in `/run/onekvm/extension-auth/<id>.json`. It no longer generates

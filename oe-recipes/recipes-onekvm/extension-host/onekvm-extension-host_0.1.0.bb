@@ -94,6 +94,8 @@ SYSTEMD_AUTO_ENABLE:${PN} = "disable"
 RDEPENDS:${PN} += "opkg systemd gnupg-gpg onekvm-feed-key wget openssl-bin erofs-utils-dump"
 RPROVIDES:${PN} += "onekvm-plugin-manager"
 RPROVIDES:${PN} += "onekvm-extension-runtime-image"
+RDEPENDS:${PN} += "shadow"
+RPROVIDES:${PN} += "onekvm-extension-dedicated-account"
 RREPLACES:${PN} += "onekvm-plugin-manager"
 RCONFLICTS:${PN} += "onekvm-plugin-manager"
 

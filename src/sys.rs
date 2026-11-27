@@ -118,6 +118,15 @@ pub fn runtime_ids() -> Result<(u32, u32), String> {
 }
 
 pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+    atomic_write_owned(path, data, mode, None)
+}
+
+pub fn atomic_write_owned(
+    path: &Path,
+    data: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| "invalid write path".to_string())?;
@@ -129,6 +138,15 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
         .set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|e| e.to_string())?;
     temporary.file.write_all(data).map_err(|e| e.to_string())?;
+    if let Some((uid, gid)) = owner {
+        if unsafe { libc::fchown(temporary.file.as_raw_fd(), uid, gid) } != 0 {
+            return Err(format!(
+                "set owner of {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    }
     temporary.file.sync_all().map_err(|e| e.to_string())?;
     fs::rename(&tmp_path, path).map_err(|e| e.to_string())?;
     File::open(dir)

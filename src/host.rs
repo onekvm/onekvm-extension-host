@@ -14,11 +14,11 @@ use crate::sandbox::{
 };
 use crate::settings::{
     repair_settings_output_permission, repair_settings_output_permissions, settings_for_state,
-    write_runtime_settings,
+    write_prepared_runtime_settings,
 };
 use crate::state::{
-    initialize_default_enabled_states, prepare_authorization, prepare_runtime_dirs,
-    read_generation, read_state, remove_authorization, write_generation, PluginState,
+    initialize_default_enabled_states, prepare_authorization, read_generation, read_state,
+    remove_authorization, write_generation, PluginState,
 };
 use crate::sys;
 
@@ -98,7 +98,10 @@ pub fn apply(
     }
     let extension = load_installed(id, &state.active_version)?;
     if !method.is_empty() {
-        if extension.manifest.runtime_image.is_some() && crate::transaction::pending(id) {
+        if (extension.manifest.runtime_image.is_some()
+            || crate::runtime_identity::is_managed(&extension.manifest))
+            && crate::transaction::pending(id)
+        {
             return Err(format!("extension {id} is changing versions"));
         }
         let spec = extension
@@ -116,6 +119,14 @@ pub fn apply(
         }
     }
     if extension.manifest.is_environment() {
+        cleanup_disabled_controller(id)?;
+        return Ok(Value::Null);
+    }
+    if !state.enabled
+        && event == "reconcile"
+        && crate::runtime_identity::is_managed(&extension.manifest)
+    {
+        prepare_runtime(&extension)?;
         cleanup_disabled_controller(id)?;
         return Ok(Value::Null);
     }
@@ -262,16 +273,16 @@ fn apply_command_method(
             _ => {}
         }
     }
-    prepare_runtime_dirs(id)?;
+    let account = prepare_runtime(extension)?;
     let settings = settings_for_state(extension, state)?;
-    write_runtime_settings(id, &settings)?;
+    write_prepared_runtime_settings(id, &settings, account.as_ref())?;
     let command = build_method_command(spec, request.as_ref())?;
     let timeout = if spec.timeout_seconds == 0 {
         10
     } else {
         spec.timeout_seconds
     };
-    ensure_helper(extension, Some((&command, timeout)))?;
+    ensure_helper(extension, account.as_ref(), Some((&command, timeout)))?;
     let input = serde_json::to_vec(&request.unwrap_or(Value::Null)).map_err(|e| e.to_string())?;
     let mut executable = command;
     executable[0] = extension
@@ -313,10 +324,11 @@ pub fn check_health(id: &str, revision: u64) -> Result<(), String> {
         return Err("health check requires an enabled extension".into());
     }
     validate_command(&extension, &health.command)?;
-    prepare_runtime_dirs(id)?;
-    write_runtime_settings(id, &settings_for_state(&extension, &state)?)?;
+    let account = prepare_runtime(&extension)?;
+    let settings = settings_for_state(&extension, &state)?;
+    write_prepared_runtime_settings(id, &settings, account.as_ref())?;
     let timeout = health.timeout_seconds.clamp(1, 30);
-    let temporary = ensure_helper(&extension, Some((&health.command, timeout)))?;
+    let temporary = ensure_helper(&extension, account.as_ref(), Some((&health.command, timeout)))?;
     let mut command = health.command.clone();
     command[0] = extension
         .root
@@ -959,6 +971,14 @@ fn apply_legacy(extension: &Installed, state: &PluginState, event: &str) -> Resu
             stop_legacy(&extension.manifest.id)?;
             crate::runtime_image::stop(extension)
         }
+        "config_changed" if extension.manifest.settings_reload == "watch" => {
+            let account = prepare_runtime(extension)?;
+            write_prepared_runtime_settings(
+                &extension.manifest.id,
+                &settings_for_state(extension, state)?,
+                account.as_ref(),
+            )
+        }
         "enable" | "reconcile" | "config_changed" if state.enabled => {
             start_legacy(extension, state)
         }
@@ -985,9 +1005,9 @@ fn apply_controller(
     if state.enabled && matches!(event, "enable" | "reconcile" | "config_changed") {
         prepare_enabled_extension(extension)?;
     }
-    prepare_runtime_dirs(id)?;
+    let account = prepare_runtime(extension)?;
     let settings = settings_for_state(extension, state)?;
-    write_runtime_settings(id, &settings)?;
+    write_prepared_runtime_settings(id, &settings, account.as_ref())?;
     let image_disable = event == "disable" && extension.manifest.runtime_image.is_some();
     if image_disable && !is_active(&paths::helper_unit(id)) {
         // A stopped helper has no children to clean up. Avoid activating a
@@ -996,7 +1016,7 @@ fn apply_controller(
         return Ok(Value::Null);
     }
     let result = (|| {
-        let helper_started = ensure_helper(extension, None)?;
+        let helper_started = ensure_helper(extension, account.as_ref(), None)?;
         let generation = host
             .generation
             .lock()
@@ -1296,12 +1316,28 @@ fn prepare_enabled_extension(extension: &Installed) -> Result<(), String> {
     load_kernel_modules(extension)
 }
 
+fn prepare_runtime(extension: &Installed) -> Result<Option<crate::runtime_identity::Account>, String> {
+    let id = &extension.manifest.id;
+    crate::runtime_identity::prepare(&extension.manifest, || {
+        stop_helper(id)?;
+        unit_action("stop", &paths::socket_unit(id))?;
+        unit_action("stop", &paths::unit_name(id))?;
+        stop_legacy_controller_units(id)
+    })
+}
+
 fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String> {
     eprintln!(
         "extension {}: preparing legacy service",
         extension.manifest.id
     );
     prepare_enabled_extension(extension)?;
+    let managed_identity = crate::runtime_identity::is_managed(&extension.manifest);
+    let account = if managed_identity {
+        prepare_runtime(extension)?
+    } else {
+        None
+    };
     let unit = paths::unit_name(&extension.manifest.id);
     let socket_unit = paths::socket_unit(&extension.manifest.id);
     if extension.manifest.socket_activation.is_some() && is_active(&socket_unit) {
@@ -1338,9 +1374,11 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         unit_action("stop", &unit)?;
         let _ = unit_action("reset-failed", &unit);
     }
-    prepare_runtime_dirs(&extension.manifest.id)?;
+    if !managed_identity {
+        prepare_runtime(extension)?;
+    }
     let settings = settings_for_state(extension, state)?;
-    write_runtime_settings(&extension.manifest.id, &settings)?;
+    write_prepared_runtime_settings(&extension.manifest.id, &settings, account.as_ref())?;
     if !service_enabled(&settings) {
         return Ok(());
     }
@@ -1356,7 +1394,7 @@ fn start_legacy(extension: &Installed, state: &PluginState) -> Result<(), String
         "--property=RestartPreventExitStatus=78".into(),
     ];
     arguments.extend(legacy_core_lifetime_properties());
-    arguments.extend(sandbox_arguments(extension));
+    arguments.extend(sandbox_arguments(extension, account.as_ref()));
     arguments.extend([
         "--setenv=CREDENTIALS_DIRECTORY=/usr/share/onekvm/extension-compat".into(),
         format!("--working-directory={}", extension.root.display()),
@@ -1546,7 +1584,11 @@ fn validate_cloud_provider_conflict(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Result<bool, String> {
+fn ensure_helper(
+    extension: &Installed,
+    account: Option<&crate::runtime_identity::Account>,
+    direct: Option<(&[String], u64)>,
+) -> Result<bool, String> {
     let id = &extension.manifest.id;
     let command_only = direct.is_some() && extension.manifest.controller.is_none();
     let mode = if command_only {
@@ -1555,6 +1597,9 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
         "controller"
     };
     let mut reuse_key = format!("sandbox-v4:{}:{mode}", extension.manifest.version);
+    if let Some(account) = account {
+        reuse_key.push_str(&format!(":uid={}", account.id));
+    }
     if let Some(image) = &extension.manifest.runtime_image {
         reuse_key.push(':');
         reuse_key.push_str(&image.sha256);
@@ -1598,7 +1643,7 @@ fn ensure_helper(extension: &Installed, direct: Option<(&[String], u64)>) -> Res
         "--property=BindsTo=onekvm.service".into(),
         "--property=After=onekvm.service".into(),
     ];
-    arguments.extend(helper_sandbox_arguments(extension));
+    arguments.extend(helper_sandbox_arguments(extension, account));
     arguments.extend([
         "--setenv=CREDENTIALS_DIRECTORY=/usr/share/onekvm/extension-compat".into(),
         format!("--working-directory={}", extension.root.display()),

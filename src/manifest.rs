@@ -32,6 +32,8 @@ pub struct Manifest {
     #[serde(default)]
     pub entrypoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_identity: Option<crate::runtime_identity::Declaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_image: Option<RuntimeImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket_activation: Option<SocketActivation>,
@@ -754,6 +756,7 @@ fn validate_manifest(value: &Manifest) -> Result<(), String> {
         ));
     }
     crate::runtime_image::validate_manifest(value)?;
+    crate::runtime_identity::validate_manifest(value)?;
     if !value.entrypoint.is_empty() && !paths::safe_relative(&value.entrypoint) {
         return Err(format!("unsafe entrypoint {:?}", value.entrypoint));
     }

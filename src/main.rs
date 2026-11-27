@@ -26,6 +26,7 @@ mod paths;
 mod ports;
 mod proxy;
 mod runtime_image;
+mod runtime_identity;
 mod sandbox;
 mod settings;
 mod state;
